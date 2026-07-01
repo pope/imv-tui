@@ -76,9 +76,17 @@ cargo build --release
 
 # Run on a file or directory
 ./target/release/imv-tui <path-to-image-or-directory>
+
+# Run with a specific starting filter (nearest, linear, cubic, gaussian, lanczos)
+./target/release/imv-tui <path-to-image> --filter cubic
 ```
 
 If no path is specified, it scans and opens images from the current directory (`.`).
+
+### Command Line Options
+
+- `-f, --filter <nearest|linear|cubic|gaussian|lanczos>`: Set the initial image scaling filter (defaults to `nearest`).
+- `-h, --help`: Displays the help menu outlining CLI usage and flags.
 
 ______________________________________________________________________
 

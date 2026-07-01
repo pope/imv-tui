@@ -143,7 +143,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_path: &Path, picker: Picker) -> Result<Self, String> {
+    pub fn new(
+        initial_path: &Path,
+        picker: Picker,
+        filter_type: FilterType,
+    ) -> Result<Self, String> {
         let (images, current_index) = scan_directory(initial_path)?;
 
         let mut app = Self {
@@ -167,7 +171,7 @@ impl App {
             palette_mode: PaletteMode::Closed,
             palette_query: String::new(),
             palette_selected_index: 0,
-            filter_type: FilterType::Nearest,
+            filter_type,
         };
 
         app.load_image();
@@ -921,12 +925,62 @@ fn ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse target path
+    // Parse arguments
     let args: Vec<String> = env::args().collect();
-    let initial_path = if args.len() > 1 {
-        PathBuf::from(&args[1])
-    } else {
-        PathBuf::from(".")
+    let mut initial_path = None;
+    let mut filter_opt = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--filter" | "-f" => {
+                if i + 1 < args.len() {
+                    filter_opt = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "Error: --filter / -f requires an argument (nearest, linear, cubic, gaussian, lanczos)"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => {
+                println!("imv-tui: A fast keyboard-driven terminal image viewer");
+                println!();
+                println!("Usage: imv-tui [path] [options]");
+                println!();
+                println!("Options:");
+                println!(
+                    "  -f, --filter <filter>  Initial image scaling filter: nearest, linear, cubic, gaussian, lanczos"
+                );
+                println!("  -h, --help             Show this help menu");
+                std::process::exit(0);
+            }
+            val => {
+                if initial_path.is_none() {
+                    initial_path = Some(PathBuf::from(val));
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let initial_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
+
+    let initial_filter = match filter_opt.as_deref() {
+        Some("nearest") => FilterType::Nearest,
+        Some("linear") => FilterType::Triangle,
+        Some("cubic") => FilterType::CatmullRom,
+        Some("gaussian") => FilterType::Gaussian,
+        Some("lanczos") => FilterType::Lanczos3,
+        Some(other) => {
+            eprintln!(
+                "Error: Unknown filter '{}'. Choose from: nearest, linear, cubic, gaussian, lanczos",
+                other
+            );
+            std::process::exit(1);
+        }
+        None => FilterType::Nearest,
     };
 
     // Query terminal protocol before raw mode
@@ -940,7 +994,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = match App::new(&initial_path, picker) {
+    let mut app = match App::new(&initial_path, picker, initial_filter) {
         Ok(app) => app,
         Err(e) => {
             // Restore terminal on init error
