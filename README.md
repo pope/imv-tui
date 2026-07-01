@@ -79,6 +79,9 @@ cargo build --release
 
 # Run with a specific starting filter (nearest, linear, cubic, gaussian, lanczos)
 ./target/release/imv-tui <path-to-image> --filter cubic
+
+# Pipe a list of file paths from another command (like fd or find) via stdin
+fd -e png -e jpg . ~/Pictures | ./target/release/imv-tui
 ```
 
 If no path is specified, it scans and opens images from the current directory (`.`).

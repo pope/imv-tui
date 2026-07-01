@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -144,11 +144,14 @@ pub struct App {
 
 impl App {
     pub fn new(
-        initial_path: &Path,
+        images: Vec<PathBuf>,
+        current_index: usize,
         picker: Picker,
         filter_type: FilterType,
     ) -> Result<Self, String> {
-        let (images, current_index) = scan_directory(initial_path)?;
+        if images.is_empty() {
+            return Err("No supported images found".to_string());
+        }
 
         let mut app = Self {
             images,
@@ -925,7 +928,33 @@ fn ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse arguments
+    // 1. Check if we have piped input via stdin (e.g. from fd or find)
+    let mut piped_files = Vec::new();
+    let is_piped = !io::stdin().is_terminal();
+    if is_piped {
+        use std::io::BufRead;
+        let stdin = io::stdin();
+        for line in stdin.lock().lines().map_while(Result::ok) {
+            let path = PathBuf::from(line.trim());
+            if path.exists() && path.is_file() {
+                piped_files.push(path);
+            }
+        }
+
+        // Reopen stdin from /dev/tty so crossterm can read keyboard inputs!
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+                let fd = tty.as_raw_fd();
+                unsafe {
+                    libc::dup2(fd, libc::STDIN_FILENO);
+                }
+            }
+        }
+    }
+
+    // Parse CLI arguments
     let args: Vec<String> = env::args().collect();
     let mut initial_path = None;
     let mut filter_opt = None;
@@ -965,7 +994,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let initial_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
+    // Get the image file list and current starting index
+    let (images, current_index) = if is_piped && !piped_files.is_empty() {
+        (piped_files, 0)
+    } else {
+        let initial_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
+        scan_directory(&initial_path)?
+    };
 
     let initial_filter = match filter_opt.as_deref() {
         Some("nearest") => FilterType::Nearest,
@@ -994,7 +1029,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = match App::new(&initial_path, picker, initial_filter) {
+    let mut app = match App::new(images, current_index, picker, initial_filter) {
         Ok(app) => app,
         Err(e) => {
             // Restore terminal on init error
