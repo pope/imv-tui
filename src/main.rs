@@ -11,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use image::{DynamicImage, GenericImage};
+use image::{DynamicImage, GenericImage, imageops::FilterType};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -79,6 +79,26 @@ const COMMANDS: &[CommandItem] = &[
         name: "Quit",
         description: "Close the application",
     },
+    CommandItem {
+        name: "Set Filter: Nearest",
+        description: "Use Nearest Neighbor scaling (sharp, fast)",
+    },
+    CommandItem {
+        name: "Set Filter: Linear",
+        description: "Use Bilinear/Triangle scaling (smooth)",
+    },
+    CommandItem {
+        name: "Set Filter: Cubic",
+        description: "Use Bicubic/Catmull-Rom scaling (very smooth)",
+    },
+    CommandItem {
+        name: "Set Filter: Gaussian",
+        description: "Use Gaussian scaling (smooth, blurred)",
+    },
+    CommandItem {
+        name: "Set Filter: Lanczos",
+        description: "Use Lanczos3 scaling (highest quality)",
+    },
 ];
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -119,6 +139,7 @@ pub struct App {
     pub palette_mode: PaletteMode,
     pub palette_query: String,
     pub palette_selected_index: usize,
+    pub filter_type: FilterType,
 }
 
 impl App {
@@ -146,6 +167,7 @@ impl App {
             palette_mode: PaletteMode::Closed,
             palette_query: String::new(),
             palette_selected_index: 0,
+            filter_type: FilterType::Nearest,
         };
 
         app.load_image();
@@ -179,6 +201,16 @@ impl App {
             .collect()
     }
 
+    pub fn filter_name(&self) -> &'static str {
+        match self.filter_type {
+            FilterType::Nearest => "Nearest",
+            FilterType::Triangle => "Linear",
+            FilterType::CatmullRom => "Cubic",
+            FilterType::Gaussian => "Gaussian",
+            FilterType::Lanczos3 => "Lanczos",
+        }
+    }
+
     pub fn execute_command(&mut self, name: &str) {
         match name {
             "Show Help" => {
@@ -195,6 +227,26 @@ impl App {
             "Zoom In" => self.zoom_in(),
             "Zoom Out" => self.zoom_out(),
             "Quit" => self.running = false,
+            "Set Filter: Nearest" => {
+                self.filter_type = FilterType::Nearest;
+                self.needs_update = true;
+            }
+            "Set Filter: Linear" => {
+                self.filter_type = FilterType::Triangle;
+                self.needs_update = true;
+            }
+            "Set Filter: Cubic" => {
+                self.filter_type = FilterType::CatmullRom;
+                self.needs_update = true;
+            }
+            "Set Filter: Gaussian" => {
+                self.filter_type = FilterType::Gaussian;
+                self.needs_update = true;
+            }
+            "Set Filter: Lanczos" => {
+                self.filter_type = FilterType::Lanczos3;
+                self.needs_update = true;
+            }
             _ => {}
         }
     }
@@ -316,7 +368,7 @@ impl App {
                     (inter_x2 - inter_x1) as u32,
                     (inter_y2 - inter_y1) as u32,
                 );
-                cropped_part.resize(target_w, target_h, image::imageops::FilterType::Nearest)
+                cropped_part.resize(target_w, target_h, self.filter_type)
             } else {
                 // Crop box goes outside image bounds (e.g. zoomed out or panned past edge).
                 // Create a blank background canvas and copy the visible portion onto it.
@@ -335,11 +387,8 @@ impl App {
                     let target_inter_h =
                         (((inter_y2 - inter_y1) as f64 * scale).round() as u32).max(1);
 
-                    let resized_part = cropped_part.resize(
-                        target_inter_w,
-                        target_inter_h,
-                        image::imageops::FilterType::Nearest,
-                    );
+                    let resized_part =
+                        cropped_part.resize(target_inter_w, target_inter_h, self.filter_type);
 
                     let paste_x = ((inter_x1 - crop_x1) as f64 * scale).round() as i64;
                     let paste_y = ((inter_y1 - crop_y1) as f64 * scale).round() as i64;
@@ -673,12 +722,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
         " No files found. Press 'q' to quit. ".to_string()
     } else {
         format!(
-            " [{}/{}] {} ({}x{}) | Zoom: {}% | Pan: ({}, {}) | Press '?' for help ",
+            " [{}/{}] {} ({}x{}) | Filter: {} | Zoom: {}% | Pan: ({}, {}) | Press '?' for help ",
             app.current_index + 1,
             app.images.len(),
             app.current_filename(),
             app.img_width,
             app.img_height,
+            app.filter_name(),
             app.current_zoom_pct.round() as i64,
             app.pan_offset.0,
             app.pan_offset.1
