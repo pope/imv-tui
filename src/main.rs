@@ -26,6 +26,73 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PaletteMode {
+    Closed,
+    Command,
+    File,
+}
+
+pub struct CommandItem {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+const COMMANDS: &[CommandItem] = &[
+    CommandItem {
+        name: "Show Help",
+        description: "Show keyboard shortcuts dialog",
+    },
+    CommandItem {
+        name: "Reset View",
+        description: "Fit image to screen and reset panning",
+    },
+    CommandItem {
+        name: "Actual Size",
+        description: "Zoom image to 1:1 pixel scale (100%)",
+    },
+    CommandItem {
+        name: "Rotate Clockwise",
+        description: "Rotate image 90 degrees clockwise",
+    },
+    CommandItem {
+        name: "Rotate Counter-Clockwise",
+        description: "Rotate image 90 degrees counter-clockwise",
+    },
+    CommandItem {
+        name: "Next Image",
+        description: "Switch to the next image in directory",
+    },
+    CommandItem {
+        name: "Previous Image",
+        description: "Switch to the previous image in directory",
+    },
+    CommandItem {
+        name: "Zoom In",
+        description: "Zoom in closer",
+    },
+    CommandItem {
+        name: "Zoom Out",
+        description: "Zoom out further",
+    },
+    CommandItem {
+        name: "Quit",
+        description: "Close the application",
+    },
+];
+
+fn fuzzy_match(text: &str, query: &str) -> bool {
+    let text_lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let mut text_chars = text_lower.chars();
+    for q_char in query_lower.chars() {
+        if !text_chars.any(|t_char| t_char == q_char) {
+            return false;
+        }
+    }
+    true
+}
+
 /// App state
 pub struct App {
     pub images: Vec<PathBuf>,
@@ -49,6 +116,9 @@ pub struct App {
     pub needs_clear: bool,
     pub rendered_size_cells: (u16, u16),
     pub current_zoom_pct: f64,
+    pub palette_mode: PaletteMode,
+    pub palette_query: String,
+    pub palette_selected_index: usize,
 }
 
 impl App {
@@ -73,10 +143,60 @@ impl App {
             needs_clear: true,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
+            palette_mode: PaletteMode::Closed,
+            palette_query: String::new(),
+            palette_selected_index: 0,
         };
 
         app.load_image();
         Ok(app)
+    }
+
+    pub fn get_filtered_files(&self) -> Vec<(usize, String)> {
+        self.images
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| {
+                (
+                    idx,
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string(),
+                )
+            })
+            .filter(|(_, name)| fuzzy_match(name, &self.palette_query))
+            .collect()
+    }
+
+    pub fn get_filtered_commands(&self) -> Vec<&'static CommandItem> {
+        COMMANDS
+            .iter()
+            .filter(|cmd| {
+                fuzzy_match(cmd.name, &self.palette_query)
+                    || fuzzy_match(cmd.description, &self.palette_query)
+            })
+            .collect()
+    }
+
+    pub fn execute_command(&mut self, name: &str) {
+        match name {
+            "Show Help" => {
+                self.show_help = true;
+                self.needs_update = true;
+                self.needs_clear = true;
+            }
+            "Reset View" => self.reset_view(),
+            "Actual Size" => self.set_actual_size(),
+            "Rotate Clockwise" => self.rotate_clockwise(),
+            "Rotate Counter-Clockwise" => self.rotate_counter_clockwise(),
+            "Next Image" => self.next_image(),
+            "Previous Image" => self.prev_image(),
+            "Zoom In" => self.zoom_in(),
+            "Zoom Out" => self.zoom_out(),
+            "Quit" => self.running = false,
+            _ => {}
+        }
     }
 
     /// Load the image at the current index
@@ -591,6 +711,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             ]),
             Line::from(vec!["  e, R, >        ".cyan(), "- Rotate CW 90°".into()]),
             Line::from(vec!["  E, <           ".cyan(), "- Rotate CCW 90°".into()]),
+            Line::from(vec!["  :              ".cyan(), "- Command Palette".into()]),
+            Line::from(vec!["  f              ".cyan(), "- File Search".into()]),
             Line::from(vec!["  Mouse Scroll   ".cyan(), "- Zoom In / Out".into()]),
             Line::from(vec!["  ?, /           ".cyan(), "- Toggle Help".into()]),
         ];
@@ -605,7 +727,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
         let help_width = 44_u16;
-        let help_height = 17_u16;
+        let help_height = 19_u16;
 
         let w = help_width.min(chunks[0].width.saturating_sub(1));
         let h = help_height.min(chunks[0].height.saturating_sub(1));
@@ -615,6 +737,136 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let popup_area = Rect::new(x, y, w, h);
         frame.render_widget(Clear, popup_area);
         frame.render_widget(help_paragraph, popup_area);
+    }
+
+    // Command / File Palette popup
+    if app.palette_mode != PaletteMode::Closed {
+        let title = match app.palette_mode {
+            PaletteMode::File => " File Search ",
+            PaletteMode::Command => " Command Palette ",
+            _ => "",
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                " > ".bold().cyan(),
+                app.palette_query.as_str().into(),
+                "▊".cyan(), // cursor block
+            ]),
+            Line::from("──────────────────────────────────────────────────────────".gray()),
+        ];
+
+        match app.palette_mode {
+            PaletteMode::File => {
+                let filtered_files = app.get_filtered_files();
+                if !filtered_files.is_empty() {
+                    app.palette_selected_index =
+                        app.palette_selected_index.min(filtered_files.len() - 1);
+                } else {
+                    app.palette_selected_index = 0;
+                }
+
+                let total_files = filtered_files.len();
+                let visible_count = 8;
+                let start_idx = if total_files <= visible_count || app.palette_selected_index < 4 {
+                    0
+                } else if app.palette_selected_index >= total_files - 4 {
+                    total_files - visible_count
+                } else {
+                    app.palette_selected_index - 4
+                };
+
+                for (i, (_, filename)) in filtered_files
+                    .iter()
+                    .enumerate()
+                    .skip(start_idx)
+                    .take(visible_count)
+                {
+                    let mut line = Line::from(format!("   {}", filename));
+                    if i == app.palette_selected_index {
+                        line = Line::from(format!(" > {}", filename))
+                            .bold()
+                            .yellow()
+                            .on_blue();
+                    }
+                    lines.push(line);
+                }
+
+                if filtered_files.is_empty() {
+                    lines.push(Line::from("   No matches found.".gray().italic()));
+                }
+            }
+            PaletteMode::Command => {
+                let filtered_commands = app.get_filtered_commands();
+                if !filtered_commands.is_empty() {
+                    app.palette_selected_index =
+                        app.palette_selected_index.min(filtered_commands.len() - 1);
+                } else {
+                    app.palette_selected_index = 0;
+                }
+
+                let total_cmds = filtered_commands.len();
+                let visible_count = 8;
+                let start_idx = if total_cmds <= visible_count || app.palette_selected_index < 4 {
+                    0
+                } else if app.palette_selected_index >= total_cmds - 4 {
+                    total_cmds - visible_count
+                } else {
+                    app.palette_selected_index - 4
+                };
+
+                for (i, cmd) in filtered_commands
+                    .iter()
+                    .enumerate()
+                    .skip(start_idx)
+                    .take(visible_count)
+                {
+                    let cmd_line = vec![
+                        if i == app.palette_selected_index {
+                            " > "
+                        } else {
+                            "   "
+                        }
+                        .into(),
+                        cmd.name.bold(),
+                        " - ".into(),
+                        cmd.description.gray(),
+                    ];
+                    let mut line = Line::from(cmd_line);
+                    if i == app.palette_selected_index {
+                        line = line.yellow().on_blue();
+                    }
+                    lines.push(line);
+                }
+
+                if filtered_commands.is_empty() {
+                    lines.push(Line::from("   No matches found.".gray().italic()));
+                }
+            }
+            _ => {}
+        }
+
+        let palette_block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let palette_paragraph = Paragraph::new(lines)
+            .block(palette_block)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+        let palette_width = 60_u16;
+        let palette_height = 12_u16;
+
+        let w = palette_width.min(chunks[0].width.saturating_sub(1));
+        let h = palette_height.min(chunks[0].height.saturating_sub(1));
+        let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+        let y = chunks[0].y.saturating_add(1);
+
+        let popup_area = Rect::new(x, y, w, h);
+
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(palette_paragraph, popup_area);
     }
 }
 
@@ -655,6 +907,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.needs_clear = false;
             if app.should_clear_on_update() {
                 terminal.clear()?;
+                app.needs_update = true;
             }
         }
         terminal.draw(|f| ui(f, &mut app))?;
@@ -662,78 +915,168 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if app.show_help {
-                                app.show_help = false;
+                    if app.palette_mode != PaletteMode::Closed {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.palette_mode = PaletteMode::Closed;
                                 app.needs_update = true;
                                 app.needs_clear = true;
-                            } else {
-                                app.running = false;
                             }
+                            KeyCode::Enter => {
+                                match app.palette_mode {
+                                    PaletteMode::File => {
+                                        let files = app.get_filtered_files();
+                                        if !files.is_empty()
+                                            && app.palette_selected_index < files.len()
+                                        {
+                                            app.current_index = files[app.palette_selected_index].0;
+                                            app.load_image();
+                                        }
+                                    }
+                                    PaletteMode::Command => {
+                                        let cmds = app.get_filtered_commands();
+                                        if !cmds.is_empty()
+                                            && app.palette_selected_index < cmds.len()
+                                        {
+                                            let cmd_name = cmds[app.palette_selected_index].name;
+                                            app.execute_command(cmd_name);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                app.palette_mode = PaletteMode::Closed;
+                                app.needs_update = true;
+                                app.needs_clear = true;
+                            }
+                            KeyCode::Up if app.palette_selected_index > 0 => {
+                                app.palette_selected_index -= 1;
+                            }
+                            KeyCode::Down => {
+                                let max_len = match app.palette_mode {
+                                    PaletteMode::File => app.get_filtered_files().len(),
+                                    PaletteMode::Command => app.get_filtered_commands().len(),
+                                    _ => 0,
+                                };
+                                if max_len > 0 && app.palette_selected_index < max_len - 1 {
+                                    app.palette_selected_index += 1;
+                                }
+                            }
+                            KeyCode::Char('k')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL)
+                                    && app.palette_selected_index > 0 =>
+                            {
+                                app.palette_selected_index -= 1;
+                            }
+                            KeyCode::Char('j')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
+                                let max_len = match app.palette_mode {
+                                    PaletteMode::File => app.get_filtered_files().len(),
+                                    PaletteMode::Command => app.get_filtered_commands().len(),
+                                    _ => 0,
+                                };
+                                if max_len > 0 && app.palette_selected_index < max_len - 1 {
+                                    app.palette_selected_index += 1;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                app.palette_query.pop();
+                                app.palette_selected_index = 0;
+                            }
+                            KeyCode::Char(c) => {
+                                app.palette_query.push(c);
+                                app.palette_selected_index = 0;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('?') | KeyCode::Char('/') => {
-                            app.show_help = !app.show_help;
-                            app.needs_update = true;
-                            app.needs_clear = true;
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                if app.show_help {
+                                    app.show_help = false;
+                                    app.needs_update = true;
+                                    app.needs_clear = true;
+                                } else {
+                                    app.running = false;
+                                }
+                            }
+                            KeyCode::Char('?') | KeyCode::Char('/') => {
+                                app.show_help = !app.show_help;
+                                app.needs_update = true;
+                                app.needs_clear = true;
+                            }
+                            // Command Palette
+                            KeyCode::Char(':') => {
+                                app.palette_mode = PaletteMode::Command;
+                                app.palette_query.clear();
+                                app.palette_selected_index = 0;
+                                app.needs_clear = true;
+                            }
+                            // File Palette
+                            KeyCode::Char('f') => {
+                                app.palette_mode = PaletteMode::File;
+                                app.palette_query.clear();
+                                app.palette_selected_index = 0;
+                                app.needs_clear = true;
+                            }
+                            // Next image
+                            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => {
+                                app.next_image();
+                            }
+                            // Prev image
+                            KeyCode::Char('p') | KeyCode::Char('[') | KeyCode::Backspace => {
+                                app.prev_image();
+                            }
+                            // Zoom
+                            KeyCode::Char('i') | KeyCode::Char('+') | KeyCode::Char('=') => {
+                                app.zoom_in();
+                            }
+                            KeyCode::Char('o') | KeyCode::Char('-') => {
+                                app.zoom_out();
+                            }
+                            // Actual size
+                            KeyCode::Char('a') => {
+                                app.set_actual_size();
+                            }
+                            // Reset
+                            KeyCode::Char('r') => {
+                                app.reset_view();
+                            }
+                            // Rotation
+                            KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
+                                app.rotate_clockwise();
+                            }
+                            KeyCode::Char('E') | KeyCode::Char('<') => {
+                                app.rotate_counter_clockwise();
+                            }
+                            // Vim Navigation (Pan)
+                            KeyCode::Char('h') => {
+                                app.pan_left();
+                            }
+                            KeyCode::Char('l') => {
+                                app.pan_right();
+                            }
+                            KeyCode::Char('k') => {
+                                app.pan_up();
+                            }
+                            KeyCode::Char('j') => {
+                                app.pan_down();
+                            }
+                            // Arrow Keys (Pan)
+                            KeyCode::Left => {
+                                app.pan_left();
+                            }
+                            KeyCode::Right => {
+                                app.pan_right();
+                            }
+                            KeyCode::Up => {
+                                app.pan_up();
+                            }
+                            KeyCode::Down => {
+                                app.pan_down();
+                            }
+                            _ => {}
                         }
-                        // Next image
-                        KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => {
-                            app.next_image();
-                        }
-                        // Prev image
-                        KeyCode::Char('p') | KeyCode::Char('[') | KeyCode::Backspace => {
-                            app.prev_image();
-                        }
-                        // Zoom
-                        KeyCode::Char('i') | KeyCode::Char('+') | KeyCode::Char('=') => {
-                            app.zoom_in();
-                        }
-                        KeyCode::Char('o') | KeyCode::Char('-') => {
-                            app.zoom_out();
-                        }
-                        // Actual size
-                        KeyCode::Char('a') => {
-                            app.set_actual_size();
-                        }
-                        // Reset
-                        KeyCode::Char('r') => {
-                            app.reset_view();
-                        }
-                        // Rotation
-                        KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
-                            app.rotate_clockwise();
-                        }
-                        KeyCode::Char('E') | KeyCode::Char('<') => {
-                            app.rotate_counter_clockwise();
-                        }
-                        // Vim Navigation (Pan)
-                        KeyCode::Char('h') => {
-                            app.pan_left();
-                        }
-                        KeyCode::Char('l') => {
-                            app.pan_right();
-                        }
-                        KeyCode::Char('k') => {
-                            app.pan_up();
-                        }
-                        KeyCode::Char('j') => {
-                            app.pan_down();
-                        }
-                        // Arrow Keys (Pan)
-                        KeyCode::Left => {
-                            app.pan_left();
-                        }
-                        KeyCode::Right => {
-                            app.pan_right();
-                        }
-                        KeyCode::Up => {
-                            app.pan_up();
-                        }
-                        KeyCode::Down => {
-                            app.pan_down();
-                        }
-                        _ => {}
                     }
                 }
                 Event::Mouse(mouse_event) => match mouse_event.kind {

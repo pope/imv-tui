@@ -113,3 +113,19 @@ When panning an image past its boundaries (where parts of the viewport show empt
 ### Guidelines for Future Work
 
 - **High-Performance Resizing**: Do not create the canvas at high original-image resolutions. Always crop the intersection in original space first, resize the cropped part to screen-pixel dimensions, and then overlay it onto a screen-resolution canvas. This avoids processing large buffers.
+
+______________________________________________________________________
+
+## 6. Text Overlays on Top of Graphics (Kitty/Sixel Interaction)
+
+### The Learning
+
+When rendering text components (like the Help menu, Command Palette, or File Search dialogs) on top of active terminal graphic overlays (Kitty protocol):
+
+- **Image Redraw covers Text**: Triggering `update_protocol()` (re-rendering/re-uploading the image) while a text dialog is open causes the graphic layer to cover the text grid. Because of `ratatui`'s double buffering, only the text cells that *changed* will be redrawn on top of the image; static text elements (like borders, titles, or unchanged labels) will remain covered and invisible.
+- **Erase Text by Redrawing Image**: To optimize background rendering, `ratatui-image` configures cells occupied by the active image to be skipped by the text writer. Consequently, dismissing/closing a text dialog does not automatically clear the characters. To completely erase text from the graphics region, you must force a single redraw of the image overlay.
+
+### Guidelines for Future Work
+
+- **No Updates on Typing/Navigation**: Do not set `needs_update = true` or call `update_protocol()` for keystrokes, character entry, or row selection inside dialog inputs.
+- **Redraw on Overlay Dismissal**: Set `needs_update = true` when dismissing or toggling an overlay *off* (such as closing the Help panel or hiding the command palette) to cleanly paint over and erase the characters.
