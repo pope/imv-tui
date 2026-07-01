@@ -20,7 +20,11 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{
+    StatefulImage,
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+};
 
 /// App state
 pub struct App {
@@ -42,6 +46,7 @@ pub struct App {
 
     pub last_widget_size: (u16, u16),
     pub needs_update: bool,
+    pub needs_clear: bool,
     pub rendered_size_cells: (u16, u16),
     pub current_zoom_pct: f64,
 }
@@ -65,6 +70,7 @@ impl App {
             error_message: None,
             last_widget_size: (0, 0),
             needs_update: true,
+            needs_clear: true,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
         };
@@ -93,6 +99,7 @@ impl App {
                     self.zoom_factor = 1.0;
                     self.pan_offset = (0, 0);
                     self.needs_update = true;
+                    self.needs_clear = true;
                 }
                 Err(e) => {
                     self.original_image = None;
@@ -215,6 +222,12 @@ impl App {
         s_w.min(s_h)
     }
 
+    /// Detect if we should sweep the screen with clear() to avoid graphics overlap artifacts.
+    /// Only necessary for Sixel terminals (like Foot) which write directly to cell grids.
+    pub fn should_clear_on_update(&self) -> bool {
+        matches!(self.picker.protocol_type(), ProtocolType::Sixel)
+    }
+
     /// Zoom in
     pub fn zoom_in(&mut self) {
         if self.original_image.is_none() {
@@ -253,6 +266,7 @@ impl App {
             self.zoom_factor = 1.0 / s;
             self.clamp_pan();
             self.needs_update = true;
+            self.needs_clear = true;
         }
     }
 
@@ -264,6 +278,7 @@ impl App {
         self.zoom_factor = 1.0;
         self.pan_offset = (0, 0);
         self.needs_update = true;
+        self.needs_clear = true;
     }
 
     /// Clamp pan offsets to keep the cropped viewport inside the original image bounds
@@ -361,6 +376,7 @@ impl App {
             self.zoom_factor = 1.0;
             self.pan_offset = (0, 0);
             self.needs_update = true;
+            self.needs_clear = true;
         }
     }
 
@@ -374,6 +390,7 @@ impl App {
             self.zoom_factor = 1.0;
             self.pan_offset = (0, 0);
             self.needs_update = true;
+            self.needs_clear = true;
         }
     }
 
@@ -568,7 +585,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 "- Rotate Counter-Clockwise 90°".into(),
             ]),
             Line::from(vec!["  Mouse Scroll   ".cyan(), "- Zoom In / Out".into()]),
-            Line::from(vec!["  ?              ".cyan(), "- Toggle Help".into()]),
+            Line::from(vec!["  ?, /           ".cyan(), "- Toggle Help".into()]),
         ];
 
         let help_paragraph = Paragraph::new(help_lines)
@@ -640,6 +657,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main event loop
     while app.running {
+        if app.needs_clear {
+            app.needs_clear = false;
+            if app.should_clear_on_update() {
+                terminal.clear()?;
+            }
+        }
         terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -647,10 +670,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            app.running = false;
+                            if app.show_help {
+                                app.show_help = false;
+                                app.needs_update = true;
+                                app.needs_clear = true;
+                            } else {
+                                app.running = false;
+                            }
                         }
-                        KeyCode::Char('?') => {
+                        KeyCode::Char('?') | KeyCode::Char('/') => {
                             app.show_help = !app.show_help;
+                            app.needs_update = true;
+                            app.needs_clear = true;
                         }
                         // Next image
                         KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => {
