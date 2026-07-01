@@ -19,20 +19,20 @@ ______________________________________________________________________
 
 ## Keyboard Shortcuts
 
-| Action                             | Primary Key | Alternative Keys                                   |
-| :--------------------------------- | :---------- | :------------------------------------------------- |
-| **Quit**                           | `q`         | `Esc`                                              |
-| **Next Image**                     | `n`         | `Space` / `]` / `Right Arrow` (when zoomed out)    |
-| **Previous Image**                 | `p`         | `Backspace` / `[` / `Left Arrow` (when zoomed out) |
-| **Zoom In**                        | `i`         | `+` / `=` / Mouse Scroll Up                        |
-| **Zoom Out**                       | `o`         | `-` / Mouse Scroll Down                            |
-| **Actual Size (100% Zoom)**        | `a`         |                                                    |
-| **Reset View (Fit Screen)**        | `r`         |                                                    |
-| **Rotate Clockwise (90°)**         | `e`         | `R` / `>`                                          |
-| **Rotate Counter-Clockwise (90°)** | `E`         | `<`                                                |
-| **Pan Left / Right**               | `h` / `l`   | `Left` / `Right Arrow` (when zoomed in)            |
-| **Pan Up / Down**                  | `k` / `j`   | `Up` / `Down Arrow` (when zoomed in)               |
-| **Toggle Help Screen**             | `?`         |                                                    |
+| Action                             | Primary Key | Alternative Keys            |
+| :--------------------------------- | :---------- | :-------------------------- |
+| **Quit**                           | `q`         | `Esc`                       |
+| **Next Image**                     | `n`         | `Space` / `]`               |
+| **Previous Image**                 | `p`         | `Backspace` / `[`           |
+| **Zoom In**                        | `i`         | `+` / `=` / Mouse Scroll Up |
+| **Zoom Out**                       | `o`         | `-` / Mouse Scroll Down     |
+| **Actual Size (100% Zoom)**        | `a`         |                             |
+| **Reset View (Fit Screen)**        | `r`         |                             |
+| **Rotate Clockwise (90°)**         | `e`         | `R` / `>`                   |
+| **Rotate Counter-Clockwise (90°)** | `E`         | `<`                         |
+| **Pan Left / Right**               | `h` / `l`   | `Left` / `Right Arrow`      |
+| **Pan Up / Down**                  | `k` / `j`   | `Up` / `Down Arrow`         |
+| **Toggle Help Screen**             | `?`         |                             |
 
 ______________________________________________________________________
 
@@ -44,7 +44,7 @@ Rather than sending massive raw images to the terminal graphics protocol and lea
 
 - It maps the target terminal widget dimensions (converted to pixel sizes based on terminal font sizes) and computes a fit-scale factor `s`.
 - For any zoom level, it generates a **crop window** dynamically mapped to the target terminal's aspect ratio.
-- If the crop window exceeds the boundaries of the image (when zoomed out), it clamps it while preserving the aspect ratio, which naturally creates top/bottom or left/right bars. As you zoom in, the crop window shrinks and eventually fits completely within the image, removing empty space.
+- If the crop box extends outside the image boundaries (due to zoom-out or panning past boundaries), `imv-tui` crops the visible intersection, resizes it, and overlays it onto a screen-resolution canvas. This naturally creates centering padding or off-screen margins while keeping memory usage extremely low.
 
 ### 2. Fast Nearest Neighbor Resizing
 

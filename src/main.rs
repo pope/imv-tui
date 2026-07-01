@@ -158,36 +158,65 @@ impl App {
             // 3. Compute crop window in original image pixels
             let crop_w = (widget_w_px / scale).round() as u32;
             let crop_h = (widget_h_px / scale).round() as u32;
+            let crop_w = crop_w.max(1);
+            let crop_h = crop_h.max(1);
 
-            // Clamp crop box size to original dimensions
-            let crop_w = crop_w.clamp(1, self.img_width);
-            let crop_h = crop_h.clamp(1, self.img_height);
-
-            // Center of crop window is center of image + pan_offset
-            let center_x = (self.img_width as i64 / 2) + self.pan_offset.0;
-            let center_y = (self.img_height as i64 / 2) + self.pan_offset.1;
-
-            // Compute top-left of crop box
-            let mut x = center_x - (crop_w as i64 / 2);
-            let mut y = center_y - (crop_h as i64 / 2);
-
-            // Clamp top-left so the crop box stays entirely within the original image
-            x = x.clamp(0, (self.img_width - crop_w) as i64);
-            y = y.clamp(0, (self.img_height - crop_h) as i64);
-
-            // Crop
-            let cropped = img.crop_imm(x as u32, y as u32, crop_w, crop_h);
-
-            // 4. Calculate target rendering size in pixels based on crop and zoom scale
+            // Calculate target rendering size in pixels based on crop and zoom scale
             let target_w = (crop_w as f64 * scale).round() as u32;
             let target_h = (crop_h as f64 * scale).round() as u32;
             let target_w = target_w.max(1);
             let target_h = target_h.max(1);
 
-            // 5. Resize cropped image to target screen size using Nearest Neighbor (pixel-perfect zooming!)
-            let resized = cropped.resize(target_w, target_h, image::imageops::FilterType::Nearest);
+            // Center of crop window is center of image + pan_offset
+            let center_x = (self.img_width as i64 / 2) + self.pan_offset.0;
+            let center_y = (self.img_height as i64 / 2) + self.pan_offset.1;
 
-            self.image_protocol = Some(self.picker.new_resize_protocol(resized));
+            // Compute top-left of crop box (can be negative if we pan past bounds)
+            let crop_x1 = center_x - (crop_w as i64 / 2);
+            let crop_y1 = center_y - (crop_h as i64 / 2);
+            let crop_x2 = crop_x1 + crop_w as i64;
+            let crop_y2 = crop_y1 + crop_h as i64;
+
+            // Intersecting bounds with original image
+            let inter_x1 = crop_x1.clamp(0, self.img_width as i64);
+            let inter_y1 = crop_y1.clamp(0, self.img_height as i64);
+            let inter_x2 = crop_x2.clamp(0, self.img_width as i64);
+            let inter_y2 = crop_y2.clamp(0, self.img_height as i64);
+
+            let mut canvas = DynamicImage::ImageRgba8(image::RgbaImage::new(target_w, target_h));
+
+            if inter_x2 > inter_x1 && inter_y2 > inter_y1 {
+                // Crop the intersecting portion of the original image
+                let cropped_part = img.crop_imm(
+                    inter_x1 as u32,
+                    inter_y1 as u32,
+                    (inter_x2 - inter_x1) as u32,
+                    (inter_y2 - inter_y1) as u32,
+                );
+
+                // Calculate target size for the cropped part
+                let target_inter_w = (((inter_x2 - inter_x1) as f64 * scale).round() as u32).max(1);
+                let target_inter_h = (((inter_y2 - inter_y1) as f64 * scale).round() as u32).max(1);
+
+                // Resize cropped part to target screen size
+                let resized_part = cropped_part.resize(
+                    target_inter_w,
+                    target_inter_h,
+                    image::imageops::FilterType::Nearest,
+                );
+
+                // Calculate paste coordinates on the canvas
+                let paste_x = ((inter_x1 - crop_x1) as f64 * scale).round() as i64;
+                let paste_y = ((inter_y1 - crop_y1) as f64 * scale).round() as i64;
+
+                let paste_x = paste_x.clamp(0, (target_w as i64 - target_inter_w as i64).max(0));
+                let paste_y = paste_y.clamp(0, (target_h as i64 - target_inter_h as i64).max(0));
+
+                // Overlay onto the blank canvas
+                image::imageops::overlay(&mut canvas, &resized_part, paste_x, paste_y);
+            }
+
+            self.image_protocol = Some(self.picker.new_resize_protocol(canvas));
 
             // Calculate exact cell size of the rendered image
             let cells_w = (target_w as f64 / cell_w as f64).round() as u16;
@@ -281,42 +310,13 @@ impl App {
         self.needs_clear = true;
     }
 
-    /// Clamp pan offsets to keep the cropped viewport inside the original image bounds
+    /// Clamp pan offsets so that the corners of the image cannot pan past the center point of the viewport
     pub fn clamp_pan(&mut self) {
         if self.original_image.is_none() {
             return;
         }
-
-        let (widget_w_cells, widget_h_cells) = self.last_widget_size;
-        if widget_w_cells == 0 || widget_h_cells == 0 {
-            self.pan_offset = (0, 0);
-            return;
-        }
-
-        let font_size = self.picker.font_size();
-        let mut cell_w = font_size.width;
-        let mut cell_h = font_size.height;
-        if cell_w == 0 {
-            cell_w = 8;
-        }
-        if cell_h == 0 {
-            cell_h = 16;
-        }
-
-        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
-        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
-
-        let s = self.get_fit_scale();
-        if s <= 0.0 {
-            return;
-        }
-        let scale = s * self.zoom_factor;
-
-        let crop_w = ((widget_w_px / scale).round() as i64).min(self.img_width as i64);
-        let crop_h = ((widget_h_px / scale).round() as i64).min(self.img_height as i64);
-
-        let max_pan_x = (self.img_width as i64 - crop_w).max(0) / 2;
-        let max_pan_y = (self.img_height as i64 - crop_h).max(0) / 2;
+        let max_pan_x = (self.img_width as i64 / 2).max(0);
+        let max_pan_y = (self.img_height as i64 / 2).max(0);
 
         self.pan_offset.0 = self.pan_offset.0.clamp(-max_pan_x, max_pan_x);
         self.pan_offset.1 = self.pan_offset.1.clamp(-max_pan_y, max_pan_y);
@@ -690,44 +690,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         // Vim Navigation (Pan)
                         KeyCode::Char('h') => {
-                            if app.zoom_factor > 1.0 {
-                                app.pan_left();
-                            } else {
-                                app.prev_image();
-                            }
+                            app.pan_left();
                         }
                         KeyCode::Char('l') => {
-                            if app.zoom_factor > 1.0 {
-                                app.pan_right();
-                            } else {
-                                app.next_image();
-                            }
+                            app.pan_right();
                         }
-                        KeyCode::Char('k') if app.zoom_factor > 1.0 => {
+                        KeyCode::Char('k') => {
                             app.pan_up();
                         }
-                        KeyCode::Char('j') if app.zoom_factor > 1.0 => {
+                        KeyCode::Char('j') => {
                             app.pan_down();
                         }
-                        // Arrow Keys (Pan, or Next/Prev if not zoomed)
+                        // Arrow Keys (Pan)
                         KeyCode::Left => {
-                            if app.zoom_factor > 1.0 {
-                                app.pan_left();
-                            } else {
-                                app.prev_image();
-                            }
+                            app.pan_left();
                         }
                         KeyCode::Right => {
-                            if app.zoom_factor > 1.0 {
-                                app.pan_right();
-                            } else {
-                                app.next_image();
-                            }
+                            app.pan_right();
                         }
-                        KeyCode::Up if app.zoom_factor > 1.0 => {
+                        KeyCode::Up => {
                             app.pan_up();
                         }
-                        KeyCode::Down if app.zoom_factor > 1.0 => {
+                        KeyCode::Down => {
                             app.pan_down();
                         }
                         _ => {}

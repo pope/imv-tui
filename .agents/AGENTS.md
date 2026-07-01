@@ -92,3 +92,24 @@ Cross-platform key event parsing in terminals (especially for combinations like 
 
 - Do not rely solely on `KeyCode::Char('?')` to toggle help menus. Bind both `?` and `/` to toggle help windows.
 - Always check `key.kind == KeyEventKind::Press` to ignore release events in terminals that support keyboard enhancement protocols.
+
+______________________________________________________________________
+
+## 5. Screen-Canvas Panning and Off-Screen Margins
+
+### The Learning
+
+When panning an image past its boundaries (where parts of the viewport show empty black padding), simple cropping using `img.crop_imm(...)` fails because the crop box coordinates extend outside `[0, img_width]` or `[0, img_height]`.
+
+- To support off-screen margins, we can calculate the **intersection** of the crop box and the original image.
+- We crop only the visible intersection, resize it to its final screen-pixel scale, and overlay/paste it onto a blank (rgba/transparent) **screen-size canvas buffer** at computed offset positions:
+  ```rust
+  let mut canvas = RgbaImage::new(target_width, target_height);
+  image::imageops::overlay(&mut canvas, &resized_intersection, paste_x, paste_y);
+  ```
+- **Automatic Centering**: When zoomed out, this canvas-overlay approach automatically centers the image with symmetric padding on all sides, eliminating any complex cell-level coordinate math in layout widgets.
+- **Corner Center Panning Limits**: To prevent the image from being panned completely off-screen, clamp the `pan_offset` boundaries to `img_width / 2` and `img_height / 2`. This guarantees that the center of the viewport can never cross the corners of the image, keeping at least 1/4 of the image visible.
+
+### Guidelines for Future Work
+
+- **High-Performance Resizing**: Do not create the canvas at high original-image resolutions. Always crop the intersection in original space first, resize the cropped part to screen-pixel dimensions, and then overlay it onto a screen-resolution canvas. This avoids processing large buffers.
