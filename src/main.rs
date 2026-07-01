@@ -11,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use image::DynamicImage;
+use image::{DynamicImage, GenericImage};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -183,38 +183,57 @@ impl App {
             let inter_x2 = crop_x2.clamp(0, self.img_width as i64);
             let inter_y2 = crop_y2.clamp(0, self.img_height as i64);
 
-            let mut canvas = DynamicImage::ImageRgba8(image::RgbaImage::new(target_w, target_h));
-
-            if inter_x2 > inter_x1 && inter_y2 > inter_y1 {
-                // Crop the intersecting portion of the original image
+            let canvas = if inter_x1 == crop_x1
+                && inter_x2 == crop_x2
+                && inter_y1 == crop_y1
+                && inter_y2 == crop_y2
+            {
+                // Optimization: Crop box is fully inside the image (e.g. zoomed in & panning).
+                // Resize the crop directly, completely bypassing background canvas allocation and overlays!
                 let cropped_part = img.crop_imm(
                     inter_x1 as u32,
                     inter_y1 as u32,
                     (inter_x2 - inter_x1) as u32,
                     (inter_y2 - inter_y1) as u32,
                 );
+                cropped_part.resize(target_w, target_h, image::imageops::FilterType::Nearest)
+            } else {
+                // Crop box goes outside image bounds (e.g. zoomed out or panned past edge).
+                // Create a blank background canvas and copy the visible portion onto it.
+                let mut screen_canvas = image::RgbaImage::new(target_w, target_h);
 
-                // Calculate target size for the cropped part
-                let target_inter_w = (((inter_x2 - inter_x1) as f64 * scale).round() as u32).max(1);
-                let target_inter_h = (((inter_y2 - inter_y1) as f64 * scale).round() as u32).max(1);
+                if inter_x2 > inter_x1 && inter_y2 > inter_y1 {
+                    let cropped_part = img.crop_imm(
+                        inter_x1 as u32,
+                        inter_y1 as u32,
+                        (inter_x2 - inter_x1) as u32,
+                        (inter_y2 - inter_y1) as u32,
+                    );
 
-                // Resize cropped part to target screen size
-                let resized_part = cropped_part.resize(
-                    target_inter_w,
-                    target_inter_h,
-                    image::imageops::FilterType::Nearest,
-                );
+                    let target_inter_w =
+                        (((inter_x2 - inter_x1) as f64 * scale).round() as u32).max(1);
+                    let target_inter_h =
+                        (((inter_y2 - inter_y1) as f64 * scale).round() as u32).max(1);
 
-                // Calculate paste coordinates on the canvas
-                let paste_x = ((inter_x1 - crop_x1) as f64 * scale).round() as i64;
-                let paste_y = ((inter_y1 - crop_y1) as f64 * scale).round() as i64;
+                    let resized_part = cropped_part.resize(
+                        target_inter_w,
+                        target_inter_h,
+                        image::imageops::FilterType::Nearest,
+                    );
 
-                let paste_x = paste_x.clamp(0, (target_w as i64 - target_inter_w as i64).max(0));
-                let paste_y = paste_y.clamp(0, (target_h as i64 - target_inter_h as i64).max(0));
+                    let paste_x = ((inter_x1 - crop_x1) as f64 * scale).round() as i64;
+                    let paste_y = ((inter_y1 - crop_y1) as f64 * scale).round() as i64;
 
-                // Overlay onto the blank canvas
-                image::imageops::overlay(&mut canvas, &resized_part, paste_x, paste_y);
-            }
+                    let paste_x =
+                        paste_x.clamp(0, (target_w as i64 - target_inter_w as i64).max(0)) as u32;
+                    let paste_y =
+                        paste_y.clamp(0, (target_h as i64 - target_inter_h as i64).max(0)) as u32;
+
+                    // Fast memory-copy block transfer without expensive alpha-blending math
+                    let _ = screen_canvas.copy_from(&resized_part, paste_x, paste_y);
+                }
+                DynamicImage::ImageRgba8(screen_canvas)
+            };
 
             self.image_protocol = Some(self.picker.new_resize_protocol(canvas));
 
