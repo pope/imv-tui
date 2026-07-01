@@ -1120,7 +1120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('f') => {
                                 app.palette_mode = PaletteMode::File;
                                 app.palette_query.clear();
-                                app.palette_selected_index = 0;
+                                app.palette_selected_index = app.current_index;
                                 app.needs_clear = true;
                             }
                             // Next image
