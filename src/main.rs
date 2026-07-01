@@ -560,30 +560,18 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Line::from(vec!["  p, Backspace, [".cyan(), "- Previous image".into()]),
             Line::from(vec!["  i, +           ".cyan(), "- Zoom In".into()]),
             Line::from(vec!["  o, -           ".cyan(), "- Zoom Out".into()]),
-            Line::from(vec![
-                "  a              ".cyan(),
-                "- Actual Size (100% Zoom)".into(),
-            ]),
-            Line::from(vec![
-                "  r              ".cyan(),
-                "- Reset View (Fit Screen)".into(),
-            ]),
+            Line::from(vec!["  a              ".cyan(), "- Actual Size".into()]),
+            Line::from(vec!["  r              ".cyan(), "- Reset View".into()]),
             Line::from(vec![
                 "  h, j, k, l     ".cyan(),
-                "- Pan Left, Down, Up, Right".into(),
+                "- Pan Left/Down/Up/Right".into(),
             ]),
             Line::from(vec![
                 "  Arrow Keys     ".cyan(),
-                "- Pan (or Prev/Next image if not zoomed)".into(),
+                "- Pan or Prev/Next image".into(),
             ]),
-            Line::from(vec![
-                "  e, R, >        ".cyan(),
-                "- Rotate Clockwise 90°".into(),
-            ]),
-            Line::from(vec![
-                "  E, <           ".cyan(),
-                "- Rotate Counter-Clockwise 90°".into(),
-            ]),
+            Line::from(vec!["  e, R, >        ".cyan(), "- Rotate CW 90°".into()]),
+            Line::from(vec!["  E, <           ".cyan(), "- Rotate CCW 90°".into()]),
             Line::from(vec!["  Mouse Scroll   ".cyan(), "- Zoom In / Out".into()]),
             Line::from(vec!["  ?, /           ".cyan(), "- Toggle Help".into()]),
         ];
@@ -597,31 +585,18 @@ fn ui(frame: &mut Frame, app: &mut App) {
             )
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-        let popup_area = centered_rect(60, 65, frame.area());
+        let help_width = 44_u16;
+        let help_height = 17_u16;
+
+        let w = help_width.min(chunks[0].width.saturating_sub(1));
+        let h = help_height.min(chunks[0].height.saturating_sub(1));
+        let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+        let y = chunks[0].y.saturating_add(1);
+
+        let popup_area = Rect::new(x, y, w, h);
         frame.render_widget(Clear, popup_area);
         frame.render_widget(help_paragraph, popup_area);
     }
-}
-
-/// Helper function to create a centered rectangle for the pop-up
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

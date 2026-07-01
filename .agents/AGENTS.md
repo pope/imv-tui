@@ -13,6 +13,7 @@ Terminal image rendering libraries (like `ratatui-image`) display graphics using
 - **Kitty** uses referenceable overlay buffers that can be selectively redrawn or removed by the terminal.
 - **Sixel** writes graphics directly onto the text grid cells of the terminal screen.
 - **Double Buffering Conflict**: `ratatui` uses a double-buffering algorithm to only draw terminal cell changes. When text overlay popups (like the Help menu) are dismissed, the terminal double-buffer may not detect a cell change because Sixel widgets do not output standard space character bytes. This leaves the old text overlay characters frozen on top of the image layer in Sixel terminals (such as Foot).
+- **Text Overlay Graphics Erasure Bug (Clear to End of Line)**: When drawing text overlays (e.g. popups) centered on top of active terminal graphics (Kitty or Sixel overlays), the TUI backend (like `ratatui`'s `CrosstermBackend` using `\x1b[K`) optimizes rendering by erasing characters to the right of the print cursor. In Kitty, this erases the graphic overlay from the cursor position to the right edge of the screen, creating an asymmetric visual bug where the left margin shows the image but the right margin is cut off.
 
 ### Guidelines for Future Work
 
@@ -25,6 +26,7 @@ Terminal image rendering libraries (like `ratatui-image`) display graphics using
   }
   ```
   This keeps Kitty and Halfblock rendering smooth and flicker-free, while ensuring Sixel redraws cleanly.
+- **Top-Right HUD Workaround for Clear-to-Right Bug**: To preserve a transparent background view of the image margins while avoiding the clear-to-right visual bug in Sixel/Kitty, position the overlay popup against the top-right corner of the viewport (or offset by exactly 1 cell to look floating). Aligning the popup's right edge near the terminal's right boundary removes any visible right margin columns, neutralizing the line-erasure region while leaving the left margins fully transparent and intact.
 
 ______________________________________________________________________
 
