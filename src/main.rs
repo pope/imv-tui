@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -53,6 +54,170 @@ use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
+
+fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), String> {
+    match source {
+        ImageSource::Local(path) => {
+            let format = image::ImageReader::open(&path)
+                .and_then(|r| r.with_guessed_format())
+                .map(|r| r.format());
+
+            if let Ok(Some(image::ImageFormat::Jpeg)) = format
+                && let Ok(bytes) = std::fs::read(&path) {
+                    let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+                        .jpeg_set_out_colorspace(
+                            zune_jpeg::zune_core::colorspace::ColorSpace::RGBA,
+                        );
+                    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&bytes, options);
+                    if let Ok(pixels) = decoder.decode()
+                        && let Some(info) = decoder.info()
+                            && let Some(rgba_img) = image::RgbaImage::from_raw(
+                                info.width as u32,
+                                info.height as u32,
+                                pixels,
+                            ) {
+                                let orientation = match image::ImageReader::open(&path)
+                                    .and_then(|r| r.with_guessed_format())
+                                {
+                                    Ok(reader) => match reader.into_decoder() {
+                                        Ok(mut dec) => dec
+                                            .orientation()
+                                            .unwrap_or(image::metadata::Orientation::NoTransforms),
+                                        Err(_) => image::metadata::Orientation::NoTransforms,
+                                    },
+                                    Err(_) => image::metadata::Orientation::NoTransforms,
+                                };
+
+                                let mut img = image::DynamicImage::ImageRgba8(rgba_img);
+                                img.apply_orientation(orientation);
+                                let w = img.width();
+                                let h = img.height();
+                                return Ok((img, w, h));
+                            }
+                }
+
+            let reader = image::ImageReader::open(&path)
+                .map_err(|e| format!("Failed to open file:\n{}\n\nError: {}", path.display(), e))?
+                .with_guessed_format()
+                .map_err(|e| {
+                    format!(
+                        "Failed to guess format for:\n{}\n\nError: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+
+            let mut decoder = reader.into_decoder().map_err(|e| {
+                format!(
+                    "Failed to read metadata:\n{}\n\nError: {}",
+                    path.display(),
+                    e
+                )
+            })?;
+
+            let orientation = decoder
+                .orientation()
+                .unwrap_or(image::metadata::Orientation::NoTransforms);
+            let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
+                format!(
+                    "Failed to decode image:\n{}\n\nError: {}",
+                    path.display(),
+                    e
+                )
+            })?;
+
+            img.apply_orientation(orientation);
+            let rgba_img = img.to_rgba8();
+            let w = rgba_img.width();
+            let h = rgba_img.height();
+            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+        }
+        ImageSource::Cbz {
+            zip_path,
+            file_in_zip,
+        } => {
+            let file = std::fs::File::open(&zip_path)
+                .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
+            let reader = std::io::BufReader::new(file);
+            let mut archive = zip::ZipArchive::new(reader)
+                .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
+            let mut zip_entry = archive.by_name(&file_in_zip).map_err(|e| {
+                format!(
+                    "Failed to locate page {} in {}: {}",
+                    file_in_zip,
+                    zip_path.display(),
+                    e
+                )
+            })?;
+            let mut buffer = Vec::with_capacity(zip_entry.size() as usize);
+            use std::io::Read;
+            zip_entry.read_to_end(&mut buffer).map_err(|e| {
+                format!(
+                    "Failed to read page data {} from {}: {}",
+                    file_in_zip,
+                    zip_path.display(),
+                    e
+                )
+            })?;
+
+            let cursor = std::io::Cursor::new(buffer.clone());
+            let reader = image::ImageReader::new(cursor)
+                .with_guessed_format()
+                .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
+
+            if let Some(image::ImageFormat::Jpeg) = reader.format() {
+                let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+                    .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+                let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&buffer, options);
+                if let Ok(pixels) = decoder.decode()
+                    && let Some(info) = decoder.info()
+                        && let Some(rgba_img) = image::RgbaImage::from_raw(
+                            info.width as u32,
+                            info.height as u32,
+                            pixels,
+                        ) {
+                            let cursor_meta = std::io::Cursor::new(buffer);
+                            let orientation =
+                                match image::ImageReader::new(cursor_meta).with_guessed_format() {
+                                    Ok(reader) => match reader.into_decoder() {
+                                        Ok(mut dec) => dec
+                                            .orientation()
+                                            .unwrap_or(image::metadata::Orientation::NoTransforms),
+                                        Err(_) => image::metadata::Orientation::NoTransforms,
+                                    },
+                                    Err(_) => image::metadata::Orientation::NoTransforms,
+                                };
+
+                            let mut img = image::DynamicImage::ImageRgba8(rgba_img);
+                            img.apply_orientation(orientation);
+                            let w = img.width();
+                            let h = img.height();
+                            return Ok((img, w, h));
+                        }
+            }
+
+            let cursor = std::io::Cursor::new(buffer);
+            let reader = image::ImageReader::new(cursor)
+                .with_guessed_format()
+                .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
+
+            let mut decoder = reader
+                .into_decoder()
+                .map_err(|e| format!("Failed to decode header for {}: {}", file_in_zip, e))?;
+            let orientation = decoder
+                .orientation()
+                .unwrap_or(image::metadata::Orientation::NoTransforms);
+            let mut img = image::DynamicImage::from_decoder(decoder)
+                .map_err(|e| format!("Failed to decode image data for {}: {}", file_in_zip, e))?;
+            img.apply_orientation(orientation);
+
+            let rgba_img = img.to_rgba8();
+            let w = rgba_img.width();
+            let h = rgba_img.height();
+            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+        }
+    }
+}
 
 struct ResizeRequest {
     img: Arc<DynamicImage>,
@@ -414,6 +579,7 @@ pub struct App {
     pub last_help_toggle: Option<Instant>,
     pub brightness: i32,
     pub contrast: f32,
+    prefetch_cache: Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32)>>>,
 }
 
 impl App {
@@ -485,6 +651,7 @@ impl App {
             last_help_toggle: None,
             brightness: 0,
             contrast: 0.0,
+            prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         app.start_load_image();
@@ -591,6 +758,49 @@ impl App {
     }
 
     /// Start loading the image at the current index in the background
+    /// Trigger background prefetching of adjacent images and prune old cache entries
+    pub fn trigger_prefetch(&self) {
+        if self.images.len() <= 1 {
+            return;
+        }
+
+        let current_index = self.current_index;
+        let next_idx = (current_index + 1) % self.images.len();
+        let prev_idx = if current_index == 0 {
+            self.images.len() - 1
+        } else {
+            current_index - 1
+        };
+
+        // Prune any cache entries that are not adjacent to the current_index
+        {
+            let mut cache = self.prefetch_cache.lock().unwrap();
+            cache.retain(|idx, _| *idx == next_idx || *idx == prev_idx);
+        }
+
+        let targets = vec![next_idx, prev_idx];
+
+        for idx in targets {
+            {
+                let cache = self.prefetch_cache.lock().unwrap();
+                if cache.contains_key(&idx) {
+                    continue;
+                }
+            }
+
+            let source = self.images[idx].clone();
+            let cache_clone = Arc::clone(&self.prefetch_cache);
+
+            std::thread::spawn(move || {
+                if let Ok((img, w, h)) = decode_image_source(source) {
+                    let mut cache = cache_clone.lock().unwrap();
+                    cache.insert(idx, (Arc::new(img), w, h));
+                }
+            });
+        }
+    }
+
+    /// Start loading the image at the current index in the background
     pub fn start_load_image(&mut self) {
         if self.images.is_empty() {
             self.original_image = None;
@@ -599,109 +809,40 @@ impl App {
             return;
         }
 
-        self.is_loading = true;
-        self.loading_start_time = Some(Instant::now());
         self.error_message = None;
         self.clear_on_protocol_receive = true;
+
+        // Check if the image is in the prefetch cache
+        let cached = {
+            let mut cache = self.prefetch_cache.lock().unwrap();
+            cache.remove(&self.current_index)
+        };
+
+        if let Some((img, w, h)) = cached {
+            self.original_image = Some(img);
+            self.img_width = w;
+            self.img_height = h;
+            self.zoom_factor = 1.0;
+            self.pan_offset = (0, 0);
+            self.brightness = 0;
+            self.contrast = 0.0;
+            self.is_loading = false;
+            self.needs_update = true;
+            self.zoom_needs_initialization = true;
+            self.trigger_prefetch();
+            return;
+        }
+
+        // Cache miss: load as normal
+        self.is_loading = true;
+        self.loading_start_time = Some(Instant::now());
 
         let source = self.images[self.current_index].clone();
         let (tx, rx) = mpsc::channel();
         self.image_rx = Some(rx);
 
         std::thread::spawn(move || {
-            let res = match source {
-                ImageSource::Local(path) => {
-                    match image::ImageReader::open(&path).and_then(|r| r.with_guessed_format()) {
-                        Ok(reader) => match reader.into_decoder() {
-                            Ok(mut decoder) => {
-                                let orientation = decoder
-                                    .orientation()
-                                    .unwrap_or(image::metadata::Orientation::NoTransforms);
-                                match image::DynamicImage::from_decoder(decoder) {
-                                    Ok(mut img) => {
-                                        img.apply_orientation(orientation);
-                                        let rgba_img = img.to_rgba8();
-                                        let w = rgba_img.width();
-                                        let h = rgba_img.height();
-                                        Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
-                                    }
-                                    Err(e) => Err(format!(
-                                        "Failed to decode image:\n{}\n\nError: {}",
-                                        path.display(),
-                                        e
-                                    )),
-                                }
-                            }
-                            Err(e) => Err(format!(
-                                "Failed to read image metadata:\n{}\n\nError: {}",
-                                path.display(),
-                                e
-                            )),
-                        },
-                        Err(e) => Err(format!(
-                            "Failed to open file:\n{}\n\nError: {}",
-                            path.display(),
-                            e
-                        )),
-                    }
-                }
-                ImageSource::Cbz {
-                    zip_path,
-                    file_in_zip,
-                } => {
-                    let load_cbz = move || -> Result<(image::DynamicImage, u32, u32), String> {
-                        let file = std::fs::File::open(&zip_path).map_err(|e| {
-                            format!("Failed to open zip file {}: {}", zip_path.display(), e)
-                        })?;
-                        let reader = std::io::BufReader::new(file);
-                        let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
-                            format!("Failed to read zip archive {}: {}", zip_path.display(), e)
-                        })?;
-                        let mut zip_entry = archive.by_name(&file_in_zip).map_err(|e| {
-                            format!(
-                                "Failed to locate page {} in {}: {}",
-                                file_in_zip,
-                                zip_path.display(),
-                                e
-                            )
-                        })?;
-                        let mut buffer = Vec::with_capacity(zip_entry.size() as usize);
-                        use std::io::Read;
-                        zip_entry.read_to_end(&mut buffer).map_err(|e| {
-                            format!(
-                                "Failed to read page data {} from {}: {}",
-                                file_in_zip,
-                                zip_path.display(),
-                                e
-                            )
-                        })?;
-
-                        let cursor = std::io::Cursor::new(buffer);
-                        let reader = image::ImageReader::new(cursor)
-                            .with_guessed_format()
-                            .map_err(|e| {
-                                format!("Failed to guess image format for {}: {}", file_in_zip, e)
-                            })?;
-
-                        let mut decoder = reader.into_decoder().map_err(|e| {
-                            format!("Failed to decode header for {}: {}", file_in_zip, e)
-                        })?;
-                        let orientation = decoder
-                            .orientation()
-                            .unwrap_or(image::metadata::Orientation::NoTransforms);
-                        let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
-                            format!("Failed to decode image data for {}: {}", file_in_zip, e)
-                        })?;
-                        img.apply_orientation(orientation);
-
-                        let rgba_img = img.to_rgba8();
-                        let w = rgba_img.width();
-                        let h = rgba_img.height();
-                        Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
-                    };
-                    load_cbz()
-                }
-            };
+            let res = decode_image_source(source);
             let _ = tx.send(res);
         });
     }
@@ -723,6 +864,7 @@ impl App {
                     self.is_loading = false;
                     self.needs_update = true;
                     self.zoom_needs_initialization = true;
+                    self.trigger_prefetch();
                 }
                 Err(err) => {
                     self.original_image = None;

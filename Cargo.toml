@@ -11,6 +11,8 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 libc = "0.2"
 fast_image_resize = { version = "6.0.0", features = ["image"] }
 zip = { version = "2.2.0", default-features = false, features = ["deflate"] }
+zune-jpeg = "0.4.13"
+
 
 [profile.dev]
 opt-level = 1
