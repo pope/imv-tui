@@ -1929,6 +1929,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.palette_selected_index += 1;
                                     }
                                 }
+                                KeyCode::PageUp => {
+                                    app.palette_selected_index =
+                                        app.palette_selected_index.saturating_sub(8);
+                                }
+                                KeyCode::PageDown => {
+                                    let max_len = match app.palette_mode {
+                                        PaletteMode::File => app.get_filtered_files().len(),
+                                        PaletteMode::Command => app.get_filtered_commands().len(),
+                                        _ => 0,
+                                    };
+                                    if max_len > 0 {
+                                        app.palette_selected_index =
+                                            (app.palette_selected_index + 8).min(max_len - 1);
+                                    }
+                                }
                                 KeyCode::Char('k')
                                     if key.modifiers.contains(event::KeyModifiers::CONTROL)
                                         && app.palette_selected_index > 0 =>
