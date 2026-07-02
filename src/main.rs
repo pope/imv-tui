@@ -47,6 +47,7 @@ struct ResizeRequest {
 }
 
 fn fast_resize(
+    resizer: &mut fir::Resizer,
     src_img: &DynamicImage,
     dst_w: u32,
     dst_h: u32,
@@ -80,7 +81,6 @@ fn fast_resize(
         options = options.crop(left, top, width, height);
     }
 
-    let mut resizer = fir::Resizer::new();
     resizer.resize(rgba_src, &mut dst_image, Some(&options))?;
 
     let buffer = dst_image.into_vec();
@@ -89,7 +89,7 @@ fn fast_resize(
     Ok(DynamicImage::ImageRgba8(rgba_dst))
 }
 
-fn process_resize(req: ResizeRequest) -> StatefulProtocol {
+fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulProtocol {
     let canvas = if req.inter_x1 == req.crop_x1
         && req.inter_x2 == req.crop_x2
         && req.inter_y1 == req.crop_y1
@@ -102,6 +102,7 @@ fn process_resize(req: ResizeRequest) -> StatefulProtocol {
             (req.inter_y2 - req.inter_y1) as f64,
         ));
         match fast_resize(
+            resizer,
             &req.img,
             req.target_w,
             req.target_h,
@@ -136,6 +137,7 @@ fn process_resize(req: ResizeRequest) -> StatefulProtocol {
             ));
 
             let resized_part = match fast_resize(
+                resizer,
                 &req.img,
                 target_inter_w,
                 target_inter_h,
@@ -283,11 +285,20 @@ const COMMANDS: &[CommandItem] = &[
 ];
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
-    let text_lower = text.to_lowercase();
-    let query_lower = query.to_lowercase();
-    let mut text_chars = text_lower.chars();
-    for q_char in query_lower.chars() {
-        if !text_chars.any(|t_char| t_char == q_char) {
+    if query.is_empty() {
+        return true;
+    }
+    let mut text_chars = text.chars();
+    for q_char in query.chars() {
+        let mut found = false;
+        let q_lower = q_char.to_lowercase();
+        for t_char in text_chars.by_ref() {
+            if t_char.to_lowercase().eq(q_lower.clone()) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
             return false;
         }
     }
@@ -297,6 +308,8 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
 /// App state
 pub struct App {
     pub images: Vec<ImageSource>,
+    pub display_names: Vec<String>,
+    pub display_names_lowercase: Vec<String>,
     pub current_index: usize,
     pub original_image: Option<Arc<DynamicImage>>,
     pub image_protocol: Option<StatefulProtocol>,
@@ -343,18 +356,25 @@ impl App {
             return Err("No supported images found".to_string());
         }
 
+        let display_names: Vec<String> = images.iter().map(|img| img.display_name()).collect();
+        let display_names_lowercase: Vec<String> = display_names
+            .iter()
+            .map(|name| name.to_lowercase())
+            .collect();
+
         let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
         let (protocol_tx, protocol_rx) = mpsc::channel::<StatefulProtocol>();
 
         // Spawn background resizing worker thread
         std::thread::spawn(move || {
+            let mut resizer = fir::Resizer::new();
             loop {
                 if let Ok(req) = resize_rx.recv() {
                     let mut latest_req = req;
                     while let Ok(next_req) = resize_rx.try_recv() {
                         latest_req = next_req;
                     }
-                    let protocol = process_resize(latest_req);
+                    let protocol = process_resize(latest_req, &mut resizer);
                     let _ = protocol_tx.send(protocol);
                 }
             }
@@ -362,6 +382,8 @@ impl App {
 
         let mut app = Self {
             images,
+            display_names,
+            display_names_lowercase,
             current_index,
             original_image: None,
             image_protocol: None,
@@ -396,11 +418,28 @@ impl App {
     }
 
     pub fn get_filtered_files(&self) -> Vec<(usize, String)> {
-        self.images
+        let query_lower = self.palette_query.to_lowercase();
+        self.display_names
             .iter()
             .enumerate()
-            .map(|(idx, src)| (idx, src.display_name()))
-            .filter(|(_, name)| fuzzy_match(name, &self.palette_query))
+            .filter(|(idx, _)| {
+                let file_lower = &self.display_names_lowercase[*idx];
+                let mut file_chars = file_lower.chars();
+                for q_char in query_lower.chars() {
+                    let mut found = false;
+                    for f_char in file_chars.by_ref() {
+                        if f_char == q_char {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(idx, name)| (idx, name.clone()))
             .collect()
     }
 
@@ -527,7 +566,8 @@ impl App {
                         let file = std::fs::File::open(&zip_path).map_err(|e| {
                             format!("Failed to open zip file {}: {}", zip_path.display(), e)
                         })?;
-                        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+                        let reader = std::io::BufReader::new(file);
+                        let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
                             format!("Failed to read zip archive {}: {}", zip_path.display(), e)
                         })?;
                         let mut zip_entry = archive.by_name(&file_in_zip).map_err(|e| {
@@ -538,8 +578,9 @@ impl App {
                                 e
                             )
                         })?;
-                        let mut buffer = Vec::new();
-                        std::io::copy(&mut zip_entry, &mut buffer).map_err(|e| {
+                        let mut buffer = Vec::with_capacity(zip_entry.size() as usize);
+                        use std::io::Read;
+                        zip_entry.read_to_end(&mut buffer).map_err(|e| {
                             format!(
                                 "Failed to read page data {} from {}: {}",
                                 file_in_zip,
@@ -873,11 +914,11 @@ impl App {
     }
 
     /// Get current image file name
-    pub fn current_filename(&self) -> String {
+    pub fn current_filename(&self) -> &str {
         if self.images.is_empty() {
-            return "No file loaded".to_string();
+            return "No file loaded";
         }
-        self.images[self.current_index].display_name()
+        &self.display_names[self.current_index]
     }
 
     /// Next image
@@ -962,10 +1003,10 @@ enum GuessType {
 }
 
 fn guess_file_type(path: &Path) -> Option<GuessType> {
-    let file = std::fs::File::open(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
     let mut header = [0u8; 16];
     use std::io::Read;
-    let n = std::io::BufReader::new(file).read(&mut header).ok()?;
+    let n = file.read(&mut header).ok()?;
     let bytes = &header[..n];
 
     if bytes.len() >= 2 && bytes[0] == 0x50 && bytes[1] == 0x4B {
@@ -983,15 +1024,18 @@ fn is_image_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        if matches!(
-            ext_lower.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "ico"
-        ) {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && (ext.eq_ignore_ascii_case("png")
+            || ext.eq_ignore_ascii_case("jpg")
+            || ext.eq_ignore_ascii_case("jpeg")
+            || ext.eq_ignore_ascii_case("gif")
+            || ext.eq_ignore_ascii_case("webp")
+            || ext.eq_ignore_ascii_case("bmp")
+            || ext.eq_ignore_ascii_case("tiff")
+            || ext.eq_ignore_ascii_case("ico"))
+        {
             return true;
         }
-    }
     matches!(guess_file_type(path), Some(GuessType::Image))
 }
 
@@ -999,45 +1043,47 @@ fn is_cbz_or_zip(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        if ext_lower == "cbz" || ext_lower == "zip" {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && (ext.eq_ignore_ascii_case("cbz") || ext.eq_ignore_ascii_case("zip")) {
             return true;
         }
-    }
     matches!(guess_file_type(path), Some(GuessType::Zip))
 }
 
 fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
-    let mut archive = zip::ZipArchive::new(file)
+    let reader = std::io::BufReader::new(file);
+    let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
 
-    let mut pages = Vec::new();
+    let mut pages = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index(i)
             && entry.is_file()
         {
             let name = entry.name();
-            if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
-                let ext_lower = ext.to_lowercase();
-                if matches!(
-                    ext_lower.as_str(),
-                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "ico"
-                ) {
+            if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("png")
+                    || ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("gif")
+                    || ext.eq_ignore_ascii_case("webp")
+                    || ext.eq_ignore_ascii_case("bmp")
+                    || ext.eq_ignore_ascii_case("tiff")
+                    || ext.eq_ignore_ascii_case("ico"))
+                {
                     pages.push(name.to_string());
                 }
-            }
         }
     }
 
-    pages.sort_by_key(|a| a.to_lowercase());
+    pages.sort_by_cached_key(|a| a.to_lowercase());
     Ok(pages)
 }
 
 fn collect_sources(paths: &[PathBuf]) -> Result<Vec<ImageSource>, String> {
-    let mut sources = Vec::new();
+    let mut sources = Vec::with_capacity(paths.len());
     for path in paths {
         if is_cbz_or_zip(path) {
             let pages = list_cbz_pages(path)?;
