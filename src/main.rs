@@ -176,6 +176,37 @@ fn process_resize(req: ResizeRequest) -> StatefulProtocol {
 
 type ImageReceiver = mpsc::Receiver<Result<(DynamicImage, u32, u32), String>>;
 
+#[derive(Clone, Debug)]
+pub enum ImageSource {
+    Local(PathBuf),
+    Cbz {
+        zip_path: PathBuf,
+        file_in_zip: String,
+    },
+}
+
+impl ImageSource {
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Local(path) => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string(),
+            Self::Cbz {
+                zip_path,
+                file_in_zip,
+            } => {
+                let zip_name = zip_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Unknown");
+                format!("{}: {}", zip_name, file_in_zip)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     Closed,
@@ -265,7 +296,7 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
 
 /// App state
 pub struct App {
-    pub images: Vec<PathBuf>,
+    pub images: Vec<ImageSource>,
     pub current_index: usize,
     pub original_image: Option<Arc<DynamicImage>>,
     pub image_protocol: Option<StatefulProtocol>,
@@ -302,7 +333,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        images: Vec<PathBuf>,
+        images: Vec<ImageSource>,
         current_index: usize,
         picker: Picker,
         filter_type: FilterType,
@@ -366,15 +397,7 @@ impl App {
         self.images
             .iter()
             .enumerate()
-            .map(|(idx, path)| {
-                (
-                    idx,
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("Unknown")
-                        .to_string(),
-                )
-            })
+            .map(|(idx, src)| (idx, src.display_name()))
             .filter(|(_, name)| fuzzy_match(name, &self.palette_query))
             .collect()
     }
@@ -453,43 +476,99 @@ impl App {
         self.error_message = None;
         self.clear_on_protocol_receive = true;
 
-        let path = self.images[self.current_index].clone();
+        let source = self.images[self.current_index].clone();
         let (tx, rx) = mpsc::channel();
         self.image_rx = Some(rx);
 
         std::thread::spawn(move || {
-            let res = match image::ImageReader::open(&path) {
-                Ok(reader) => match reader.into_decoder() {
-                    Ok(mut decoder) => {
-                        let orientation = decoder
-                            .orientation()
-                            .unwrap_or(image::metadata::Orientation::NoTransforms);
-                        match image::DynamicImage::from_decoder(decoder) {
-                            Ok(mut img) => {
-                                img.apply_orientation(orientation);
-                                let rgba_img = img.to_rgba8();
-                                let w = rgba_img.width();
-                                let h = rgba_img.height();
-                                Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+            let res = match source {
+                ImageSource::Local(path) => match image::ImageReader::open(&path) {
+                    Ok(reader) => match reader.into_decoder() {
+                        Ok(mut decoder) => {
+                            let orientation = decoder
+                                .orientation()
+                                .unwrap_or(image::metadata::Orientation::NoTransforms);
+                            match image::DynamicImage::from_decoder(decoder) {
+                                Ok(mut img) => {
+                                    img.apply_orientation(orientation);
+                                    let rgba_img = img.to_rgba8();
+                                    let w = rgba_img.width();
+                                    let h = rgba_img.height();
+                                    Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+                                }
+                                Err(e) => Err(format!(
+                                    "Failed to decode image:\n{}\n\nError: {}",
+                                    path.display(),
+                                    e
+                                )),
                             }
-                            Err(e) => Err(format!(
-                                "Failed to decode image:\n{}\n\nError: {}",
-                                path.display(),
-                                e
-                            )),
                         }
-                    }
+                        Err(e) => Err(format!(
+                            "Failed to read image metadata:\n{}\n\nError: {}",
+                            path.display(),
+                            e
+                        )),
+                    },
                     Err(e) => Err(format!(
-                        "Failed to read image metadata:\n{}\n\nError: {}",
+                        "Failed to open file:\n{}\n\nError: {}",
                         path.display(),
                         e
                     )),
                 },
-                Err(e) => Err(format!(
-                    "Failed to open file:\n{}\n\nError: {}",
-                    path.display(),
-                    e
-                )),
+                ImageSource::Cbz {
+                    zip_path,
+                    file_in_zip,
+                } => {
+                    let load_cbz = move || -> Result<(image::DynamicImage, u32, u32), String> {
+                        let file = std::fs::File::open(&zip_path).map_err(|e| {
+                            format!("Failed to open zip file {}: {}", zip_path.display(), e)
+                        })?;
+                        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+                            format!("Failed to read zip archive {}: {}", zip_path.display(), e)
+                        })?;
+                        let mut zip_entry = archive.by_name(&file_in_zip).map_err(|e| {
+                            format!(
+                                "Failed to locate page {} in {}: {}",
+                                file_in_zip,
+                                zip_path.display(),
+                                e
+                            )
+                        })?;
+                        let mut buffer = Vec::new();
+                        std::io::copy(&mut zip_entry, &mut buffer).map_err(|e| {
+                            format!(
+                                "Failed to read page data {} from {}: {}",
+                                file_in_zip,
+                                zip_path.display(),
+                                e
+                            )
+                        })?;
+
+                        let cursor = std::io::Cursor::new(buffer);
+                        let reader = image::ImageReader::new(cursor)
+                            .with_guessed_format()
+                            .map_err(|e| {
+                                format!("Failed to guess image format for {}: {}", file_in_zip, e)
+                            })?;
+
+                        let mut decoder = reader.into_decoder().map_err(|e| {
+                            format!("Failed to decode header for {}: {}", file_in_zip, e)
+                        })?;
+                        let orientation = decoder
+                            .orientation()
+                            .unwrap_or(image::metadata::Orientation::NoTransforms);
+                        let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
+                            format!("Failed to decode image data for {}: {}", file_in_zip, e)
+                        })?;
+                        img.apply_orientation(orientation);
+
+                        let rgba_img = img.to_rgba8();
+                        let w = rgba_img.width();
+                        let h = rgba_img.height();
+                        Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+                    };
+                    load_cbz()
+                }
             };
             let _ = tx.send(res);
         });
@@ -788,11 +867,7 @@ impl App {
         if self.images.is_empty() {
             return "No file loaded".to_string();
         }
-        self.images[self.current_index]
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown")
-            .to_string()
+        self.images[self.current_index].display_name()
     }
 
     /// Next image
@@ -876,6 +951,64 @@ fn scan_directory(initial_path: &Path) -> Result<(Vec<PathBuf>, usize), String> 
     };
 
     Ok((images, index))
+}
+
+fn is_cbz_or_zip(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                let ext_lower = ext.to_lowercase();
+                ext_lower == "cbz" || ext_lower == "zip"
+            })
+            .unwrap_or(false)
+}
+
+fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
+
+    let mut pages = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i)
+            && entry.is_file()
+        {
+            let name = entry.name();
+            if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_lowercase();
+                if matches!(
+                    ext_lower.as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "ico"
+                ) {
+                    pages.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    pages.sort_by_key(|a| a.to_lowercase());
+    Ok(pages)
+}
+
+fn collect_sources(paths: &[PathBuf]) -> Result<Vec<ImageSource>, String> {
+    let mut sources = Vec::new();
+    for path in paths {
+        if is_cbz_or_zip(path) {
+            let pages = list_cbz_pages(path)?;
+            for page in pages {
+                sources.push(ImageSource::Cbz {
+                    zip_path: path.clone(),
+                    file_in_zip: page,
+                });
+            }
+        } else if path.is_file() {
+            sources.push(ImageSource::Local(path.clone()));
+        }
+    }
+    Ok(sources)
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
@@ -1201,10 +1334,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get the image file list and current starting index
     let (images, current_index) = if is_piped && !piped_files.is_empty() {
-        (piped_files, 0)
+        let sources = collect_sources(&piped_files)?;
+        (sources, 0)
     } else {
         let initial_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
-        scan_directory(&initial_path)?
+        if is_cbz_or_zip(&initial_path) {
+            let pages = list_cbz_pages(&initial_path)?;
+            let sources = pages
+                .into_iter()
+                .map(|page| ImageSource::Cbz {
+                    zip_path: initial_path.clone(),
+                    file_in_zip: page,
+                })
+                .collect();
+            (sources, 0)
+        } else {
+            let (paths, index) = scan_directory(&initial_path)?;
+            let sources = paths.into_iter().map(ImageSource::Local).collect();
+            (sources, index)
+        }
     };
 
     let initial_filter = match filter_opt.as_deref() {
