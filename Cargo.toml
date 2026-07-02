@@ -19,5 +19,9 @@ opt-level = 1
 opt-level = 3
 
 [profile.release]
-debug = true
-
+debug = true            # Enable debug symbols for profiling
+opt-level = 3           # Maximum optimizations for speed
+lto = "fat"             # Enables aggressive whole-program link-time optimizations
+codegen-units = 1       # Optimizes whole-program at the expense of longer compile times
+panic = "abort"         # Removes panic unwinding, reducing binary size and runtime checks
+overflow-checks = false # Disables integer overflow runtime checks (use only if safe)
