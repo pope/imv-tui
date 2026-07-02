@@ -482,39 +482,41 @@ impl App {
 
         std::thread::spawn(move || {
             let res = match source {
-                ImageSource::Local(path) => match image::ImageReader::open(&path) {
-                    Ok(reader) => match reader.into_decoder() {
-                        Ok(mut decoder) => {
-                            let orientation = decoder
-                                .orientation()
-                                .unwrap_or(image::metadata::Orientation::NoTransforms);
-                            match image::DynamicImage::from_decoder(decoder) {
-                                Ok(mut img) => {
-                                    img.apply_orientation(orientation);
-                                    let rgba_img = img.to_rgba8();
-                                    let w = rgba_img.width();
-                                    let h = rgba_img.height();
-                                    Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+                ImageSource::Local(path) => {
+                    match image::ImageReader::open(&path).and_then(|r| r.with_guessed_format()) {
+                        Ok(reader) => match reader.into_decoder() {
+                            Ok(mut decoder) => {
+                                let orientation = decoder
+                                    .orientation()
+                                    .unwrap_or(image::metadata::Orientation::NoTransforms);
+                                match image::DynamicImage::from_decoder(decoder) {
+                                    Ok(mut img) => {
+                                        img.apply_orientation(orientation);
+                                        let rgba_img = img.to_rgba8();
+                                        let w = rgba_img.width();
+                                        let h = rgba_img.height();
+                                        Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+                                    }
+                                    Err(e) => Err(format!(
+                                        "Failed to decode image:\n{}\n\nError: {}",
+                                        path.display(),
+                                        e
+                                    )),
                                 }
-                                Err(e) => Err(format!(
-                                    "Failed to decode image:\n{}\n\nError: {}",
-                                    path.display(),
-                                    e
-                                )),
                             }
-                        }
+                            Err(e) => Err(format!(
+                                "Failed to read image metadata:\n{}\n\nError: {}",
+                                path.display(),
+                                e
+                            )),
+                        },
                         Err(e) => Err(format!(
-                            "Failed to read image metadata:\n{}\n\nError: {}",
+                            "Failed to open file:\n{}\n\nError: {}",
                             path.display(),
                             e
                         )),
-                    },
-                    Err(e) => Err(format!(
-                        "Failed to open file:\n{}\n\nError: {}",
-                        path.display(),
-                        e
-                    )),
-                },
+                    }
+                }
                 ImageSource::Cbz {
                     zip_path,
                     file_in_zip,
@@ -918,16 +920,8 @@ fn scan_directory(initial_path: &Path) -> Result<(Vec<PathBuf>, usize), String> 
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
-                && let Some(ext) = path.extension().and_then(|e| e.to_str())
-            {
-                let ext_lower = ext.to_lowercase();
-                if matches!(
-                    ext_lower.as_str(),
-                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "ico"
-                ) {
-                    images.push(path);
-                }
+            if is_image_file(&path) {
+                images.push(path);
             }
         }
     }
@@ -953,16 +947,57 @@ fn scan_directory(initial_path: &Path) -> Result<(Vec<PathBuf>, usize), String> 
     Ok((images, index))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuessType {
+    Image,
+    Zip,
+}
+
+fn guess_file_type(path: &Path) -> Option<GuessType> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 16];
+    use std::io::Read;
+    let n = std::io::BufReader::new(file).read(&mut header).ok()?;
+    let bytes = &header[..n];
+
+    if bytes.len() >= 2 && bytes[0] == 0x50 && bytes[1] == 0x4B {
+        return Some(GuessType::Zip);
+    }
+
+    if image::guess_format(bytes).is_ok() {
+        return Some(GuessType::Image);
+    }
+
+    None
+}
+
+fn is_image_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        if matches!(
+            ext_lower.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "ico"
+        ) {
+            return true;
+        }
+    }
+    matches!(guess_file_type(path), Some(GuessType::Image))
+}
+
 fn is_cbz_or_zip(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| {
-                let ext_lower = ext.to_lowercase();
-                ext_lower == "cbz" || ext_lower == "zip"
-            })
-            .unwrap_or(false)
+    if !path.is_file() {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        if ext_lower == "cbz" || ext_lower == "zip" {
+            return true;
+        }
+    }
+    matches!(guess_file_type(path), Some(GuessType::Zip))
 }
 
 fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
@@ -1004,7 +1039,7 @@ fn collect_sources(paths: &[PathBuf]) -> Result<Vec<ImageSource>, String> {
                     file_in_zip: page,
                 });
             }
-        } else if path.is_file() {
+        } else if is_image_file(path) {
             sources.push(ImageSource::Local(path.clone()));
         }
     }
