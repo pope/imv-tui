@@ -183,6 +183,7 @@ When holding down keys for continuous actions (like panning), standard keyboard 
 ### Guidelines for Future Work
 
 Before drawing a frame, block for the first key event, then immediately drain all remaining pending key repeat events from Crossterm's event buffer using `poll(0)`:
+
 ```rust
 if event::poll(Duration::from_millis(50))? {
     let mut events = Vec::new();
@@ -205,10 +206,10 @@ Normal pixel decoders do not automatically apply EXIF rotation metadata.
 ### Guidelines for Future Work
 
 Instead of raw `ImageReader::decode()`, use `into_decoder()` to read EXIF tags, then call `apply_orientation()` to align the image coordinates prior to computing any layout boundaries:
+
 ```rust
 let mut decoder = reader.into_decoder()?;
 let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
 let mut img = DynamicImage::from_decoder(decoder)?;
 img.apply_orientation(orientation);
 ```
-

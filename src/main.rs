@@ -13,6 +13,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use fast_image_resize as fir;
 use image::{DynamicImage, GenericImage, ImageDecoder, imageops::FilterType};
 use ratatui::{
     Frame, Terminal,
@@ -45,36 +46,113 @@ struct ResizeRequest {
     picker: Picker,
 }
 
+fn fast_resize(
+    src_img: &DynamicImage,
+    dst_w: u32,
+    dst_h: u32,
+    filter_type: FilterType,
+    crop_rect: Option<(f64, f64, f64, f64)>,
+) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+    use fast_image_resize::images::Image as FirImage;
+
+    let resize_alg = match filter_type {
+        FilterType::Nearest => fir::ResizeAlg::Nearest,
+        FilterType::Triangle => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
+        FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
+        FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Gaussian),
+        FilterType::Lanczos3 => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+    };
+
+    let temp_rgba;
+    let rgba_src = match src_img {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        other => {
+            temp_rgba = other.to_rgba8();
+            &temp_rgba
+        }
+    };
+
+    let mut dst_image = FirImage::new(dst_w, dst_h, fir::PixelType::U8x4);
+
+    let mut options = fir::ResizeOptions::new();
+    options.algorithm = resize_alg;
+    if let Some((left, top, width, height)) = crop_rect {
+        options = options.crop(left, top, width, height);
+    }
+
+    let mut resizer = fir::Resizer::new();
+    resizer.resize(rgba_src, &mut dst_image, Some(&options))?;
+
+    let buffer = dst_image.into_vec();
+    let rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
+        .ok_or("Failed to construct RgbaImage from resized buffer")?;
+    Ok(DynamicImage::ImageRgba8(rgba_dst))
+}
+
 fn process_resize(req: ResizeRequest) -> StatefulProtocol {
     let canvas = if req.inter_x1 == req.crop_x1
         && req.inter_x2 == req.crop_x2
         && req.inter_y1 == req.crop_y1
         && req.inter_y2 == req.crop_y2
     {
-        let cropped_part = req.img.crop_imm(
-            req.inter_x1 as u32,
-            req.inter_y1 as u32,
-            (req.inter_x2 - req.inter_x1) as u32,
-            (req.inter_y2 - req.inter_y1) as u32,
-        );
-        cropped_part.resize(req.target_w, req.target_h, req.filter_type)
+        let crop_rect = Some((
+            req.inter_x1 as f64,
+            req.inter_y1 as f64,
+            (req.inter_x2 - req.inter_x1) as f64,
+            (req.inter_y2 - req.inter_y1) as f64,
+        ));
+        match fast_resize(
+            &req.img,
+            req.target_w,
+            req.target_h,
+            req.filter_type,
+            crop_rect,
+        ) {
+            Ok(resized) => resized,
+            Err(_) => {
+                let cropped_part = req.img.crop_imm(
+                    req.inter_x1 as u32,
+                    req.inter_y1 as u32,
+                    (req.inter_x2 - req.inter_x1) as u32,
+                    (req.inter_y2 - req.inter_y1) as u32,
+                );
+                cropped_part.resize(req.target_w, req.target_h, req.filter_type)
+            }
+        }
     } else {
         let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
 
         if req.inter_x2 > req.inter_x1 && req.inter_y2 > req.inter_y1 {
-            let cropped_part = req.img.crop_imm(
-                req.inter_x1 as u32,
-                req.inter_y1 as u32,
-                (req.inter_x2 - req.inter_x1) as u32,
-                (req.inter_y2 - req.inter_y1) as u32,
-            );
-
             let target_inter_w =
                 (((req.inter_x2 - req.inter_x1) as f64 * req.scale).round() as u32).max(1);
             let target_inter_h =
                 (((req.inter_y2 - req.inter_y1) as f64 * req.scale).round() as u32).max(1);
 
-            let resized_part = cropped_part.resize(target_inter_w, target_inter_h, req.filter_type);
+            let crop_rect = Some((
+                req.inter_x1 as f64,
+                req.inter_y1 as f64,
+                (req.inter_x2 - req.inter_x1) as f64,
+                (req.inter_y2 - req.inter_y1) as f64,
+            ));
+
+            let resized_part = match fast_resize(
+                &req.img,
+                target_inter_w,
+                target_inter_h,
+                req.filter_type,
+                crop_rect,
+            ) {
+                Ok(resized) => resized,
+                Err(_) => {
+                    let cropped_part = req.img.crop_imm(
+                        req.inter_x1 as u32,
+                        req.inter_y1 as u32,
+                        (req.inter_x2 - req.inter_x1) as u32,
+                        (req.inter_y2 - req.inter_y1) as u32,
+                    );
+                    cropped_part.resize(target_inter_w, target_inter_h, req.filter_type)
+                }
+            };
 
             let paste_x = ((req.inter_x1 - req.crop_x1) as f64 * req.scale).round() as i64;
             let paste_y = ((req.inter_y1 - req.crop_y1) as f64 * req.scale).round() as i64;
@@ -84,7 +162,11 @@ fn process_resize(req: ResizeRequest) -> StatefulProtocol {
             let paste_y =
                 paste_y.clamp(0, (req.target_h as i64 - target_inter_h as i64).max(0)) as u32;
 
-            let _ = screen_canvas.copy_from(&resized_part, paste_x, paste_y);
+            if let Some(rgba_part) = resized_part.as_rgba8() {
+                let _ = screen_canvas.copy_from(rgba_part, paste_x, paste_y);
+            } else {
+                let _ = screen_canvas.copy_from(&resized_part.to_rgba8(), paste_x, paste_y);
+            }
         }
         DynamicImage::ImageRgba8(screen_canvas)
     };
@@ -385,9 +467,10 @@ impl App {
                         match image::DynamicImage::from_decoder(decoder) {
                             Ok(mut img) => {
                                 img.apply_orientation(orientation);
-                                let w = img.width();
-                                let h = img.height();
-                                Ok((img, w, h))
+                                let rgba_img = img.to_rgba8();
+                                let w = rgba_img.width();
+                                let h = rgba_img.height();
+                                Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
                             }
                             Err(e) => Err(format!(
                                 "Failed to decode image:\n{}\n\nError: {}",
