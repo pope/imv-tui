@@ -14,7 +14,32 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use fast_image_resize as fir;
-use image::{DynamicImage, GenericImage, ImageDecoder, imageops::FilterType};
+use image::{DynamicImage, GenericImage, ImageDecoder};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterType {
+    Nearest,
+    Triangle,
+    CatmullRom,
+    Mitchell,
+    Gaussian,
+    Lanczos3,
+    Hamming,
+}
+
+impl FilterType {
+    pub fn to_image_filter(self) -> image::imageops::FilterType {
+        match self {
+            FilterType::Nearest => image::imageops::FilterType::Nearest,
+            FilterType::Triangle => image::imageops::FilterType::Triangle,
+            FilterType::CatmullRom => image::imageops::FilterType::CatmullRom,
+            FilterType::Mitchell => image::imageops::FilterType::CatmullRom,
+            FilterType::Gaussian => image::imageops::FilterType::Gaussian,
+            FilterType::Lanczos3 => image::imageops::FilterType::Lanczos3,
+            FilterType::Hamming => image::imageops::FilterType::Triangle,
+        }
+    }
+}
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -62,8 +87,10 @@ fn fast_resize(
         FilterType::Nearest => fir::ResizeAlg::Nearest,
         FilterType::Triangle => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
         FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
+        FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Mitchell),
         FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Gaussian),
         FilterType::Lanczos3 => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+        FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
     };
 
     let temp_rgba;
@@ -119,7 +146,11 @@ fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulPro
                     (req.inter_x2 - req.inter_x1) as u32,
                     (req.inter_y2 - req.inter_y1) as u32,
                 );
-                cropped_part.resize(req.target_w, req.target_h, req.filter_type)
+                cropped_part.resize(
+                    req.target_w,
+                    req.target_h,
+                    req.filter_type.to_image_filter(),
+                )
             }
         }
     } else {
@@ -154,7 +185,11 @@ fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulPro
                         (req.inter_x2 - req.inter_x1) as u32,
                         (req.inter_y2 - req.inter_y1) as u32,
                     );
-                    cropped_part.resize(target_inter_w, target_inter_h, req.filter_type)
+                    cropped_part.resize(
+                        target_inter_w,
+                        target_inter_h,
+                        req.filter_type.to_image_filter(),
+                    )
                 }
             };
 
@@ -281,7 +316,11 @@ const COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "Set Filter: Cubic",
-        description: "Use Bicubic/Catmull-Rom scaling (very smooth)",
+        description: "Use Bicubic/Catmull-Rom scaling (sharp cubic)",
+    },
+    CommandItem {
+        name: "Set Filter: Mitchell",
+        description: "Use Mitchell-Netravali scaling (smooth cubic)",
     },
     CommandItem {
         name: "Set Filter: Gaussian",
@@ -290,6 +329,10 @@ const COMMANDS: &[CommandItem] = &[
     CommandItem {
         name: "Set Filter: Lanczos",
         description: "Use Lanczos3 scaling (highest quality)",
+    },
+    CommandItem {
+        name: "Set Filter: Hamming",
+        description: "Use Hamming scaling (sharp downscaling)",
     },
     CommandItem {
         name: "Increase Brightness",
@@ -489,8 +532,10 @@ impl App {
             FilterType::Nearest => "Nearest",
             FilterType::Triangle => "Linear",
             FilterType::CatmullRom => "Cubic",
+            FilterType::Mitchell => "Mitchell",
             FilterType::Gaussian => "Gaussian",
             FilterType::Lanczos3 => "Lanczos",
+            FilterType::Hamming => "Hamming",
         }
     }
 
@@ -521,12 +566,20 @@ impl App {
                 self.filter_type = FilterType::CatmullRom;
                 self.needs_update = true;
             }
+            "Set Filter: Mitchell" => {
+                self.filter_type = FilterType::Mitchell;
+                self.needs_update = true;
+            }
             "Set Filter: Gaussian" => {
                 self.filter_type = FilterType::Gaussian;
                 self.needs_update = true;
             }
             "Set Filter: Lanczos" => {
                 self.filter_type = FilterType::Lanczos3;
+                self.needs_update = true;
+            }
+            "Set Filter: Hamming" => {
+                self.filter_type = FilterType::Hamming;
                 self.needs_update = true;
             }
             "Increase Brightness" => self.increase_brightness(),
@@ -1494,7 +1547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     i += 2;
                 } else {
                     eprintln!(
-                        "Error: --filter / -f requires an argument (nearest, linear, cubic, gaussian, lanczos)"
+                        "Error: --filter / -f requires an argument (nearest, linear, cubic, mitchell, gaussian, lanczos, hamming)"
                     );
                     std::process::exit(1);
                 }
@@ -1506,7 +1559,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!();
                 println!("Options:");
                 println!(
-                    "  -f, --filter <filter>  Initial image scaling filter: nearest, linear, cubic, gaussian, lanczos"
+                    "  -f, --filter <filter>  Initial image scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming"
                 );
                 println!("  -h, --help             Show this help menu");
                 std::process::exit(0);
@@ -1547,11 +1600,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("nearest") => FilterType::Nearest,
         Some("linear") => FilterType::Triangle,
         Some("cubic") => FilterType::CatmullRom,
+        Some("mitchell") => FilterType::Mitchell,
         Some("gaussian") => FilterType::Gaussian,
         Some("lanczos") => FilterType::Lanczos3,
+        Some("hamming") => FilterType::Hamming,
         Some(other) => {
             eprintln!(
-                "Error: Unknown filter '{}'. Choose from: nearest, linear, cubic, gaussian, lanczos",
+                "Error: Unknown filter '{}'. Choose from: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming",
                 other
             );
             std::process::exit(1);
