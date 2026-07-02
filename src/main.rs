@@ -329,6 +329,7 @@ pub struct App {
     pub is_loading: bool,
     pub loading_start_time: Option<Instant>,
     pub clear_on_protocol_receive: bool,
+    pub zoom_needs_initialization: bool,
 }
 
 impl App {
@@ -387,6 +388,7 @@ impl App {
             is_loading: false,
             loading_start_time: None,
             clear_on_protocol_receive: false,
+            zoom_needs_initialization: false,
         };
 
         app.start_load_image();
@@ -590,6 +592,7 @@ impl App {
                     self.pan_offset = (0, 0);
                     self.is_loading = false;
                     self.needs_update = true;
+                    self.zoom_needs_initialization = true;
                 }
                 Err(err) => {
                     self.original_image = None;
@@ -636,6 +639,11 @@ impl App {
             let s_w = widget_w_px / w_orig;
             let s_h = widget_h_px / h_orig;
             let s = s_w.min(s_h);
+
+            if self.zoom_needs_initialization && s > 0.0 {
+                self.zoom_needs_initialization = false;
+                self.zoom_factor = if s >= 1.0 { 1.0 / s } else { 1.0 };
+            }
 
             // 2. Combined scale is s * zoom_factor
             let scale = s * self.zoom_factor;
