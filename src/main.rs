@@ -556,7 +556,13 @@ pub struct App {
 
     pub last_widget_size: (u16, u16),
     pub needs_update: bool,
+    /// Triggers a visual clearing of the terminal screen, but only if the active protocol requires it (e.g. Sixel).
+    /// Used to clean Sixel cells on discrete updates (like image loads) without causing constant Kitty/Halfblocks flicker.
     pub needs_clear: bool,
+    /// Triggers an unconditional visual clearing of the terminal text grid on the next frame.
+    /// Primarily used to cleanly erase text characters of dismissed dialogues (Help, search palettes) from the image region
+    /// in terminals using the Kitty graphics protocol (like WezTerm), where double buffering would otherwise skip/freeze them.
+    pub needs_clear_once: bool,
     pub rendered_size_cells: (u16, u16),
     pub current_zoom_pct: f64,
     pub palette_mode: PaletteMode,
@@ -633,6 +639,7 @@ impl App {
             last_widget_size: (0, 0),
             needs_update: true,
             needs_clear: true,
+            needs_clear_once: false,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
             palette_mode: PaletteMode::Closed,
@@ -1104,6 +1111,7 @@ impl App {
         self.show_help = !self.show_help;
         if !self.show_help {
             self.needs_update = true;
+            self.needs_clear_once = true;
         }
         self.needs_clear = true;
     }
@@ -1850,6 +1858,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while app.running {
         app.update_channels();
 
+        if app.needs_clear_once {
+            app.needs_clear_once = false;
+            terminal.clear()?;
+        }
+
         if app.needs_clear {
             app.needs_clear = false;
             if app.should_clear_on_update() {
@@ -1873,7 +1886,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Esc => {
                                     app.palette_mode = PaletteMode::Closed;
                                     app.needs_update = true;
-                                    app.needs_clear = true;
+                                    app.needs_clear_once = true;
                                 }
                                 KeyCode::Enter => {
                                     match app.palette_mode {
@@ -1901,7 +1914,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     app.palette_mode = PaletteMode::Closed;
                                     app.needs_update = true;
-                                    app.needs_clear = true;
+                                    app.needs_clear_once = true;
                                 }
                                 KeyCode::Up if app.palette_selected_index > 0 => {
                                     app.palette_selected_index -= 1;
@@ -1955,13 +1968,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     KeyCode::Char('q') | KeyCode::Esc => {
                                         app.show_help = false;
                                         app.needs_update = true;
-                                        app.needs_clear = true;
+                                        app.needs_clear_once = true;
                                         key_handled = true;
                                     }
                                     _ => {
                                         app.show_help = false;
                                         app.needs_update = true;
-                                        app.needs_clear = true;
+                                        app.needs_clear_once = true;
                                     }
                                 }
                             }
@@ -2069,7 +2082,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if app.show_help {
                             app.show_help = false;
                             app.needs_update = true;
-                            app.needs_clear = true;
+                            app.needs_clear_once = true;
                         }
                         match mouse_event.kind {
                             MouseEventKind::ScrollUp => {
