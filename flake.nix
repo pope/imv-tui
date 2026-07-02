@@ -57,10 +57,12 @@
           devShells.${system}.default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              cargo-flamegraph
               clippy
               rust-analyzer
               rustc
               rustfmt
+              samply
               self.formatter.${system}
             ];
           };
