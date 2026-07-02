@@ -54,6 +54,17 @@
           });
         in
         {
+          packages.${system} = rec {
+            imv-tui = pkgs.rustPlatform.buildRustPackage {
+              pname = "imv-tui";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+              };
+            };
+            default = imv-tui;
+          };
           devShells.${system}.default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
@@ -67,7 +78,10 @@
             ];
           };
           formatter.${system} = treefmt-eval.config.build.wrapper;
-          checks.${system}.treefmt = treefmt-eval.config.build.check self;
+          checks.${system} = {
+            inherit (self.packages.${system}) imv-tui;
+            treefmt = treefmt-eval.config.build.check self;
+          };
         };
     in
     builtins.foldl' nixpkgs.lib.recursiveUpdate { } (map sys-config systems);
