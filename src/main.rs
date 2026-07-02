@@ -11,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use image::{DynamicImage, GenericImage, imageops::FilterType};
+use image::{DynamicImage, GenericImage, ImageDecoder, imageops::FilterType};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -269,22 +269,39 @@ impl App {
 
         let path = &self.images[self.current_index];
         match image::ImageReader::open(path) {
-            Ok(reader) => match reader.decode() {
-                Ok(img) => {
-                    self.img_width = img.width();
-                    self.img_height = img.height();
-                    self.original_image = Some(img);
-                    self.error_message = None;
-                    self.zoom_factor = 1.0;
-                    self.pan_offset = (0, 0);
-                    self.needs_update = true;
-                    self.needs_clear = true;
+            Ok(reader) => match reader.into_decoder() {
+                Ok(mut decoder) => {
+                    let orientation = decoder
+                        .orientation()
+                        .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    match image::DynamicImage::from_decoder(decoder) {
+                        Ok(mut img) => {
+                            img.apply_orientation(orientation);
+                            self.img_width = img.width();
+                            self.img_height = img.height();
+                            self.original_image = Some(img);
+                            self.error_message = None;
+                            self.zoom_factor = 1.0;
+                            self.pan_offset = (0, 0);
+                            self.needs_update = true;
+                            self.needs_clear = true;
+                        }
+                        Err(e) => {
+                            self.original_image = None;
+                            self.image_protocol = None;
+                            self.error_message = Some(format!(
+                                "Failed to decode image:\n{}\n\nError: {}",
+                                path.display(),
+                                e
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     self.original_image = None;
                     self.image_protocol = None;
                     self.error_message = Some(format!(
-                        "Failed to decode image:\n{}\n\nError: {}",
+                        "Failed to read image metadata:\n{}\n\nError: {}",
                         path.display(),
                         e
                     ));
