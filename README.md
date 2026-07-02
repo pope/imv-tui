@@ -9,6 +9,9 @@ ______________________________________________________________________
 ## Features
 
 - **Directory Navigation**: Open an image, and it automatically scans the directory for all sibling files, allowing you to cycle through them effortlessly.
+- **Manga/Comic CBZ & ZIP Support**: Open and flip through compressed `.cbz` and `.zip` archives directly. Pages are sorted alphabetically and loaded asynchronously.
+- **Image Manipulation Adjustments**: Adjust brightness and contrast in real-time. Operations are processed asynchronously on background threads for fluid performance.
+- **Header-Based Magic Byte Verification**: Intelligently identifies images and zip files by reading their headers, allowing images with missing or incorrect file extensions to load perfectly.
 - **Smart Aspect-Ratio Padding Compression**: When zoomed out, images sit centered with empty border spaces (padding). As you zoom in, the borders automatically shrink and disappear, scaling the image to fully cover the terminal space.
 - **Pixel-Perfect Deep Zooming**: Supports zooming beyond a 1:1 pixel scale (up to 10000%) with clean Nearest Neighbor scaling—perfect for inspection and pixel-art view.
 - **In-Memory Rotation**: Rotate vertical or misaligned images clockwise and counter-clockwise in-memory (does not modify files on disk).
@@ -30,6 +33,8 @@ ______________________________________________________________________
 | **Reset View (Fit Screen)**        | `r`         |                             |
 | **Rotate Clockwise (90°)**         | `e`         | `R` / `>`                   |
 | **Rotate Counter-Clockwise (90°)** | `E`         | `<`                         |
+| **Brightness Increase / Decrease** | `b` / `B`   |                             |
+| **Contrast Increase / Decrease**   | `c` / `C`   |                             |
 | **Pan Left / Right**               | `h` / `l`   | `Left` / `Right Arrow`      |
 | **Pan Up / Down**                  | `k` / `j`   | `Up` / `Down Arrow`         |
 | **Toggle Help Screen**             | `?`         |                             |
@@ -74,8 +79,11 @@ cd imv-tui
 # Build in release mode
 cargo build --release
 
-# Run on a file or directory
-./target/release/imv-tui <path-to-image-or-directory>
+# Or build using Nix Flakes
+nix build
+
+# Run on a file, directory, or CBZ comic archive
+./target/release/imv-tui <path-to-image-or-directory-or-cbz>
 
 # Run with a specific starting filter (nearest, linear, cubic, gaussian, lanczos)
 ./target/release/imv-tui <path-to-image> --filter cubic

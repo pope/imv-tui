@@ -44,6 +44,8 @@ struct ResizeRequest {
     target_h: u32,
     filter_type: FilterType,
     picker: Picker,
+    brightness: i32,
+    contrast: f32,
 }
 
 fn fast_resize(
@@ -90,7 +92,7 @@ fn fast_resize(
 }
 
 fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulProtocol {
-    let canvas = if req.inter_x1 == req.crop_x1
+    let mut canvas = if req.inter_x1 == req.crop_x1
         && req.inter_x2 == req.crop_x2
         && req.inter_y1 == req.crop_y1
         && req.inter_y2 == req.crop_y2
@@ -172,6 +174,13 @@ fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulPro
         }
         DynamicImage::ImageRgba8(screen_canvas)
     };
+
+    if req.brightness != 0 {
+        canvas = canvas.brighten(req.brightness);
+    }
+    if req.contrast != 0.0 {
+        canvas = canvas.adjust_contrast(req.contrast);
+    }
 
     req.picker.new_resize_protocol(canvas)
 }
@@ -282,6 +291,22 @@ const COMMANDS: &[CommandItem] = &[
         name: "Set Filter: Lanczos",
         description: "Use Lanczos3 scaling (highest quality)",
     },
+    CommandItem {
+        name: "Increase Brightness",
+        description: "Increase image brightness (+10)",
+    },
+    CommandItem {
+        name: "Decrease Brightness",
+        description: "Decrease image brightness (-10)",
+    },
+    CommandItem {
+        name: "Increase Contrast",
+        description: "Increase image contrast (+10%)",
+    },
+    CommandItem {
+        name: "Decrease Contrast",
+        description: "Decrease image contrast (-10%)",
+    },
 ];
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -343,6 +368,8 @@ pub struct App {
     pub loading_start_time: Option<Instant>,
     pub clear_on_protocol_receive: bool,
     pub zoom_needs_initialization: bool,
+    pub brightness: i32,
+    pub contrast: f32,
 }
 
 impl App {
@@ -411,6 +438,8 @@ impl App {
             loading_start_time: None,
             clear_on_protocol_receive: false,
             zoom_needs_initialization: false,
+            brightness: 0,
+            contrast: 0.0,
         };
 
         app.start_load_image();
@@ -499,6 +528,10 @@ impl App {
                 self.filter_type = FilterType::Lanczos3;
                 self.needs_update = true;
             }
+            "Increase Brightness" => self.increase_brightness(),
+            "Decrease Brightness" => self.decrease_brightness(),
+            "Increase Contrast" => self.increase_contrast(),
+            "Decrease Contrast" => self.decrease_contrast(),
             _ => {}
         }
     }
@@ -631,6 +664,8 @@ impl App {
                     self.error_message = None;
                     self.zoom_factor = 1.0;
                     self.pan_offset = (0, 0);
+                    self.brightness = 0;
+                    self.contrast = 0.0;
                     self.is_loading = false;
                     self.needs_update = true;
                     self.zoom_needs_initialization = true;
@@ -738,6 +773,8 @@ impl App {
                 target_h,
                 filter_type: self.filter_type,
                 picker: self.picker.clone(),
+                brightness: self.brightness,
+                contrast: self.contrast,
             };
 
             let _ = self.resize_tx.send(req);
@@ -818,15 +855,49 @@ impl App {
         }
     }
 
-    /// Reset zoom and pan
+    /// Reset zoom, pan, brightness, and contrast
     pub fn reset_view(&mut self) {
         if self.original_image.is_none() {
             return;
         }
         self.zoom_factor = 1.0;
         self.pan_offset = (0, 0);
+        self.brightness = 0;
+        self.contrast = 0.0;
         self.needs_update = true;
         self.clear_on_protocol_receive = true;
+    }
+
+    pub fn increase_brightness(&mut self) {
+        if self.original_image.is_none() {
+            return;
+        }
+        self.brightness = (self.brightness + 10).min(255);
+        self.needs_update = true;
+    }
+
+    pub fn decrease_brightness(&mut self) {
+        if self.original_image.is_none() {
+            return;
+        }
+        self.brightness = (self.brightness - 10).max(-255);
+        self.needs_update = true;
+    }
+
+    pub fn increase_contrast(&mut self) {
+        if self.original_image.is_none() {
+            return;
+        }
+        self.contrast = (self.contrast + 10.0).min(255.0);
+        self.needs_update = true;
+    }
+
+    pub fn decrease_contrast(&mut self) {
+        if self.original_image.is_none() {
+            return;
+        }
+        self.contrast = (self.contrast - 10.0).max(-255.0);
+        self.needs_update = true;
     }
 
     /// Clamp pan offsets so that the corners of the image cannot pan past the center point of the viewport
@@ -1156,8 +1227,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let status_text = if app.images.is_empty() {
         " No files found. Press 'q' to quit. ".to_string()
     } else {
+        let mut extra_info = String::new();
+        if app.brightness != 0 {
+            extra_info.push_str(&format!(" | Brightness: {:+}", app.brightness));
+        }
+        if app.contrast != 0.0 {
+            extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
+        }
+
         format!(
-            " [{}/{}] {} ({}x{}) | Filter: {} | Zoom: {}% | Pan: ({}, {}) | Press '?' for help ",
+            " [{}/{}] {} ({}x{}) | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
             app.current_index + 1,
             app.images.len(),
             app.current_filename(),
@@ -1166,7 +1245,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             app.filter_name(),
             app.current_zoom_pct.round() as i64,
             app.pan_offset.0,
-            app.pan_offset.1
+            app.pan_offset.1,
+            extra_info
         )
     };
 
@@ -1186,6 +1266,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Line::from(vec!["  o, -           ".cyan(), "- Zoom Out".into()]),
             Line::from(vec!["  a              ".cyan(), "- Actual Size".into()]),
             Line::from(vec!["  r              ".cyan(), "- Reset View".into()]),
+            Line::from(vec!["  b, B           ".cyan(), "- Brightness +/-".into()]),
+            Line::from(vec!["  c, C           ".cyan(), "- Contrast +/-".into()]),
             Line::from(vec![
                 "  h, j, k, l     ".cyan(),
                 "- Pan Left/Down/Up/Right".into(),
@@ -1212,7 +1294,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
         let help_width = 44_u16;
-        let help_height = 19_u16;
+        let help_height = 21_u16;
 
         let w = help_width.min(chunks[0].width.saturating_sub(1));
         let h = help_height.min(chunks[0].height.saturating_sub(1));
@@ -1633,6 +1715,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Reset
                                 KeyCode::Char('r') => {
                                     app.reset_view();
+                                }
+                                // Brightness
+                                KeyCode::Char('b') => {
+                                    app.increase_brightness();
+                                }
+                                KeyCode::Char('B') => {
+                                    app.decrease_brightness();
+                                }
+                                // Contrast
+                                KeyCode::Char('c') => {
+                                    app.increase_contrast();
+                                }
+                                KeyCode::Char('C') => {
+                                    app.decrease_contrast();
                                 }
                                 // Rotation
                                 KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
