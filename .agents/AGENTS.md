@@ -129,3 +129,86 @@ When rendering text components (like the Help menu, Command Palette, or File Sea
 
 - **No Updates on Typing/Navigation**: Do not set `needs_update = true` or call `update_protocol()` for keystrokes, character entry, or row selection inside dialog inputs.
 - **Redraw on Overlay Dismissal**: Set `needs_update = true` when dismissing or toggling an overlay *off* (such as closing the Help panel or hiding the command palette) to cleanly paint over and erase the characters.
+
+______________________________________________________________________
+
+## 7. Asynchronous Thread Offloading & Arc-Sharing
+
+### The Learning
+
+Image loading/decoding and scale resizing are highly CPU-bound. If done synchronously in the main event loop, they freeze the user interface for several hundred milliseconds.
+
+- **Thread-safe Image Sharing**: To safely send decoded images to background threads without expensive memory cloning (which can take 10ms+ for large buffers), wrap the `DynamicImage` in `std::sync::Arc`.
+- **Worker Task Coalescing**: When the user repeats a command quickly (like zoom/pan), the worker queue fills up. To prevent CPU thrashes, the worker thread should drain its channel and only process the absolute latest request:
+  ```rust
+  if let Ok(req) = resize_rx.recv() {
+      let mut latest_req = req;
+      while let Ok(next_req) = resize_rx.try_recv() {
+          latest_req = next_req;
+      }
+      let protocol = process_resize(latest_req);
+      let _ = protocol_tx.send(protocol);
+  }
+  ```
+
+### Guidelines for Future Work
+
+- Offload decoding to one-shot background threads and scaling to a persistent worker thread.
+- Avoid freezing the TUI during startup/navigation by showing a debounced indicator (e.g. only if loading takes >150ms).
+
+______________________________________________________________________
+
+## 8. Selective Visual Clearing (Anti-Flicker Sixel Logic)
+
+### The Learning
+
+Sixel graphics require clear operations (`terminal.clear()?`) to wipe old frames, but clearing on every frame of a continuous update (like zooming or panning) causes extreme screen flicker.
+
+- If we clear the screen immediately on image load, rotation, or zoom triggers, the terminal will render the old image's layout for one frame before the background thread returns the new protocol.
+- This creates double-clearing and redraw stutters.
+
+### Guidelines for Future Work
+
+- Defer screen clearing until the new protocol is actually received from the worker thread.
+- Do not clear the terminal during zooming and panning. Use a selective `clear_on_protocol_receive` flag to restrict screen clearing only to discrete state changes (e.g. loading a new file, resetting views, or rotations).
+
+______________________________________________________________________
+
+## 9. Input Event Coalescing/Debouncing (Keyboard Repeats)
+
+### The Learning
+
+When holding down keys for continuous actions (like panning), standard keyboard repeat configurations trigger events faster than Sixel escape rendering can complete. This creates a backlog of render inputs, leading to delayed panning responses and visual stutter.
+
+### Guidelines for Future Work
+
+Before drawing a frame, block for the first key event, then immediately drain all remaining pending key repeat events from Crossterm's event buffer using `poll(0)`:
+```rust
+if event::poll(Duration::from_millis(50))? {
+    let mut events = Vec::new();
+    events.push(event::read()?);
+    while event::poll(Duration::from_millis(0))? {
+        events.push(event::read()?);
+    }
+    // Process all events and update offsets before running update_protocol().
+}
+```
+
+______________________________________________________________________
+
+## 10. Native EXIF Orientation Decoding
+
+### The Learning
+
+Normal pixel decoders do not automatically apply EXIF rotation metadata.
+
+### Guidelines for Future Work
+
+Instead of raw `ImageReader::decode()`, use `into_decoder()` to read EXIF tags, then call `apply_orientation()` to align the image coordinates prior to computing any layout boundaries:
+```rust
+let mut decoder = reader.into_decoder()?;
+let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+let mut img = DynamicImage::from_decoder(decoder)?;
+img.apply_orientation(orientation);
+```
+
