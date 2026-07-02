@@ -1033,9 +1033,9 @@ fn is_image_file(path: &Path) -> bool {
             || ext.eq_ignore_ascii_case("bmp")
             || ext.eq_ignore_ascii_case("tiff")
             || ext.eq_ignore_ascii_case("ico"))
-        {
-            return true;
-        }
+    {
+        return true;
+    }
     matches!(guess_file_type(path), Some(GuessType::Image))
 }
 
@@ -1044,9 +1044,10 @@ fn is_cbz_or_zip(path: &Path) -> bool {
         return false;
     }
     if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && (ext.eq_ignore_ascii_case("cbz") || ext.eq_ignore_ascii_case("zip")) {
-            return true;
-        }
+        && (ext.eq_ignore_ascii_case("cbz") || ext.eq_ignore_ascii_case("zip"))
+    {
+        return true;
+    }
     matches!(guess_file_type(path), Some(GuessType::Zip))
 }
 
@@ -1072,9 +1073,9 @@ fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
                     || ext.eq_ignore_ascii_case("bmp")
                     || ext.eq_ignore_ascii_case("tiff")
                     || ext.eq_ignore_ascii_case("ico"))
-                {
-                    pages.push(name.to_string());
-                }
+            {
+                pages.push(name.to_string());
+            }
         }
     }
 
