@@ -368,6 +368,7 @@ pub struct App {
     pub loading_start_time: Option<Instant>,
     pub clear_on_protocol_receive: bool,
     pub zoom_needs_initialization: bool,
+    pub last_help_toggle: Option<Instant>,
     pub brightness: i32,
     pub contrast: f32,
 }
@@ -438,6 +439,7 @@ impl App {
             loading_start_time: None,
             clear_on_protocol_receive: false,
             zoom_needs_initialization: false,
+            last_help_toggle: None,
             brightness: 0,
             contrast: 0.0,
         };
@@ -496,7 +498,6 @@ impl App {
         match name {
             "Show Help" => {
                 self.show_help = true;
-                self.needs_update = true;
                 self.needs_clear = true;
             }
             "Reset View" => self.reset_view(),
@@ -866,6 +867,21 @@ impl App {
         self.contrast = 0.0;
         self.needs_update = true;
         self.clear_on_protocol_receive = true;
+    }
+
+    pub fn toggle_help(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_help_toggle
+            && now.duration_since(last) < std::time::Duration::from_millis(150)
+        {
+            return;
+        }
+        self.last_help_toggle = Some(now);
+        self.show_help = !self.show_help;
+        if !self.show_help {
+            self.needs_update = true;
+        }
+        self.needs_clear = true;
     }
 
     pub fn increase_brightness(&mut self) {
@@ -1664,118 +1680,148 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             }
                         } else {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    if app.show_help {
+                            let mut key_handled = false;
+                            if app.show_help {
+                                match key.code {
+                                    KeyCode::Char('?') | KeyCode::Char('/') => {
+                                        app.toggle_help();
+                                        key_handled = true;
+                                    }
+                                    KeyCode::Char('q') | KeyCode::Esc => {
                                         app.show_help = false;
                                         app.needs_update = true;
                                         app.needs_clear = true;
-                                    } else {
-                                        app.running = false;
+                                        key_handled = true;
+                                    }
+                                    _ => {
+                                        app.show_help = false;
+                                        app.needs_update = true;
+                                        app.needs_clear = true;
                                     }
                                 }
-                                KeyCode::Char('?') | KeyCode::Char('/') => {
-                                    app.show_help = !app.show_help;
-                                    app.needs_update = true;
-                                    app.needs_clear = true;
+                            }
+
+                            if !key_handled {
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Esc => {
+                                        app.running = false;
+                                    }
+                                    KeyCode::Char('?') | KeyCode::Char('/') => {
+                                        app.toggle_help();
+                                    }
+                                    // Command Palette
+                                    KeyCode::Char(':') => {
+                                        app.palette_mode = PaletteMode::Command;
+                                        app.palette_query.clear();
+                                        app.palette_selected_index = 0;
+                                        app.needs_clear = true;
+                                    }
+                                    // File Palette
+                                    KeyCode::Char('f') => {
+                                        app.palette_mode = PaletteMode::File;
+                                        app.palette_query.clear();
+                                        app.palette_selected_index = app.current_index;
+                                        app.needs_clear = true;
+                                    }
+                                    // Next image
+                                    KeyCode::Char('n')
+                                    | KeyCode::Char(' ')
+                                    | KeyCode::Char(']') => {
+                                        app.next_image();
+                                    }
+                                    // Prev image
+                                    KeyCode::Char('p')
+                                    | KeyCode::Char('[')
+                                    | KeyCode::Backspace => {
+                                        app.prev_image();
+                                    }
+                                    // Zoom
+                                    KeyCode::Char('i')
+                                    | KeyCode::Char('+')
+                                    | KeyCode::Char('=') => {
+                                        app.zoom_in();
+                                    }
+                                    KeyCode::Char('o') | KeyCode::Char('-') => {
+                                        app.zoom_out();
+                                    }
+                                    // Actual size
+                                    KeyCode::Char('a') => {
+                                        app.set_actual_size();
+                                    }
+                                    // Reset
+                                    KeyCode::Char('r') => {
+                                        app.reset_view();
+                                    }
+                                    // Brightness
+                                    KeyCode::Char('b') => {
+                                        app.increase_brightness();
+                                    }
+                                    KeyCode::Char('B') => {
+                                        app.decrease_brightness();
+                                    }
+                                    // Contrast
+                                    KeyCode::Char('c') => {
+                                        app.increase_contrast();
+                                    }
+                                    KeyCode::Char('C') => {
+                                        app.decrease_contrast();
+                                    }
+                                    // Rotation
+                                    KeyCode::Char('e')
+                                    | KeyCode::Char('R')
+                                    | KeyCode::Char('>') => {
+                                        app.rotate_clockwise();
+                                    }
+                                    KeyCode::Char('E') | KeyCode::Char('<') => {
+                                        app.rotate_counter_clockwise();
+                                    }
+                                    // Vim Navigation (Pan)
+                                    KeyCode::Char('h') => {
+                                        app.pan_left();
+                                    }
+                                    KeyCode::Char('l') => {
+                                        app.pan_right();
+                                    }
+                                    KeyCode::Char('k') => {
+                                        app.pan_up();
+                                    }
+                                    KeyCode::Char('j') => {
+                                        app.pan_down();
+                                    }
+                                    // Arrow Keys (Pan)
+                                    KeyCode::Left => {
+                                        app.pan_left();
+                                    }
+                                    KeyCode::Right => {
+                                        app.pan_right();
+                                    }
+                                    KeyCode::Up => {
+                                        app.pan_up();
+                                    }
+                                    KeyCode::Down => {
+                                        app.pan_down();
+                                    }
+                                    _ => {}
                                 }
-                                // Command Palette
-                                KeyCode::Char(':') => {
-                                    app.palette_mode = PaletteMode::Command;
-                                    app.palette_query.clear();
-                                    app.palette_selected_index = 0;
-                                    app.needs_clear = true;
-                                }
-                                // File Palette
-                                KeyCode::Char('f') => {
-                                    app.palette_mode = PaletteMode::File;
-                                    app.palette_query.clear();
-                                    app.palette_selected_index = app.current_index;
-                                    app.needs_clear = true;
-                                }
-                                // Next image
-                                KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => {
-                                    app.next_image();
-                                }
-                                // Prev image
-                                KeyCode::Char('p') | KeyCode::Char('[') | KeyCode::Backspace => {
-                                    app.prev_image();
-                                }
-                                // Zoom
-                                KeyCode::Char('i') | KeyCode::Char('+') | KeyCode::Char('=') => {
-                                    app.zoom_in();
-                                }
-                                KeyCode::Char('o') | KeyCode::Char('-') => {
-                                    app.zoom_out();
-                                }
-                                // Actual size
-                                KeyCode::Char('a') => {
-                                    app.set_actual_size();
-                                }
-                                // Reset
-                                KeyCode::Char('r') => {
-                                    app.reset_view();
-                                }
-                                // Brightness
-                                KeyCode::Char('b') => {
-                                    app.increase_brightness();
-                                }
-                                KeyCode::Char('B') => {
-                                    app.decrease_brightness();
-                                }
-                                // Contrast
-                                KeyCode::Char('c') => {
-                                    app.increase_contrast();
-                                }
-                                KeyCode::Char('C') => {
-                                    app.decrease_contrast();
-                                }
-                                // Rotation
-                                KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
-                                    app.rotate_clockwise();
-                                }
-                                KeyCode::Char('E') | KeyCode::Char('<') => {
-                                    app.rotate_counter_clockwise();
-                                }
-                                // Vim Navigation (Pan)
-                                KeyCode::Char('h') => {
-                                    app.pan_left();
-                                }
-                                KeyCode::Char('l') => {
-                                    app.pan_right();
-                                }
-                                KeyCode::Char('k') => {
-                                    app.pan_up();
-                                }
-                                KeyCode::Char('j') => {
-                                    app.pan_down();
-                                }
-                                // Arrow Keys (Pan)
-                                KeyCode::Left => {
-                                    app.pan_left();
-                                }
-                                KeyCode::Right => {
-                                    app.pan_right();
-                                }
-                                KeyCode::Up => {
-                                    app.pan_up();
-                                }
-                                KeyCode::Down => {
-                                    app.pan_down();
-                                }
-                                _ => {}
                             }
                         }
                     }
-                    Event::Mouse(mouse_event) => match mouse_event.kind {
-                        MouseEventKind::ScrollUp => {
-                            app.zoom_in();
+                    Event::Mouse(mouse_event) => {
+                        if app.show_help {
+                            app.show_help = false;
+                            app.needs_update = true;
+                            app.needs_clear = true;
                         }
-                        MouseEventKind::ScrollDown => {
-                            app.zoom_out();
+                        match mouse_event.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.zoom_in();
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.zoom_out();
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 }
             }
