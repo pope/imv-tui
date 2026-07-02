@@ -1,5 +1,5 @@
 {
-  description = "TODO";
+  description = "imv-tui is a TUI for viewing images with zooming and panning";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
