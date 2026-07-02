@@ -63,38 +63,35 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
                 .map(|r| r.format());
 
             if let Ok(Some(image::ImageFormat::Jpeg)) = format
-                && let Ok(bytes) = std::fs::read(&path) {
-                    let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-                        .jpeg_set_out_colorspace(
-                            zune_jpeg::zune_core::colorspace::ColorSpace::RGBA,
-                        );
-                    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&bytes, options);
-                    if let Ok(pixels) = decoder.decode()
-                        && let Some(info) = decoder.info()
-                            && let Some(rgba_img) = image::RgbaImage::from_raw(
-                                info.width as u32,
-                                info.height as u32,
-                                pixels,
-                            ) {
-                                let orientation = match image::ImageReader::open(&path)
-                                    .and_then(|r| r.with_guessed_format())
-                                {
-                                    Ok(reader) => match reader.into_decoder() {
-                                        Ok(mut dec) => dec
-                                            .orientation()
-                                            .unwrap_or(image::metadata::Orientation::NoTransforms),
-                                        Err(_) => image::metadata::Orientation::NoTransforms,
-                                    },
-                                    Err(_) => image::metadata::Orientation::NoTransforms,
-                                };
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+                    .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+                let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&bytes, options);
+                if let Ok(pixels) = decoder.decode()
+                    && let Some(info) = decoder.info()
+                    && let Some(rgba_img) =
+                        image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
+                {
+                    let orientation = match image::ImageReader::open(&path)
+                        .and_then(|r| r.with_guessed_format())
+                    {
+                        Ok(reader) => match reader.into_decoder() {
+                            Ok(mut dec) => dec
+                                .orientation()
+                                .unwrap_or(image::metadata::Orientation::NoTransforms),
+                            Err(_) => image::metadata::Orientation::NoTransforms,
+                        },
+                        Err(_) => image::metadata::Orientation::NoTransforms,
+                    };
 
-                                let mut img = image::DynamicImage::ImageRgba8(rgba_img);
-                                img.apply_orientation(orientation);
-                                let w = img.width();
-                                let h = img.height();
-                                return Ok((img, w, h));
-                            }
+                    let mut img = image::DynamicImage::ImageRgba8(rgba_img);
+                    img.apply_orientation(orientation);
+                    let w = img.width();
+                    let h = img.height();
+                    return Ok((img, w, h));
                 }
+            }
 
             let reader = image::ImageReader::open(&path)
                 .map_err(|e| format!("Failed to open file:\n{}\n\nError: {}", path.display(), e))?
@@ -171,29 +168,27 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
                 let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&buffer, options);
                 if let Ok(pixels) = decoder.decode()
                     && let Some(info) = decoder.info()
-                        && let Some(rgba_img) = image::RgbaImage::from_raw(
-                            info.width as u32,
-                            info.height as u32,
-                            pixels,
-                        ) {
-                            let cursor_meta = std::io::Cursor::new(buffer);
-                            let orientation =
-                                match image::ImageReader::new(cursor_meta).with_guessed_format() {
-                                    Ok(reader) => match reader.into_decoder() {
-                                        Ok(mut dec) => dec
-                                            .orientation()
-                                            .unwrap_or(image::metadata::Orientation::NoTransforms),
-                                        Err(_) => image::metadata::Orientation::NoTransforms,
-                                    },
-                                    Err(_) => image::metadata::Orientation::NoTransforms,
-                                };
+                    && let Some(rgba_img) =
+                        image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
+                {
+                    let cursor_meta = std::io::Cursor::new(buffer);
+                    let orientation =
+                        match image::ImageReader::new(cursor_meta).with_guessed_format() {
+                            Ok(reader) => match reader.into_decoder() {
+                                Ok(mut dec) => dec
+                                    .orientation()
+                                    .unwrap_or(image::metadata::Orientation::NoTransforms),
+                                Err(_) => image::metadata::Orientation::NoTransforms,
+                            },
+                            Err(_) => image::metadata::Orientation::NoTransforms,
+                        };
 
-                            let mut img = image::DynamicImage::ImageRgba8(rgba_img);
-                            img.apply_orientation(orientation);
-                            let w = img.width();
-                            let h = img.height();
-                            return Ok((img, w, h));
-                        }
+                    let mut img = image::DynamicImage::ImageRgba8(rgba_img);
+                    img.apply_orientation(orientation);
+                    let w = img.width();
+                    let h = img.height();
+                    return Ok((img, w, h));
+                }
             }
 
             let cursor = std::io::Cursor::new(buffer);
@@ -236,6 +231,7 @@ struct ResizeRequest {
     picker: Picker,
     brightness: i32,
     contrast: f32,
+    rendered_size_cells: (u16, u16),
 }
 
 fn fast_resize(
@@ -570,7 +566,7 @@ pub struct App {
 
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
-    protocol_rx: mpsc::Receiver<StatefulProtocol>,
+    protocol_rx: mpsc::Receiver<(StatefulProtocol, (u16, u16))>,
     image_rx: Option<ImageReceiver>,
     pub is_loading: bool,
     pub loading_start_time: Option<Instant>,
@@ -600,7 +596,7 @@ impl App {
             .collect();
 
         let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
-        let (protocol_tx, protocol_rx) = mpsc::channel::<StatefulProtocol>();
+        let (protocol_tx, protocol_rx) = mpsc::channel::<(StatefulProtocol, (u16, u16))>();
 
         // Spawn background resizing worker thread
         std::thread::spawn(move || {
@@ -611,8 +607,9 @@ impl App {
                     while let Ok(next_req) = resize_rx.try_recv() {
                         latest_req = next_req;
                     }
+                    let rendered_cells = latest_req.rendered_size_cells;
                     let protocol = process_resize(latest_req, &mut resizer);
-                    let _ = protocol_tx.send(protocol);
+                    let _ = protocol_tx.send((protocol, rendered_cells));
                 }
             }
         });
@@ -875,8 +872,9 @@ impl App {
             }
         }
 
-        if let Ok(protocol) = self.protocol_rx.try_recv() {
+        if let Ok((protocol, cells)) = self.protocol_rx.try_recv() {
             self.image_protocol = Some(protocol);
+            self.rendered_size_cells = cells;
             if self.clear_on_protocol_receive {
                 self.clear_on_protocol_receive = false;
                 self.needs_clear = true;
@@ -952,7 +950,7 @@ impl App {
             // Calculate exact cell size of the rendered image
             let cells_w = (target_w as f64 / cell_w as f64).round() as u16;
             let cells_h = (target_h as f64 / cell_h as f64).round() as u16;
-            self.rendered_size_cells = (cells_w.clamp(1, widget_w), cells_h.clamp(1, widget_h));
+            let rendered_cells = (cells_w.clamp(1, widget_w), cells_h.clamp(1, widget_h));
 
             let req = ResizeRequest {
                 img: Arc::clone(img),
@@ -971,6 +969,7 @@ impl App {
                 picker: self.picker.clone(),
                 brightness: self.brightness,
                 contrast: self.contrast,
+                rendered_size_cells: rendered_cells,
             };
 
             let _ = self.resize_tx.send(req);
