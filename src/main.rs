@@ -1678,6 +1678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let mut initial_path = None;
     let mut filter_opt = None;
+    let mut protocol_opt = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1693,6 +1694,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--protocol" | "-p" => {
+                if i + 1 < args.len() {
+                    protocol_opt = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "Error: --protocol / -p requires an argument (kitty, sixel, halfblocks, iterm2)"
+                    );
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -1700,9 +1712,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!();
                 println!("Options:");
                 println!(
-                    "  -f, --filter <filter>  Initial image scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming"
+                    "  -f, --filter <filter>      Initial image scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming"
                 );
-                println!("  -h, --help             Show this help menu");
+                println!(
+                    "  -p, --protocol <protocol>  Force terminal graphics protocol: kitty, sixel, halfblocks, iterm2"
+                );
+                println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
             }
             val => {
@@ -1756,7 +1771,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Query terminal protocol before raw mode
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    if let Some(proto_str) = protocol_opt.as_deref() {
+        let proto = match proto_str.to_lowercase().as_str() {
+            "kitty" => ProtocolType::Kitty,
+            "sixel" => ProtocolType::Sixel,
+            "halfblocks" | "halfblock" => ProtocolType::Halfblocks,
+            "iterm2" => ProtocolType::Iterm2,
+            other => {
+                eprintln!(
+                    "Error: Unknown protocol '{}'. Choose from: kitty, sixel, halfblocks, iterm2",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+        picker.set_protocol_type(proto);
+    }
 
     // Setup terminal
     enable_raw_mode()?;

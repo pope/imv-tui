@@ -96,7 +96,8 @@ If no path is specified, it scans and opens images from the current directory (`
 
 ### Command Line Options
 
-- `-f, --filter <nearest|linear|cubic|gaussian|lanczos>`: Set the initial image scaling filter (defaults to `nearest`).
+- `-f, --filter <nearest|linear|cubic|mitchell|gaussian|lanczos|hamming>`: Set the initial image scaling filter (defaults to `nearest`).
+- `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection).
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
 
 ______________________________________________________________________
