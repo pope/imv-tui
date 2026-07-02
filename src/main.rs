@@ -2,7 +2,9 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -25,6 +27,72 @@ use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
+
+struct ResizeRequest {
+    img: Arc<DynamicImage>,
+    scale: f64,
+    crop_x1: i64,
+    crop_y1: i64,
+    crop_x2: i64,
+    crop_y2: i64,
+    inter_x1: i64,
+    inter_y1: i64,
+    inter_x2: i64,
+    inter_y2: i64,
+    target_w: u32,
+    target_h: u32,
+    filter_type: FilterType,
+    picker: Picker,
+}
+
+fn process_resize(req: ResizeRequest) -> StatefulProtocol {
+    let canvas = if req.inter_x1 == req.crop_x1
+        && req.inter_x2 == req.crop_x2
+        && req.inter_y1 == req.crop_y1
+        && req.inter_y2 == req.crop_y2
+    {
+        let cropped_part = req.img.crop_imm(
+            req.inter_x1 as u32,
+            req.inter_y1 as u32,
+            (req.inter_x2 - req.inter_x1) as u32,
+            (req.inter_y2 - req.inter_y1) as u32,
+        );
+        cropped_part.resize(req.target_w, req.target_h, req.filter_type)
+    } else {
+        let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
+
+        if req.inter_x2 > req.inter_x1 && req.inter_y2 > req.inter_y1 {
+            let cropped_part = req.img.crop_imm(
+                req.inter_x1 as u32,
+                req.inter_y1 as u32,
+                (req.inter_x2 - req.inter_x1) as u32,
+                (req.inter_y2 - req.inter_y1) as u32,
+            );
+
+            let target_inter_w =
+                (((req.inter_x2 - req.inter_x1) as f64 * req.scale).round() as u32).max(1);
+            let target_inter_h =
+                (((req.inter_y2 - req.inter_y1) as f64 * req.scale).round() as u32).max(1);
+
+            let resized_part = cropped_part.resize(target_inter_w, target_inter_h, req.filter_type);
+
+            let paste_x = ((req.inter_x1 - req.crop_x1) as f64 * req.scale).round() as i64;
+            let paste_y = ((req.inter_y1 - req.crop_y1) as f64 * req.scale).round() as i64;
+
+            let paste_x =
+                paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;
+            let paste_y =
+                paste_y.clamp(0, (req.target_h as i64 - target_inter_h as i64).max(0)) as u32;
+
+            let _ = screen_canvas.copy_from(&resized_part, paste_x, paste_y);
+        }
+        DynamicImage::ImageRgba8(screen_canvas)
+    };
+
+    req.picker.new_resize_protocol(canvas)
+}
+
+type ImageReceiver = mpsc::Receiver<Result<(DynamicImage, u32, u32), String>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
@@ -117,7 +185,7 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
 pub struct App {
     pub images: Vec<PathBuf>,
     pub current_index: usize,
-    pub original_image: Option<DynamicImage>,
+    pub original_image: Option<Arc<DynamicImage>>,
     pub image_protocol: Option<StatefulProtocol>,
     pub picker: Picker,
 
@@ -140,6 +208,14 @@ pub struct App {
     pub palette_query: String,
     pub palette_selected_index: usize,
     pub filter_type: FilterType,
+
+    // Thread communication channels
+    resize_tx: mpsc::Sender<ResizeRequest>,
+    protocol_rx: mpsc::Receiver<StatefulProtocol>,
+    image_rx: Option<ImageReceiver>,
+    pub is_loading: bool,
+    pub loading_start_time: Option<Instant>,
+    pub clear_on_protocol_receive: bool,
 }
 
 impl App {
@@ -152,6 +228,23 @@ impl App {
         if images.is_empty() {
             return Err("No supported images found".to_string());
         }
+
+        let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
+        let (protocol_tx, protocol_rx) = mpsc::channel::<StatefulProtocol>();
+
+        // Spawn background resizing worker thread
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(req) = resize_rx.recv() {
+                    let mut latest_req = req;
+                    while let Ok(next_req) = resize_rx.try_recv() {
+                        latest_req = next_req;
+                    }
+                    let protocol = process_resize(latest_req);
+                    let _ = protocol_tx.send(protocol);
+                }
+            }
+        });
 
         let mut app = Self {
             images,
@@ -175,9 +268,15 @@ impl App {
             palette_query: String::new(),
             palette_selected_index: 0,
             filter_type,
+            resize_tx,
+            protocol_rx,
+            image_rx: None,
+            is_loading: false,
+            loading_start_time: None,
+            clear_on_protocol_receive: false,
         };
 
-        app.load_image();
+        app.start_load_image();
         Ok(app)
     }
 
@@ -258,8 +357,8 @@ impl App {
         }
     }
 
-    /// Load the image at the current index
-    pub fn load_image(&mut self) {
+    /// Start loading the image at the current index in the background
+    pub fn start_load_image(&mut self) {
         if self.images.is_empty() {
             self.original_image = None;
             self.image_protocol = None;
@@ -267,59 +366,86 @@ impl App {
             return;
         }
 
-        let path = &self.images[self.current_index];
-        match image::ImageReader::open(path) {
-            Ok(reader) => match reader.into_decoder() {
-                Ok(mut decoder) => {
-                    let orientation = decoder
-                        .orientation()
-                        .unwrap_or(image::metadata::Orientation::NoTransforms);
-                    match image::DynamicImage::from_decoder(decoder) {
-                        Ok(mut img) => {
-                            img.apply_orientation(orientation);
-                            self.img_width = img.width();
-                            self.img_height = img.height();
-                            self.original_image = Some(img);
-                            self.error_message = None;
-                            self.zoom_factor = 1.0;
-                            self.pan_offset = (0, 0);
-                            self.needs_update = true;
-                            self.needs_clear = true;
-                        }
-                        Err(e) => {
-                            self.original_image = None;
-                            self.image_protocol = None;
-                            self.error_message = Some(format!(
+        self.is_loading = true;
+        self.loading_start_time = Some(Instant::now());
+        self.error_message = None;
+        self.clear_on_protocol_receive = true;
+
+        let path = self.images[self.current_index].clone();
+        let (tx, rx) = mpsc::channel();
+        self.image_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let res = match image::ImageReader::open(&path) {
+                Ok(reader) => match reader.into_decoder() {
+                    Ok(mut decoder) => {
+                        let orientation = decoder
+                            .orientation()
+                            .unwrap_or(image::metadata::Orientation::NoTransforms);
+                        match image::DynamicImage::from_decoder(decoder) {
+                            Ok(mut img) => {
+                                img.apply_orientation(orientation);
+                                let w = img.width();
+                                let h = img.height();
+                                Ok((img, w, h))
+                            }
+                            Err(e) => Err(format!(
                                 "Failed to decode image:\n{}\n\nError: {}",
                                 path.display(),
                                 e
-                            ));
+                            )),
                         }
                     }
-                }
-                Err(e) => {
-                    self.original_image = None;
-                    self.image_protocol = None;
-                    self.error_message = Some(format!(
+                    Err(e) => Err(format!(
                         "Failed to read image metadata:\n{}\n\nError: {}",
                         path.display(),
                         e
-                    ));
-                }
-            },
-            Err(e) => {
-                self.original_image = None;
-                self.image_protocol = None;
-                self.error_message = Some(format!(
+                    )),
+                },
+                Err(e) => Err(format!(
                     "Failed to open file:\n{}\n\nError: {}",
                     path.display(),
                     e
-                ));
+                )),
+            };
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Check background threads and poll their messages
+    pub fn update_channels(&mut self) {
+        if let Some(res) = self.image_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.image_rx = None;
+            match res {
+                Ok((img, w, h)) => {
+                    self.img_width = w;
+                    self.img_height = h;
+                    self.original_image = Some(Arc::new(img));
+                    self.error_message = None;
+                    self.zoom_factor = 1.0;
+                    self.pan_offset = (0, 0);
+                    self.is_loading = false;
+                    self.needs_update = true;
+                }
+                Err(err) => {
+                    self.original_image = None;
+                    self.image_protocol = None;
+                    self.error_message = Some(err);
+                    self.is_loading = false;
+                }
+            }
+        }
+
+        if let Ok(protocol) = self.protocol_rx.try_recv() {
+            self.image_protocol = Some(protocol);
+            if self.clear_on_protocol_receive {
+                self.clear_on_protocol_receive = false;
+                self.needs_clear = true;
             }
         }
     }
 
-    /// Update the ratatui-image protocol state based on zoom and pan
+    /// Update the ratatui-image protocol state based on zoom and pan (processed asynchronously)
     pub fn update_protocol(&mut self, widget_w: u16, widget_h: u16) {
         if widget_w == 0 || widget_h == 0 {
             return;
@@ -379,61 +505,29 @@ impl App {
             let inter_x2 = crop_x2.clamp(0, self.img_width as i64);
             let inter_y2 = crop_y2.clamp(0, self.img_height as i64);
 
-            let canvas = if inter_x1 == crop_x1
-                && inter_x2 == crop_x2
-                && inter_y1 == crop_y1
-                && inter_y2 == crop_y2
-            {
-                // Optimization: Crop box is fully inside the image (e.g. zoomed in & panning).
-                // Resize the crop directly, completely bypassing background canvas allocation and overlays!
-                let cropped_part = img.crop_imm(
-                    inter_x1 as u32,
-                    inter_y1 as u32,
-                    (inter_x2 - inter_x1) as u32,
-                    (inter_y2 - inter_y1) as u32,
-                );
-                cropped_part.resize(target_w, target_h, self.filter_type)
-            } else {
-                // Crop box goes outside image bounds (e.g. zoomed out or panned past edge).
-                // Create a blank background canvas and copy the visible portion onto it.
-                let mut screen_canvas = image::RgbaImage::new(target_w, target_h);
-
-                if inter_x2 > inter_x1 && inter_y2 > inter_y1 {
-                    let cropped_part = img.crop_imm(
-                        inter_x1 as u32,
-                        inter_y1 as u32,
-                        (inter_x2 - inter_x1) as u32,
-                        (inter_y2 - inter_y1) as u32,
-                    );
-
-                    let target_inter_w =
-                        (((inter_x2 - inter_x1) as f64 * scale).round() as u32).max(1);
-                    let target_inter_h =
-                        (((inter_y2 - inter_y1) as f64 * scale).round() as u32).max(1);
-
-                    let resized_part =
-                        cropped_part.resize(target_inter_w, target_inter_h, self.filter_type);
-
-                    let paste_x = ((inter_x1 - crop_x1) as f64 * scale).round() as i64;
-                    let paste_y = ((inter_y1 - crop_y1) as f64 * scale).round() as i64;
-
-                    let paste_x =
-                        paste_x.clamp(0, (target_w as i64 - target_inter_w as i64).max(0)) as u32;
-                    let paste_y =
-                        paste_y.clamp(0, (target_h as i64 - target_inter_h as i64).max(0)) as u32;
-
-                    // Fast memory-copy block transfer without expensive alpha-blending math
-                    let _ = screen_canvas.copy_from(&resized_part, paste_x, paste_y);
-                }
-                DynamicImage::ImageRgba8(screen_canvas)
-            };
-
-            self.image_protocol = Some(self.picker.new_resize_protocol(canvas));
-
             // Calculate exact cell size of the rendered image
             let cells_w = (target_w as f64 / cell_w as f64).round() as u16;
             let cells_h = (target_h as f64 / cell_h as f64).round() as u16;
             self.rendered_size_cells = (cells_w.clamp(1, widget_w), cells_h.clamp(1, widget_h));
+
+            let req = ResizeRequest {
+                img: Arc::clone(img),
+                scale,
+                crop_x1,
+                crop_y1,
+                crop_x2,
+                crop_y2,
+                inter_x1,
+                inter_y1,
+                inter_x2,
+                inter_y2,
+                target_w,
+                target_h,
+                filter_type: self.filter_type,
+                picker: self.picker.clone(),
+            };
+
+            let _ = self.resize_tx.send(req);
         } else {
             self.image_protocol = None;
             self.rendered_size_cells = (0, 0);
@@ -507,7 +601,7 @@ impl App {
             self.zoom_factor = 1.0 / s;
             self.clamp_pan();
             self.needs_update = true;
-            self.needs_clear = true;
+            self.clear_on_protocol_receive = true;
         }
     }
 
@@ -519,7 +613,7 @@ impl App {
         self.zoom_factor = 1.0;
         self.pan_offset = (0, 0);
         self.needs_update = true;
-        self.needs_clear = true;
+        self.clear_on_protocol_receive = true;
     }
 
     /// Clamp pan offsets so that the corners of the image cannot pan past the center point of the viewport
@@ -584,11 +678,11 @@ impl App {
             let rotated = img.rotate90();
             self.img_width = rotated.width();
             self.img_height = rotated.height();
-            self.original_image = Some(rotated);
+            self.original_image = Some(Arc::new(rotated));
             self.zoom_factor = 1.0;
             self.pan_offset = (0, 0);
             self.needs_update = true;
-            self.needs_clear = true;
+            self.clear_on_protocol_receive = true;
         }
     }
 
@@ -598,11 +692,11 @@ impl App {
             let rotated = img.rotate270();
             self.img_width = rotated.width();
             self.img_height = rotated.height();
-            self.original_image = Some(rotated);
+            self.original_image = Some(Arc::new(rotated));
             self.zoom_factor = 1.0;
             self.pan_offset = (0, 0);
             self.needs_update = true;
-            self.needs_clear = true;
+            self.clear_on_protocol_receive = true;
         }
     }
 
@@ -624,7 +718,7 @@ impl App {
             return;
         }
         self.current_index = (self.current_index + 1) % self.images.len();
-        self.load_image();
+        self.start_load_image();
     }
 
     /// Previous image
@@ -637,7 +731,7 @@ impl App {
         } else {
             self.current_index -= 1;
         }
-        self.load_image();
+        self.start_load_image();
     }
 }
 
@@ -716,7 +810,18 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
 
     // Render image or placeholders
-    if let Some(ref mut protocol) = app.image_protocol {
+    let show_loading = app.is_loading
+        && (app.image_protocol.is_none()
+            || app
+                .loading_start_time
+                .is_some_and(|t| t.elapsed() > Duration::from_millis(150)));
+
+    if show_loading {
+        let loading_paragraph = Paragraph::new("\n\nLoading Image...")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Yellow).bold());
+        frame.render_widget(loading_paragraph, chunks[0]);
+    } else if let Some(ref mut protocol) = app.image_protocol {
         // Calculate the centered Rect inside chunks[0]
         let (rect_w, rect_h) = app.rendered_size_cells;
         let x = chunks[0].x + (chunks[0].width.saturating_sub(rect_w)) / 2;
@@ -1059,192 +1164,203 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Main event loop
     while app.running {
+        app.update_channels();
+
         if app.needs_clear {
             app.needs_clear = false;
             if app.should_clear_on_update() {
                 terminal.clear()?;
-                app.needs_update = true;
             }
         }
         terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if app.palette_mode != PaletteMode::Closed {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.palette_mode = PaletteMode::Closed;
-                                app.needs_update = true;
-                                app.needs_clear = true;
-                            }
-                            KeyCode::Enter => {
-                                match app.palette_mode {
-                                    PaletteMode::File => {
-                                        let files = app.get_filtered_files();
-                                        if !files.is_empty()
-                                            && app.palette_selected_index < files.len()
-                                        {
-                                            app.current_index = files[app.palette_selected_index].0;
-                                            app.load_image();
-                                        }
-                                    }
-                                    PaletteMode::Command => {
-                                        let cmds = app.get_filtered_commands();
-                                        if !cmds.is_empty()
-                                            && app.palette_selected_index < cmds.len()
-                                        {
-                                            let cmd_name = cmds[app.palette_selected_index].name;
-                                            app.execute_command(cmd_name);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                app.palette_mode = PaletteMode::Closed;
-                                app.needs_update = true;
-                                app.needs_clear = true;
-                            }
-                            KeyCode::Up if app.palette_selected_index > 0 => {
-                                app.palette_selected_index -= 1;
-                            }
-                            KeyCode::Down => {
-                                let max_len = match app.palette_mode {
-                                    PaletteMode::File => app.get_filtered_files().len(),
-                                    PaletteMode::Command => app.get_filtered_commands().len(),
-                                    _ => 0,
-                                };
-                                if max_len > 0 && app.palette_selected_index < max_len - 1 {
-                                    app.palette_selected_index += 1;
-                                }
-                            }
-                            KeyCode::Char('k')
-                                if key.modifiers.contains(event::KeyModifiers::CONTROL)
-                                    && app.palette_selected_index > 0 =>
-                            {
-                                app.palette_selected_index -= 1;
-                            }
-                            KeyCode::Char('j')
-                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                            {
-                                let max_len = match app.palette_mode {
-                                    PaletteMode::File => app.get_filtered_files().len(),
-                                    PaletteMode::Command => app.get_filtered_commands().len(),
-                                    _ => 0,
-                                };
-                                if max_len > 0 && app.palette_selected_index < max_len - 1 {
-                                    app.palette_selected_index += 1;
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                app.palette_query.pop();
-                                app.palette_selected_index = 0;
-                            }
-                            KeyCode::Char(c) => {
-                                app.palette_query.push(c);
-                                app.palette_selected_index = 0;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                if app.show_help {
-                                    app.show_help = false;
+            let mut events = Vec::new();
+            events.push(event::read()?);
+            while event::poll(Duration::from_millis(0))? {
+                events.push(event::read()?);
+            }
+
+            for ev in events {
+                match ev {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if app.palette_mode != PaletteMode::Closed {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.palette_mode = PaletteMode::Closed;
                                     app.needs_update = true;
                                     app.needs_clear = true;
-                                } else {
-                                    app.running = false;
                                 }
+                                KeyCode::Enter => {
+                                    match app.palette_mode {
+                                        PaletteMode::File => {
+                                            let files = app.get_filtered_files();
+                                            if !files.is_empty()
+                                                && app.palette_selected_index < files.len()
+                                            {
+                                                app.current_index =
+                                                    files[app.palette_selected_index].0;
+                                                app.start_load_image();
+                                            }
+                                        }
+                                        PaletteMode::Command => {
+                                            let cmds = app.get_filtered_commands();
+                                            if !cmds.is_empty()
+                                                && app.palette_selected_index < cmds.len()
+                                            {
+                                                let cmd_name =
+                                                    cmds[app.palette_selected_index].name;
+                                                app.execute_command(cmd_name);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    app.palette_mode = PaletteMode::Closed;
+                                    app.needs_update = true;
+                                    app.needs_clear = true;
+                                }
+                                KeyCode::Up if app.palette_selected_index > 0 => {
+                                    app.palette_selected_index -= 1;
+                                }
+                                KeyCode::Down => {
+                                    let max_len = match app.palette_mode {
+                                        PaletteMode::File => app.get_filtered_files().len(),
+                                        PaletteMode::Command => app.get_filtered_commands().len(),
+                                        _ => 0,
+                                    };
+                                    if max_len > 0 && app.palette_selected_index < max_len - 1 {
+                                        app.palette_selected_index += 1;
+                                    }
+                                }
+                                KeyCode::Char('k')
+                                    if key.modifiers.contains(event::KeyModifiers::CONTROL)
+                                        && app.palette_selected_index > 0 =>
+                                {
+                                    app.palette_selected_index -= 1;
+                                }
+                                KeyCode::Char('j')
+                                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                                {
+                                    let max_len = match app.palette_mode {
+                                        PaletteMode::File => app.get_filtered_files().len(),
+                                        PaletteMode::Command => app.get_filtered_commands().len(),
+                                        _ => 0,
+                                    };
+                                    if max_len > 0 && app.palette_selected_index < max_len - 1 {
+                                        app.palette_selected_index += 1;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    app.palette_query.pop();
+                                    app.palette_selected_index = 0;
+                                }
+                                KeyCode::Char(c) => {
+                                    app.palette_query.push(c);
+                                    app.palette_selected_index = 0;
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char('?') | KeyCode::Char('/') => {
-                                app.show_help = !app.show_help;
-                                app.needs_update = true;
-                                app.needs_clear = true;
+                        } else {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    if app.show_help {
+                                        app.show_help = false;
+                                        app.needs_update = true;
+                                        app.needs_clear = true;
+                                    } else {
+                                        app.running = false;
+                                    }
+                                }
+                                KeyCode::Char('?') | KeyCode::Char('/') => {
+                                    app.show_help = !app.show_help;
+                                    app.needs_update = true;
+                                    app.needs_clear = true;
+                                }
+                                // Command Palette
+                                KeyCode::Char(':') => {
+                                    app.palette_mode = PaletteMode::Command;
+                                    app.palette_query.clear();
+                                    app.palette_selected_index = 0;
+                                    app.needs_clear = true;
+                                }
+                                // File Palette
+                                KeyCode::Char('f') => {
+                                    app.palette_mode = PaletteMode::File;
+                                    app.palette_query.clear();
+                                    app.palette_selected_index = app.current_index;
+                                    app.needs_clear = true;
+                                }
+                                // Next image
+                                KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => {
+                                    app.next_image();
+                                }
+                                // Prev image
+                                KeyCode::Char('p') | KeyCode::Char('[') | KeyCode::Backspace => {
+                                    app.prev_image();
+                                }
+                                // Zoom
+                                KeyCode::Char('i') | KeyCode::Char('+') | KeyCode::Char('=') => {
+                                    app.zoom_in();
+                                }
+                                KeyCode::Char('o') | KeyCode::Char('-') => {
+                                    app.zoom_out();
+                                }
+                                // Actual size
+                                KeyCode::Char('a') => {
+                                    app.set_actual_size();
+                                }
+                                // Reset
+                                KeyCode::Char('r') => {
+                                    app.reset_view();
+                                }
+                                // Rotation
+                                KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
+                                    app.rotate_clockwise();
+                                }
+                                KeyCode::Char('E') | KeyCode::Char('<') => {
+                                    app.rotate_counter_clockwise();
+                                }
+                                // Vim Navigation (Pan)
+                                KeyCode::Char('h') => {
+                                    app.pan_left();
+                                }
+                                KeyCode::Char('l') => {
+                                    app.pan_right();
+                                }
+                                KeyCode::Char('k') => {
+                                    app.pan_up();
+                                }
+                                KeyCode::Char('j') => {
+                                    app.pan_down();
+                                }
+                                // Arrow Keys (Pan)
+                                KeyCode::Left => {
+                                    app.pan_left();
+                                }
+                                KeyCode::Right => {
+                                    app.pan_right();
+                                }
+                                KeyCode::Up => {
+                                    app.pan_up();
+                                }
+                                KeyCode::Down => {
+                                    app.pan_down();
+                                }
+                                _ => {}
                             }
-                            // Command Palette
-                            KeyCode::Char(':') => {
-                                app.palette_mode = PaletteMode::Command;
-                                app.palette_query.clear();
-                                app.palette_selected_index = 0;
-                                app.needs_clear = true;
-                            }
-                            // File Palette
-                            KeyCode::Char('f') => {
-                                app.palette_mode = PaletteMode::File;
-                                app.palette_query.clear();
-                                app.palette_selected_index = app.current_index;
-                                app.needs_clear = true;
-                            }
-                            // Next image
-                            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => {
-                                app.next_image();
-                            }
-                            // Prev image
-                            KeyCode::Char('p') | KeyCode::Char('[') | KeyCode::Backspace => {
-                                app.prev_image();
-                            }
-                            // Zoom
-                            KeyCode::Char('i') | KeyCode::Char('+') | KeyCode::Char('=') => {
-                                app.zoom_in();
-                            }
-                            KeyCode::Char('o') | KeyCode::Char('-') => {
-                                app.zoom_out();
-                            }
-                            // Actual size
-                            KeyCode::Char('a') => {
-                                app.set_actual_size();
-                            }
-                            // Reset
-                            KeyCode::Char('r') => {
-                                app.reset_view();
-                            }
-                            // Rotation
-                            KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
-                                app.rotate_clockwise();
-                            }
-                            KeyCode::Char('E') | KeyCode::Char('<') => {
-                                app.rotate_counter_clockwise();
-                            }
-                            // Vim Navigation (Pan)
-                            KeyCode::Char('h') => {
-                                app.pan_left();
-                            }
-                            KeyCode::Char('l') => {
-                                app.pan_right();
-                            }
-                            KeyCode::Char('k') => {
-                                app.pan_up();
-                            }
-                            KeyCode::Char('j') => {
-                                app.pan_down();
-                            }
-                            // Arrow Keys (Pan)
-                            KeyCode::Left => {
-                                app.pan_left();
-                            }
-                            KeyCode::Right => {
-                                app.pan_right();
-                            }
-                            KeyCode::Up => {
-                                app.pan_up();
-                            }
-                            KeyCode::Down => {
-                                app.pan_down();
-                            }
-                            _ => {}
                         }
                     }
-                }
-                Event::Mouse(mouse_event) => match mouse_event.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.zoom_in();
-                    }
-                    MouseEventKind::ScrollDown => {
-                        app.zoom_out();
-                    }
+                    Event::Mouse(mouse_event) => match mouse_event.kind {
+                        MouseEventKind::ScrollUp => {
+                            app.zoom_in();
+                        }
+                        MouseEventKind::ScrollDown => {
+                            app.zoom_out();
+                        }
+                        _ => {}
+                    },
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
     }
