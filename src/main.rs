@@ -562,6 +562,7 @@ pub struct App {
     pub palette_mode: PaletteMode,
     pub palette_query: String,
     pub palette_selected_index: usize,
+    pub palette_width: u16,
     pub filter_type: FilterType,
 
     // Thread communication channels
@@ -637,6 +638,7 @@ impl App {
             palette_mode: PaletteMode::Closed,
             palette_query: String::new(),
             palette_selected_index: 0,
+            palette_width: 0,
             filter_type,
             resize_tx,
             protocol_rx,
@@ -752,6 +754,34 @@ impl App {
             "Decrease Contrast" => self.decrease_contrast(),
             _ => {}
         }
+    }
+
+    pub fn open_palette(&mut self, mode: PaletteMode) {
+        self.palette_mode = mode;
+        self.palette_query.clear();
+        self.palette_selected_index = match mode {
+            PaletteMode::File => self.current_index,
+            PaletteMode::Command => 0,
+            _ => 0,
+        };
+        self.needs_clear = true;
+
+        let max_text_width = match mode {
+            PaletteMode::File => self
+                .display_names
+                .iter()
+                .map(|name| name.len())
+                .max()
+                .unwrap_or(0) as u16,
+            PaletteMode::Command => COMMANDS
+                .iter()
+                .map(|cmd| cmd.name.len() + 3 + cmd.description.len())
+                .max()
+                .unwrap_or(0) as u16,
+            _ => 0,
+        };
+
+        self.palette_width = max_text_width + 5;
     }
 
     /// Start loading the image at the current index in the background
@@ -1623,6 +1653,15 @@ fn ui(frame: &mut Frame, app: &mut App) {
             _ => {}
         }
 
+        let mut palette_width = app.palette_width;
+        let cap_width = (chunks[0].width as f64 * 0.75).round() as u16;
+        palette_width = palette_width.max(40).min(cap_width);
+
+        if lines.len() > 1 {
+            let inner_w = palette_width.saturating_sub(2) as usize;
+            lines[1] = Line::from("─".repeat(inner_w).gray());
+        }
+
         let palette_block = Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -1632,7 +1671,6 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .block(palette_block)
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-        let palette_width = 60_u16;
         let palette_height = 12_u16;
 
         let w = palette_width.min(chunks[0].width.saturating_sub(1));
@@ -1938,17 +1976,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     // Command Palette
                                     KeyCode::Char(':') => {
-                                        app.palette_mode = PaletteMode::Command;
-                                        app.palette_query.clear();
-                                        app.palette_selected_index = 0;
-                                        app.needs_clear = true;
+                                        app.open_palette(PaletteMode::Command);
                                     }
                                     // File Palette
                                     KeyCode::Char('f') => {
-                                        app.palette_mode = PaletteMode::File;
-                                        app.palette_query.clear();
-                                        app.palette_selected_index = app.current_index;
-                                        app.needs_clear = true;
+                                        app.open_palette(PaletteMode::File);
                                     }
                                     // Next image
                                     KeyCode::Char('n')
