@@ -381,7 +381,19 @@ fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulPro
     req.picker.new_resize_protocol(canvas)
 }
 
-type ImageReceiver = mpsc::Receiver<Result<(DynamicImage, u32, u32), String>>;
+struct LoaderRequest {
+    idx: usize,
+    source: ImageSource,
+    is_prefetch: bool,
+    sequence: u64,
+}
+
+struct LoaderResponse {
+    idx: usize,
+    result: Result<(DynamicImage, u32, u32), String>,
+    is_prefetch: bool,
+    sequence: u64,
+}
 
 #[derive(Clone, Debug)]
 pub enum ImageSource {
@@ -576,7 +588,9 @@ pub struct App {
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
     protocol_rx: mpsc::Receiver<(StatefulProtocol, (u16, u16))>,
-    image_rx: Option<ImageReceiver>,
+    loader_tx: mpsc::Sender<LoaderRequest>,
+    response_rx: mpsc::Receiver<LoaderResponse>,
+    current_sequence: u64,
     pub is_loading: bool,
     pub loading_start_time: Option<Instant>,
     pub clear_on_protocol_receive: bool,
@@ -623,6 +637,43 @@ impl App {
             }
         });
 
+        let (loader_tx, loader_rx) = mpsc::channel::<LoaderRequest>();
+        let (response_tx, response_rx) = mpsc::channel::<LoaderResponse>();
+
+        // Spawn persistent background loader thread
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(req) = loader_rx.recv() {
+                    let mut requests = vec![req];
+                    while let Ok(r) = loader_rx.try_recv() {
+                        requests.push(r);
+                    }
+
+                    // Find the highest sequence number
+                    let highest_seq = requests.iter().map(|r| r.sequence).max().unwrap_or(0);
+
+                    // Keep only requests matching the highest sequence
+                    let mut current_requests: Vec<LoaderRequest> = requests
+                        .into_iter()
+                        .filter(|r| r.sequence == highest_seq)
+                        .collect();
+
+                    // Sort current_requests so that the active load (is_prefetch == false) is processed first
+                    current_requests.sort_by_key(|r| r.is_prefetch);
+
+                    for r in current_requests {
+                        let res = decode_image_source(r.source);
+                        let _ = response_tx.send(LoaderResponse {
+                            idx: r.idx,
+                            result: res,
+                            is_prefetch: r.is_prefetch,
+                            sequence: r.sequence,
+                        });
+                    }
+                }
+            }
+        });
+
         let mut app = Self {
             images,
             display_names,
@@ -651,7 +702,9 @@ impl App {
             filter_type,
             resize_tx,
             protocol_rx,
-            image_rx: None,
+            loader_tx,
+            response_rx,
+            current_sequence: 0,
             is_loading: false,
             loading_start_time: None,
             clear_on_protocol_receive: false,
@@ -795,28 +848,43 @@ impl App {
 
     /// Start loading the image at the current index in the background
     /// Trigger background prefetching of adjacent images and prune old cache entries
+    pub fn get_sliding_window_indices(&self) -> Vec<usize> {
+        let n = 2; // Cache size N=2 (caches current + 2 before + 2 after)
+        let total = self.images.len();
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut indices = Vec::new();
+        indices.push(self.current_index);
+        for i in 1..=n {
+            let prev = (self.current_index + total - i) % total;
+            let next = (self.current_index + i) % total;
+            indices.push(prev);
+            indices.push(next);
+        }
+        indices.sort();
+        indices.dedup();
+        indices
+    }
+
     pub fn trigger_prefetch(&self) {
         if self.images.len() <= 1 {
             return;
         }
 
-        let current_index = self.current_index;
-        let next_idx = (current_index + 1) % self.images.len();
-        let prev_idx = if current_index == 0 {
-            self.images.len() - 1
-        } else {
-            current_index - 1
-        };
+        let window_indices = self.get_sliding_window_indices();
 
-        // Prune any cache entries that are not adjacent to the current_index
+        // Prune any cache entries that are not in the sliding window
         {
             let mut cache = self.prefetch_cache.lock().unwrap();
-            cache.retain(|idx, _| *idx == next_idx || *idx == prev_idx);
+            cache.retain(|idx, _| window_indices.contains(idx));
         }
 
-        let targets = vec![next_idx, prev_idx];
+        for idx in window_indices {
+            if idx == self.current_index {
+                continue;
+            }
 
-        for idx in targets {
             {
                 let cache = self.prefetch_cache.lock().unwrap();
                 if cache.contains_key(&idx) {
@@ -825,13 +893,11 @@ impl App {
             }
 
             let source = self.images[idx].clone();
-            let cache_clone = Arc::clone(&self.prefetch_cache);
-
-            std::thread::spawn(move || {
-                if let Ok((img, w, h)) = decode_image_source(source) {
-                    let mut cache = cache_clone.lock().unwrap();
-                    cache.insert(idx, (Arc::new(img), w, h));
-                }
+            let _ = self.loader_tx.send(LoaderRequest {
+                idx,
+                source,
+                is_prefetch: true,
+                sequence: self.current_sequence,
             });
         }
     }
@@ -855,6 +921,7 @@ impl App {
         };
 
         if let Some((img, w, h)) = cached {
+            self.current_sequence += 1;
             self.original_image = Some(img);
             self.img_width = w;
             self.img_height = h;
@@ -869,44 +936,61 @@ impl App {
             return;
         }
 
-        // Cache miss: load as normal
+        // Cache miss: load as normal via background loader worker
         self.is_loading = true;
         self.loading_start_time = Some(Instant::now());
+        self.current_sequence += 1;
 
         let source = self.images[self.current_index].clone();
-        let (tx, rx) = mpsc::channel();
-        self.image_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let res = decode_image_source(source);
-            let _ = tx.send(res);
+        let _ = self.loader_tx.send(LoaderRequest {
+            idx: self.current_index,
+            source,
+            is_prefetch: false,
+            sequence: self.current_sequence,
         });
+
+        // Trigger prefetching immediately under this new sequence
+        self.trigger_prefetch();
     }
 
     /// Check background threads and poll their messages
     pub fn update_channels(&mut self) {
-        if let Some(res) = self.image_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            self.image_rx = None;
-            match res {
+        while let Ok(resp) = self.response_rx.try_recv() {
+            if resp.sequence < self.current_sequence {
+                continue;
+            }
+
+            match resp.result {
                 Ok((img, w, h)) => {
-                    self.img_width = w;
-                    self.img_height = h;
-                    self.original_image = Some(Arc::new(img));
-                    self.error_message = None;
-                    self.zoom_factor = 1.0;
-                    self.pan_offset = (0, 0);
-                    self.brightness = 0;
-                    self.contrast = 0.0;
-                    self.is_loading = false;
-                    self.needs_update = true;
-                    self.zoom_needs_initialization = true;
-                    self.trigger_prefetch();
+                    let shared_img = Arc::new(img);
+                    if resp.is_prefetch {
+                        let window_indices = self.get_sliding_window_indices();
+                        if window_indices.contains(&resp.idx) {
+                            let mut cache = self.prefetch_cache.lock().unwrap();
+                            cache.insert(resp.idx, (shared_img, w, h));
+                        }
+                    } else if resp.idx == self.current_index {
+                        self.img_width = w;
+                        self.img_height = h;
+                        self.original_image = Some(shared_img);
+                        self.error_message = None;
+                        self.zoom_factor = 1.0;
+                        self.pan_offset = (0, 0);
+                        self.brightness = 0;
+                        self.contrast = 0.0;
+                        self.is_loading = false;
+                        self.needs_update = true;
+                        self.zoom_needs_initialization = true;
+                        self.trigger_prefetch();
+                    }
                 }
                 Err(err) => {
-                    self.original_image = None;
-                    self.image_protocol = None;
-                    self.error_message = Some(err);
-                    self.is_loading = false;
+                    if !resp.is_prefetch && resp.idx == self.current_index {
+                        self.original_image = None;
+                        self.image_protocol = None;
+                        self.error_message = Some(err);
+                        self.is_loading = false;
+                    }
                 }
             }
         }

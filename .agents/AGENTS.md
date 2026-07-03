@@ -139,7 +139,7 @@ ______________________________________________________________________
 Image loading/decoding and scale resizing are highly CPU-bound. If done synchronously in the main event loop, they freeze the user interface for several hundred milliseconds.
 
 - **Thread-safe Image Sharing**: To safely send decoded images to background threads without expensive memory cloning (which can take 10ms+ for large buffers), wrap the `DynamicImage` in `std::sync::Arc`.
-- **Worker Task Coalescing**: When the user repeats a command quickly (like zoom/pan), the worker queue fills up. To prevent CPU thrashes, the worker thread should drain its channel and only process the absolute latest request:
+- **Resize Worker Task Coalescing**: When the user repeats a command quickly (like zoom/pan), the worker queue fills up. To prevent CPU thrashes, the worker thread should drain its channel and only process the absolute latest request:
   ```rust
   if let Ok(req) = resize_rx.recv() {
       let mut latest_req = req;
@@ -150,10 +150,14 @@ Image loading/decoding and scale resizing are highly CPU-bound. If done synchron
       let _ = protocol_tx.send(protocol);
   }
   ```
+- **Persistent Image Loader Worker & Request Coalescing**: Spawning a brand-new OS thread for every image load or prefetch request causes severe thread and disk contention when a user spams keys. To prevent this, offload loading to a persistent background Loader Thread.
+  - Coalesce loader requests by draining the channel and filtering out any request with an obsolete `sequence` number.
+  - Sort the active request list so that the active viewport load (`is_prefetch == false`) is prioritized and processed first, followed by background prefetches.
 
 ### Guidelines for Future Work
 
-- Offload decoding to one-shot background threads and scaling to a persistent worker thread.
+- Offload both decoding/loading and scaling to dedicated persistent worker threads.
+- Keep a global `current_sequence` number in the state controller. When navigating, increment the sequence and attach it to both active and prefetch requests sent to the Loader Thread. Discard any returned results on the main thread if their sequence is older than `current_sequence`.
 - Avoid freezing the TUI during startup/navigation by showing a debounced indicator (e.g. only if loading takes >150ms).
 
 ______________________________________________________________________
@@ -228,3 +232,17 @@ Recalculating a dialog or search palette's width dynamically on every character 
 
 - **Freeze Layout Width on Open**: When opening search or command palettes, scan the *unfiltered* list of all possible items once to calculate the maximum text length. Set and freeze `self.palette_width` inside the state constructor.
 - **Constraints**: Apply rendering constraints in the draw loop, forcing a minimum dialog width (e.g., 40 cells) and capping the maximum width at a percentage of horizontal screen space (e.g., 75% of screen width). Generate horizontal separator lines dynamically based on this static width.
+
+______________________________________________________________________
+
+## 12. Sliding Window Prefetch Cache ($2N+1$)
+
+### The Learning
+
+Caching only immediate neighbors ($N=1$) results in constant disk reads when navigating back and forth across a small set of files.
+
+### Guidelines for Future Work
+
+- **Sliding Window bounds**: Maintain a sliding window of size $N=2$ (caches the current image + 2 preceding + 2 succeeding images).
+- **Dynamic cache retention**: Prune the prefetch cache using a dynamic range check (`cache.retain(|idx, _| window_indices.contains(idx))`) on every navigation.
+- **Out-of-order check**: Only insert a returned prefetch image into the cache if its index is still within the active window when the loader thread returns it.
