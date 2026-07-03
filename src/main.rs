@@ -2284,7 +2284,7 @@ impl App {
 }
 
 /// Scan target path and sibling/child images
-fn scan_directory(initial_path: &Path) -> Result<(Vec<PathBuf>, usize), String> {
+fn scan_directory(initial_path: &Path, check_magic: bool) -> Result<(Vec<PathBuf>, usize), String> {
     let (dir, file_name) = if initial_path.is_file() {
         let parent = initial_path.parent().unwrap_or_else(|| Path::new("."));
         let name = initial_path.file_name().map(|n| n.to_os_string());
@@ -2308,7 +2308,7 @@ fn scan_directory(initial_path: &Path) -> Result<(Vec<PathBuf>, usize), String> 
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_image_file(&path) {
+            if is_image_file(&path, check_magic) {
                 images.push(path);
             }
         }
@@ -2359,7 +2359,7 @@ fn guess_file_type(path: &Path) -> Option<GuessType> {
     None
 }
 
-fn is_image_file(path: &Path) -> bool {
+fn is_image_file(path: &Path, check_magic: bool) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -2375,10 +2375,14 @@ fn is_image_file(path: &Path) -> bool {
     {
         return true;
     }
-    matches!(guess_file_type(path), Some(GuessType::Image))
+    if check_magic {
+        matches!(guess_file_type(path), Some(GuessType::Image))
+    } else {
+        false
+    }
 }
 
-fn is_cbz_or_zip(path: &Path) -> bool {
+fn is_cbz_or_zip(path: &Path, check_magic: bool) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -2387,7 +2391,11 @@ fn is_cbz_or_zip(path: &Path) -> bool {
     {
         return true;
     }
-    matches!(guess_file_type(path), Some(GuessType::Zip))
+    if check_magic {
+        matches!(guess_file_type(path), Some(GuessType::Zip))
+    } else {
+        false
+    }
 }
 
 fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
@@ -2422,10 +2430,10 @@ fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
     Ok(pages)
 }
 
-fn collect_sources(paths: &[PathBuf]) -> Result<Vec<ImageSource>, String> {
+fn collect_sources(paths: &[PathBuf], check_magic: bool) -> Result<Vec<ImageSource>, String> {
     let mut sources = Vec::with_capacity(paths.len());
     for path in paths {
-        if is_cbz_or_zip(path) {
+        if is_cbz_or_zip(path, check_magic) {
             let pages = list_cbz_pages(path)?;
             for page in pages {
                 sources.push(ImageSource::Cbz {
@@ -2433,7 +2441,7 @@ fn collect_sources(paths: &[PathBuf]) -> Result<Vec<ImageSource>, String> {
                     file_in_zip: page,
                 });
             }
-        } else if is_image_file(path) {
+        } else if is_image_file(path, check_magic) {
             sources.push(ImageSource::Local(path.clone()));
         }
     }
@@ -2924,6 +2932,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut protocol_opt = None;
     let mut scale_opt = None;
     let mut slideshow_opt = None;
+    let mut check_magic = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -2975,6 +2984,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--check-magic" | "-m" => {
+                check_magic = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -2993,6 +3006,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  -t, --slideshow <seconds>  Start the slideshow with the given delay in seconds"
                 );
+                println!(
+                    "  -m, --check-magic          Check file magic bytes on startup (slower on network drives)"
+                );
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
             }
@@ -3007,11 +3023,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get the image file list and current starting index
     let (images, current_index) = if is_piped && !piped_files.is_empty() {
-        let sources = collect_sources(&piped_files)?;
+        let sources = collect_sources(&piped_files, check_magic)?;
         (sources, 0)
     } else {
         let initial_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
-        if is_cbz_or_zip(&initial_path) {
+        if is_cbz_or_zip(&initial_path, check_magic) {
             let pages = list_cbz_pages(&initial_path)?;
             let sources = pages
                 .into_iter()
@@ -3022,7 +3038,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             (sources, 0)
         } else {
-            let (paths, index) = scan_directory(&initial_path)?;
+            let (paths, index) = scan_directory(&initial_path, check_magic)?;
             let sources = paths.into_iter().map(ImageSource::Local).collect();
             (sources, index)
         }

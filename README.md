@@ -120,6 +120,7 @@ If no path is specified, it scans and opens images from the current directory (`
 - `-s, --scale <none|actual|shrink|full|crop>`: Set the initial image scaling mode (defaults to `shrink`). `actual` maps to `none`, and `fit` maps to `full`.
 - `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection). `halfblock` maps to `halfblocks`.
 - `-t, --slideshow <seconds>`: Start the slideshow with the given delay in seconds.
+- `-m, --check-magic`: Check file magic bytes on startup (slower on network drives).
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
 
 ______________________________________________________________________
