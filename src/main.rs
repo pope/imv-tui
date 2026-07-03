@@ -429,6 +429,8 @@ impl ImageSource {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PromptType {
     GoToImage,
+    SetBrightness,
+    SetContrast,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,6 +538,14 @@ const COMMANDS: &[CommandItem] = &[
     CommandItem {
         name: "Go to Image",
         description: "Go to an image by index or relative offset (e.g. 40, +10, -10)",
+    },
+    CommandItem {
+        name: "Set Brightness",
+        description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
+    },
+    CommandItem {
+        name: "Set Contrast",
+        description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
     },
 ];
 
@@ -843,6 +853,8 @@ impl App {
             }
             "Next Filter" => self.cycle_filter(),
             "Go to Image" => self.open_prompt(PromptType::GoToImage),
+            "Set Brightness" => self.open_prompt(PromptType::SetBrightness),
+            "Set Contrast" => self.open_prompt(PromptType::SetContrast),
             "Increase Brightness" => self.increase_brightness(),
             "Decrease Brightness" => self.decrease_brightness(),
             "Increase Contrast" => self.increase_contrast(),
@@ -912,6 +924,50 @@ impl App {
                     if new_idx != self.current_index {
                         self.current_index = new_idx;
                         self.start_load_image();
+                    }
+                }
+            }
+            PromptType::SetBrightness => {
+                let input = self.palette_query.trim();
+                if !input.is_empty() && self.original_image.is_some() {
+                    let mut new_val = self.brightness;
+                    if let Some(stripped) = input.strip_prefix('+') {
+                        if let Ok(offset) = stripped.parse::<i32>() {
+                            new_val = self.brightness + offset;
+                        }
+                    } else if let Some(stripped) = input.strip_prefix('-') {
+                        if let Ok(offset) = stripped.parse::<i32>() {
+                            new_val = self.brightness - offset;
+                        }
+                    } else if let Ok(val) = input.parse::<i32>() {
+                        new_val = val;
+                    }
+                    let new_val = new_val.clamp(-255, 255);
+                    if new_val != self.brightness {
+                        self.brightness = new_val;
+                        self.needs_update = true;
+                    }
+                }
+            }
+            PromptType::SetContrast => {
+                let input = self.palette_query.trim();
+                if !input.is_empty() && self.original_image.is_some() {
+                    let mut new_val = self.contrast;
+                    if let Some(stripped) = input.strip_prefix('+') {
+                        if let Ok(offset) = stripped.parse::<f32>() {
+                            new_val = self.contrast + offset;
+                        }
+                    } else if let Some(stripped) = input.strip_prefix('-') {
+                        if let Ok(offset) = stripped.parse::<f32>() {
+                            new_val = self.contrast - offset;
+                        }
+                    } else if let Ok(val) = input.parse::<f32>() {
+                        new_val = val;
+                    }
+                    let new_val = new_val.clamp(-255.0, 255.0);
+                    if (new_val - self.contrast).abs() > f32::EPSILON {
+                        self.contrast = new_val;
+                        self.needs_update = true;
                     }
                 }
             }
@@ -1724,10 +1780,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
         if app.palette_mode == PaletteMode::Prompt {
             let prompt_title = match app.prompt_type {
                 Some(PromptType::GoToImage) => " Go to Image ",
+                Some(PromptType::SetBrightness) => " Set Brightness ",
+                Some(PromptType::SetContrast) => " Set Contrast ",
                 None => " Input ",
             };
             let prompt_label = match app.prompt_type {
                 Some(PromptType::GoToImage) => "Enter index (e.g. 40, +10, -10):",
+                Some(PromptType::SetBrightness) => "Enter brightness (e.g. 50, +10, -10):",
+                Some(PromptType::SetContrast) => "Enter contrast % (e.g. 20, +5, -5):",
                 None => "Enter value:",
             };
 
