@@ -252,3 +252,22 @@ Caching only immediate neighbors ($N=1$) results in constant disk reads when nav
 - **Sliding Window bounds**: Maintain a sliding window of size $N=2$ (caches the current image + 2 preceding + 2 succeeding images).
 - **Dynamic cache retention**: Prune the prefetch cache using a dynamic range check (`cache.retain(|idx, _| window_indices.contains(idx))`) on every navigation.
 - **Out-of-order check**: Only insert a returned prefetch image into the cache if its index is still within the active window when the loader thread returns it.
+
+______________________________________________________________________
+
+## 13. Image Scaling Modes & Layout Alignment
+
+### The Learning
+
+Providing various default image fit protocols (None, Shrink to Fit, Fit View, Crop to Fill) requires translating viewport and image aspect ratios into exact in-memory zoom scales, which are then applied during image load initialization and reset operations.
+
+- **Scale Calculations**:
+  - **None (Actual Size)**: Sets `scale = 1.0`, meaning `zoom_factor = 1.0 / fit_scale`.
+  - **Shrink to Fit**: Scales down only if the image is larger than the viewport (`fit_scale < 1.0`), keeping it at `1.0` otherwise.
+  - **Fit View (Full)**: Scales images up or down to match the screen boundaries (`zoom_factor = 1.0`).
+  - **Crop to Fill**: Scales the image so that it completely covers the viewport, cropping the wider margin (`zoom_factor = max_scale / min_scale`).
+
+### Guidelines for Future Work
+
+- Map layout modes cleanly via a `ScaleMode` enum.
+- Inline scale-mode logic inside the `update_protocol()` layout initialization sequence to prevent borrow checker conflicts resulting from simultaneous mutable self references inside dynamic image borrowing scopes.

@@ -35,6 +35,8 @@ ______________________________________________________________________
 | **Rotate Counter-Clockwise (90°)** | `E`         | `<`                         |
 | **Brightness Increase / Decrease** | `b` / `B`   |                             |
 | **Contrast Increase / Decrease**   | `c` / `C`   |                             |
+| **Cycle Image Scaling Filter**     | `S`         |                             |
+| **Cycle Image Scaling Mode**       | `s`         |                             |
 | **Pan Left / Right**               | `h` / `l`   | `Left` / `Right Arrow`      |
 | **Pan Up / Down**                  | `k` / `j`   | `Up` / `Down Arrow`         |
 | **Toggle Help Screen**             | `?`         |                             |
@@ -64,6 +66,13 @@ When zoomed in, the cropped sub-image is scaled in memory to target screen pixel
 ### 3. Non-Destructive Rotation
 
 The rotation keys (`e` and `E`) apply 90° clockwise/counter-clockwise operations directly to the image buffer in memory. The layout and cropping dimensions are recalculated on the fly to support vertical view orientations.
+
+### 4. Background Thread Loader & Sliding Window Cache
+
+To ensure stutter-free navigation under high key-repeat rates:
+
+- **Persistent Image Loader**: Offloads image decoding to a dedicated background thread. Image loader requests are sequenced; during fast navigation, the loader thread coalesces pending requests, processes the active viewport first, and discards stale sequence requests to prevent thread and disk contention.
+- **$2N+1$ Sliding Window Cache**: Caches the active image alongside 2 preceding and 2 succeeding images ($N=2$) in CPU memory. Prunes out-of-bounds cache items dynamically on navigation, providing instantaneous response times when cycling back and forth across pictures.
 
 ______________________________________________________________________
 
@@ -97,6 +106,7 @@ If no path is specified, it scans and opens images from the current directory (`
 ### Command Line Options
 
 - `-f, --filter <nearest|linear|cubic|mitchell|gaussian|lanczos|hamming>`: Set the initial image scaling filter (defaults to `nearest`).
+- `-s, --scale <none|actual|shrink|full|crop>`: Set the initial image scaling mode (defaults to `shrink`).
 - `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection).
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
 

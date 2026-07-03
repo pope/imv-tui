@@ -441,6 +441,25 @@ pub enum PaletteMode {
     Prompt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleMode {
+    None,
+    Shrink,
+    Full,
+    Crop,
+}
+
+impl ScaleMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ScaleMode::None => "None",
+            ScaleMode::Shrink => "Shrink",
+            ScaleMode::Full => "Full",
+            ScaleMode::Crop => "Crop",
+        }
+    }
+}
+
 pub struct CommandItem {
     pub name: &'static str,
     pub description: &'static str,
@@ -547,6 +566,26 @@ const COMMANDS: &[CommandItem] = &[
         name: "Set Contrast",
         description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
     },
+    CommandItem {
+        name: "Set Scale: None",
+        description: "Do not scale the image (show at actual size 1:1)",
+    },
+    CommandItem {
+        name: "Set Scale: Shrink to Fit",
+        description: "Scale larger images down to fit, leave smaller images untouched",
+    },
+    CommandItem {
+        name: "Set Scale: Fit View",
+        description: "Scale images up or down to fit the viewport perfectly",
+    },
+    CommandItem {
+        name: "Set Scale: Crop to Fill",
+        description: "Scale images to completely fill the viewport (cropping excess)",
+    },
+    CommandItem {
+        name: "Cycle Scale Mode",
+        description: "Rotate through the different scaling modes (None -> Shrink -> Fit -> Crop)",
+    },
 ];
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -610,6 +649,7 @@ pub struct App {
     pub palette_height: u16,
     pub prompt_type: Option<PromptType>,
     pub filter_type: FilterType,
+    pub scale_mode: ScaleMode,
 
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
@@ -633,6 +673,7 @@ impl App {
         current_index: usize,
         picker: Picker,
         filter_type: FilterType,
+        scale_mode: ScaleMode,
     ) -> Result<Self, String> {
         if images.is_empty() {
             return Err("No supported images found".to_string());
@@ -728,6 +769,7 @@ impl App {
             palette_height: 0,
             prompt_type: None,
             filter_type,
+            scale_mode,
             resize_tx,
             protocol_rx,
             loader_tx,
@@ -855,6 +897,23 @@ impl App {
             "Go to Image" => self.open_prompt(PromptType::GoToImage),
             "Set Brightness" => self.open_prompt(PromptType::SetBrightness),
             "Set Contrast" => self.open_prompt(PromptType::SetContrast),
+            "Set Scale: None" => {
+                self.scale_mode = ScaleMode::None;
+                self.apply_scale_mode();
+            }
+            "Set Scale: Shrink to Fit" => {
+                self.scale_mode = ScaleMode::Shrink;
+                self.apply_scale_mode();
+            }
+            "Set Scale: Fit View" => {
+                self.scale_mode = ScaleMode::Full;
+                self.apply_scale_mode();
+            }
+            "Set Scale: Crop to Fill" => {
+                self.scale_mode = ScaleMode::Crop;
+                self.apply_scale_mode();
+            }
+            "Cycle Scale Mode" => self.cycle_scale_mode(),
             "Increase Brightness" => self.increase_brightness(),
             "Decrease Brightness" => self.decrease_brightness(),
             "Increase Contrast" => self.increase_contrast(),
@@ -1166,7 +1225,19 @@ impl App {
 
             if self.zoom_needs_initialization && s > 0.0 {
                 self.zoom_needs_initialization = false;
-                self.zoom_factor = if s >= 1.0 { 1.0 / s } else { 1.0 };
+                self.zoom_factor = match self.scale_mode {
+                    ScaleMode::None => 1.0 / s,
+                    ScaleMode::Shrink => {
+                        if s < 1.0 {
+                            1.0
+                        } else {
+                            1.0 / s
+                        }
+                    }
+                    ScaleMode::Full => 1.0,
+                    ScaleMode::Crop => s_w.max(s_h) / s,
+                };
+                self.pan_offset = (0, 0);
             }
 
             // 2. Combined scale is s * zoom_factor
@@ -1309,12 +1380,56 @@ impl App {
         if self.original_image.is_none() {
             return;
         }
-        self.zoom_factor = 1.0;
-        self.pan_offset = (0, 0);
+        self.apply_scale_mode();
         self.brightness = 0;
         self.contrast = 0.0;
-        self.needs_update = true;
         self.clear_on_protocol_receive = true;
+    }
+
+    pub fn apply_scale_mode(&mut self) {
+        let s = self.get_fit_scale();
+        if s > 0.0 {
+            self.zoom_factor = match self.scale_mode {
+                ScaleMode::None => 1.0 / s,
+                ScaleMode::Shrink => {
+                    if s < 1.0 {
+                        1.0
+                    } else {
+                        1.0 / s
+                    }
+                }
+                ScaleMode::Full => 1.0,
+                ScaleMode::Crop => {
+                    let (widget_w_cells, widget_h_cells) = self.last_widget_size;
+                    let font_size = self.picker.font_size();
+                    let mut cell_w = font_size.width;
+                    let mut cell_h = font_size.height;
+                    if cell_w == 0 {
+                        cell_w = 8;
+                    }
+                    if cell_h == 0 {
+                        cell_h = 16;
+                    }
+                    let widget_w_px = widget_w_cells as f64 * cell_w as f64;
+                    let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+                    let s_w = widget_w_px / self.img_width as f64;
+                    let s_h = widget_h_px / self.img_height as f64;
+                    s_w.max(s_h) / s
+                }
+            };
+            self.pan_offset = (0, 0);
+            self.needs_update = true;
+        }
+    }
+
+    pub fn cycle_scale_mode(&mut self) {
+        self.scale_mode = match self.scale_mode {
+            ScaleMode::None => ScaleMode::Shrink,
+            ScaleMode::Shrink => ScaleMode::Full,
+            ScaleMode::Full => ScaleMode::Crop,
+            ScaleMode::Crop => ScaleMode::None,
+        };
+        self.apply_scale_mode();
     }
 
     pub fn toggle_help(&mut self) {
@@ -1701,12 +1816,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
 
         format!(
-            " [{}/{}] {} ({}x{}) | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
+            " [{}/{}] {} ({}x{}) | Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
             app.current_index + 1,
             app.images.len(),
             app.current_filename(),
             app.img_width,
             app.img_height,
+            app.scale_mode.name(),
             app.filter_name(),
             app.current_zoom_pct.round() as i64,
             app.pan_offset.0,
@@ -1746,6 +1862,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Line::from(vec![
                 "  S              ".cyan(),
                 "- Next scaling filter".into(),
+            ]),
+            Line::from(vec![
+                "  s              ".cyan(),
+                "- Cycle scale mode".into(),
             ]),
             Line::from(vec!["  :              ".cyan(), "- Command Palette".into()]),
             Line::from(vec!["  f              ".cyan(), "- File Search".into()]),
@@ -2016,6 +2136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut initial_path = None;
     let mut filter_opt = None;
     let mut protocol_opt = None;
+    let mut scale_opt = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -2042,6 +2163,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--scale" | "-s" => {
+                if i + 1 < args.len() {
+                    scale_opt = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "Error: --scale / -s requires an argument (none, actual, shrink, full, crop)"
+                    );
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -2053,6 +2185,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!(
                     "  -p, --protocol <protocol>  Force terminal graphics protocol: kitty, sixel, halfblocks, iterm2"
+                );
+                println!(
+                    "  -s, --scale <mode>         Initial image scaling mode: none, actual, shrink, full, crop (defaults to shrink)"
                 );
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
@@ -2107,6 +2242,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => FilterType::Nearest,
     };
 
+    let scale_mode = match scale_opt.as_deref() {
+        Some("none") | Some("actual") => ScaleMode::None,
+        Some("shrink") => ScaleMode::Shrink,
+        Some("full") | Some("fit") => ScaleMode::Full,
+        Some("crop") => ScaleMode::Crop,
+        Some(other) => {
+            eprintln!(
+                "Error: Unknown scale mode '{}'. Choose from: none, actual, shrink, full, crop",
+                other
+            );
+            std::process::exit(1);
+        }
+        None => ScaleMode::Shrink,
+    };
+
     // Query terminal protocol before raw mode
     let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     if let Some(proto_str) = protocol_opt.as_deref() {
@@ -2134,7 +2284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = match App::new(images, current_index, picker, initial_filter) {
+    let mut app = match App::new(images, current_index, picker, initial_filter, scale_mode) {
         Ok(app) => app,
         Err(e) => {
             // Restore terminal on init error
@@ -2380,6 +2530,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Cycle Filter
                                     KeyCode::Char('S') => {
                                         app.cycle_filter();
+                                    }
+                                    // Cycle Scale Mode
+                                    KeyCode::Char('s') => {
+                                        app.cycle_scale_mode();
                                     }
                                     // Vim Navigation (Pan)
                                     KeyCode::Char('h') => {
