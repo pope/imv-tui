@@ -1162,8 +1162,6 @@ impl App {
             return;
         }
 
-        self.is_loading = true;
-        self.loading_start_time = Some(Instant::now());
         self.error_message = None;
         self.clear_on_protocol_receive = true;
 
@@ -1183,6 +1181,7 @@ impl App {
             self.pan_offset = (0, 0);
             self.brightness = 0;
             self.contrast = 0.0;
+            self.is_loading = false;
             self.needs_update = true;
             self.zoom_needs_initialization = true;
             self.trigger_prefetch();
@@ -1190,6 +1189,10 @@ impl App {
         }
 
         // Cache miss: load as normal via background loader worker
+        self.original_image = None;
+        self.image_protocol = None;
+        self.is_loading = true;
+        self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
 
         let source = self.images[self.current_index].clone();
