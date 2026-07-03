@@ -63,6 +63,15 @@
                 lockFile = ./Cargo.lock;
               };
             };
+            imv-tui-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
+              pname = "imv-tui";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+              };
+              target = "x86_64-unknown-linux-musl";
+            };
             default = imv-tui;
           };
           devShells.${system}.default = pkgs.mkShell {
