@@ -876,6 +876,9 @@ impl App {
     }
 
     pub fn cycle_filter(&mut self) {
+        if self.is_loading {
+            return;
+        }
         self.filter_type = match self.filter_type {
             FilterType::Nearest => FilterType::Hamming,
             FilterType::Hamming => FilterType::Triangle,
@@ -1139,6 +1142,8 @@ impl App {
             return;
         }
 
+        self.is_loading = true;
+        self.loading_start_time = Some(Instant::now());
         self.error_message = None;
         self.clear_on_protocol_receive = true;
 
@@ -1157,7 +1162,6 @@ impl App {
             self.pan_offset = (0, 0);
             self.brightness = 0;
             self.contrast = 0.0;
-            self.is_loading = false;
             self.needs_update = true;
             self.zoom_needs_initialization = true;
             self.trigger_prefetch();
@@ -1165,8 +1169,6 @@ impl App {
         }
 
         // Cache miss: load as normal via background loader worker
-        self.is_loading = true;
-        self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
 
         let source = self.images[self.current_index].clone();
@@ -1206,7 +1208,6 @@ impl App {
                         self.pan_offset = (0, 0);
                         self.brightness = 0;
                         self.contrast = 0.0;
-                        self.is_loading = false;
                         self.needs_update = true;
                         self.zoom_needs_initialization = true;
                         self.trigger_prefetch();
@@ -1226,6 +1227,7 @@ impl App {
         if let Ok((protocol, cells)) = self.protocol_rx.try_recv() {
             self.image_protocol = Some(protocol);
             self.rendered_size_cells = cells;
+            self.is_loading = false;
             if self.clear_on_protocol_receive {
                 self.clear_on_protocol_receive = false;
                 self.needs_clear = true;
@@ -1373,7 +1375,7 @@ impl App {
 
     /// Zoom in
     pub fn zoom_in(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         let s = self.get_fit_scale();
@@ -1386,7 +1388,7 @@ impl App {
 
     /// Zoom out
     pub fn zoom_out(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         let s = self.get_fit_scale();
@@ -1399,7 +1401,7 @@ impl App {
 
     /// Actual size (100% zoom)
     pub fn set_actual_size(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         let s = self.get_fit_scale();
@@ -1415,7 +1417,7 @@ impl App {
 
     /// Reset zoom, pan, brightness, and contrast
     pub fn reset_view(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         self.apply_scale_mode();
@@ -1461,6 +1463,9 @@ impl App {
     }
 
     pub fn cycle_scale_mode(&mut self) {
+        if self.is_loading {
+            return;
+        }
         self.scale_mode = match self.scale_mode {
             ScaleMode::None => ScaleMode::Shrink,
             ScaleMode::Shrink => ScaleMode::Full,
@@ -1487,7 +1492,7 @@ impl App {
     }
 
     pub fn increase_brightness(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         self.brightness = (self.brightness + 10).min(255);
@@ -1495,7 +1500,7 @@ impl App {
     }
 
     pub fn decrease_brightness(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         self.brightness = (self.brightness - 10).max(-255);
@@ -1503,7 +1508,7 @@ impl App {
     }
 
     pub fn increase_contrast(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         self.contrast = (self.contrast + 10.0).min(255.0);
@@ -1511,7 +1516,7 @@ impl App {
     }
 
     pub fn decrease_contrast(&mut self) {
-        if self.original_image.is_none() {
+        if self.original_image.is_none() || self.is_loading {
             return;
         }
         self.contrast = (self.contrast - 10.0).max(-255.0);
@@ -1532,6 +1537,9 @@ impl App {
 
     /// Pan left
     pub fn pan_left(&mut self) {
+        if self.original_image.is_none() || self.is_loading {
+            return;
+        }
         let step = self.pan_step_x();
         self.pan_offset.0 -= step;
         self.clamp_pan();
@@ -1540,6 +1548,9 @@ impl App {
 
     /// Pan right
     pub fn pan_right(&mut self) {
+        if self.original_image.is_none() || self.is_loading {
+            return;
+        }
         let step = self.pan_step_x();
         self.pan_offset.0 += step;
         self.clamp_pan();
@@ -1548,6 +1559,9 @@ impl App {
 
     /// Pan up
     pub fn pan_up(&mut self) {
+        if self.original_image.is_none() || self.is_loading {
+            return;
+        }
         let step = self.pan_step_y();
         self.pan_offset.1 -= step;
         self.clamp_pan();
@@ -1556,6 +1570,9 @@ impl App {
 
     /// Pan down
     pub fn pan_down(&mut self) {
+        if self.original_image.is_none() || self.is_loading {
+            return;
+        }
         let step = self.pan_step_y();
         self.pan_offset.1 += step;
         self.clamp_pan();
@@ -1576,6 +1593,9 @@ impl App {
 
     /// Rotate 90 degrees clockwise
     pub fn rotate_clockwise(&mut self) {
+        if self.is_loading {
+            return;
+        }
         if let Some(img) = self.original_image.take() {
             let rotated = img.rotate90();
             self.img_width = rotated.width();
@@ -1590,6 +1610,9 @@ impl App {
 
     /// Rotate 90 degrees counter-clockwise
     pub fn rotate_counter_clockwise(&mut self) {
+        if self.is_loading {
+            return;
+        }
         if let Some(img) = self.original_image.take() {
             let rotated = img.rotate270();
             self.img_width = rotated.width();
