@@ -604,6 +604,14 @@ const COMMANDS: &[CommandItem] = &[
         name: "Cycle Scale Mode",
         description: "Rotate through the different scaling modes (None -> Shrink -> Fit -> Crop)",
     },
+    CommandItem {
+        name: "Predefined Zoom In",
+        description: "Jump to the next predefined zoom level (Crop, 1:1, 2:1, 4:1)",
+    },
+    CommandItem {
+        name: "Predefined Zoom Out",
+        description: "Jump to the previous predefined zoom level",
+    },
 ];
 
 type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32, &'static str)>>>;
@@ -979,6 +987,8 @@ impl App {
             "Decrease Brightness" => self.decrease_brightness(),
             "Increase Contrast" => self.increase_contrast(),
             "Decrease Contrast" => self.decrease_contrast(),
+            "Predefined Zoom In" => self.jump_zoom_in(),
+            "Predefined Zoom Out" => self.jump_zoom_out(),
             _ => {}
         }
     }
@@ -1405,7 +1415,7 @@ impl App {
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
-            self.zoom_factor = (self.zoom_factor * 1.25).min(100.0 / s);
+            self.zoom_factor = (self.zoom_factor * 1.25).min(102.4 / s);
             self.clamp_pan();
             self.needs_update = true;
         }
@@ -1422,6 +1432,140 @@ impl App {
             self.clamp_pan();
             self.needs_update = true;
         }
+    }
+
+    /// Predefined Zoom In
+    pub fn jump_zoom_in(&mut self) {
+        if self.original_image.is_none() || self.is_loading {
+            return;
+        }
+        let fit_scale = self.get_fit_scale();
+        if fit_scale <= 0.0 {
+            return;
+        }
+
+        // Calculate crop scale (crop to fill)
+        let (widget_w_cells, widget_h_cells) = self.last_widget_size;
+        let font_size = self.picker.font_size();
+        let mut cell_w = font_size.width;
+        let mut cell_h = font_size.height;
+        if cell_w == 0 {
+            cell_w = 8;
+        }
+        if cell_h == 0 {
+            cell_h = 16;
+        }
+        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
+        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+        let s_w = widget_w_px / self.img_width as f64;
+        let s_h = widget_h_px / self.img_height as f64;
+        let crop_scale = s_w.max(s_h);
+
+        // Predefined levels in terms of absolute scale (scale = fit_scale * zoom_factor)
+        let shrink_to_fit_scale = fit_scale.min(1.0);
+        let fit_view_scale = fit_scale;
+        let crop_to_fill_scale = crop_scale;
+        let one_to_one_scale = 1.0;
+        let two_to_one_scale = 2.0;
+        let four_to_one_scale = 4.0;
+
+        let mut levels = vec![
+            shrink_to_fit_scale,
+            fit_view_scale,
+            crop_to_fill_scale,
+            one_to_one_scale,
+            two_to_one_scale,
+            four_to_one_scale,
+        ];
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        levels.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+
+        let current_scale = fit_scale * self.zoom_factor;
+
+        let mut target_scale = None;
+        for &lvl in &levels {
+            if lvl > current_scale + 0.01 {
+                target_scale = Some(lvl);
+                break;
+            }
+        }
+
+        if let Some(target) = target_scale {
+            self.zoom_factor = target / fit_scale;
+        } else {
+            // Double the scale if already past maximum level
+            self.zoom_factor = (current_scale * 2.0).min(102.4) / fit_scale;
+        }
+
+        self.clamp_pan();
+        self.needs_update = true;
+    }
+
+    /// Predefined Zoom Out
+    pub fn jump_zoom_out(&mut self) {
+        if self.original_image.is_none() || self.is_loading {
+            return;
+        }
+        let fit_scale = self.get_fit_scale();
+        if fit_scale <= 0.0 {
+            return;
+        }
+
+        // Calculate crop scale (crop to fill)
+        let (widget_w_cells, widget_h_cells) = self.last_widget_size;
+        let font_size = self.picker.font_size();
+        let mut cell_w = font_size.width;
+        let mut cell_h = font_size.height;
+        if cell_w == 0 {
+            cell_w = 8;
+        }
+        if cell_h == 0 {
+            cell_h = 16;
+        }
+        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
+        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+        let s_w = widget_w_px / self.img_width as f64;
+        let s_h = widget_h_px / self.img_height as f64;
+        let crop_scale = s_w.max(s_h);
+
+        // Predefined levels in terms of absolute scale (scale = fit_scale * zoom_factor)
+        let shrink_to_fit_scale = fit_scale.min(1.0);
+        let fit_view_scale = fit_scale;
+        let crop_to_fill_scale = crop_scale;
+        let one_to_one_scale = 1.0;
+        let two_to_one_scale = 2.0;
+        let four_to_one_scale = 4.0;
+
+        let mut levels = vec![
+            shrink_to_fit_scale,
+            fit_view_scale,
+            crop_to_fill_scale,
+            one_to_one_scale,
+            two_to_one_scale,
+            four_to_one_scale,
+        ];
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        levels.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+
+        let current_scale = fit_scale * self.zoom_factor;
+
+        let mut target_scale = None;
+        for &lvl in levels.iter().rev() {
+            if lvl < current_scale - 0.01 {
+                target_scale = Some(lvl);
+                break;
+            }
+        }
+
+        if let Some(target) = target_scale {
+            self.zoom_factor = target / fit_scale;
+        } else {
+            // Halve the scale if already below minimum level
+            self.zoom_factor = (current_scale / 2.0).max(0.01) / fit_scale;
+        }
+
+        self.clamp_pan();
+        self.needs_update = true;
     }
 
     /// Actual size (100% zoom)
@@ -1973,6 +2117,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Line::from(vec!["  p, Backspace, [".cyan(), "- Previous image".into()]),
             Line::from(vec!["  i, +           ".cyan(), "- Zoom In".into()]),
             Line::from(vec!["  o, -           ".cyan(), "- Zoom Out".into()]),
+            Line::from(vec![
+                "  I              ".cyan(),
+                "- Predefined Zoom In".into(),
+            ]),
+            Line::from(vec![
+                "  O              ".cyan(),
+                "- Predefined Zoom Out".into(),
+            ]),
             Line::from(vec!["  a              ".cyan(), "- Actual Size".into()]),
             Line::from(vec!["  r              ".cyan(), "- Reset View".into()]),
             Line::from(vec!["  b, B           ".cyan(), "- Brightness +/-".into()]),
@@ -2010,7 +2162,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
         let help_width = 44_u16;
-        let help_height = 21_u16;
+        let help_height = 23_u16;
 
         let w = help_width.min(chunks[0].width.saturating_sub(1));
         let h = help_height.min(chunks[0].height.saturating_sub(1));
@@ -2626,6 +2778,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     KeyCode::Char('o') | KeyCode::Char('-') => {
                                         app.zoom_out();
+                                    }
+                                    KeyCode::Char('I') => {
+                                        app.jump_zoom_in();
+                                    }
+                                    KeyCode::Char('O') => {
+                                        app.jump_zoom_out();
                                     }
                                     // Actual size
                                     KeyCode::Char('a') => {

@@ -14,8 +14,10 @@ ______________________________________________________________________
 - **Manga/Comic CBZ & ZIP Support**: Open and flip through compressed `.cbz` and `.zip` archives directly. Pages are sorted alphabetically and loaded asynchronously.
 - **Image Manipulation Adjustments**: Adjust brightness and contrast in real-time. Operations are processed asynchronously on background threads for fluid performance.
 - **Header-Based Magic Byte Verification**: Intelligently identifies images and zip files by reading their headers, allowing images with missing or incorrect file extensions to load perfectly.
+- **Decoded Format Nerd Font Icons**: Intelligently parses magic bytes and matches the decoded format with clean Material Nerd Font icons in the status bar (e.g., JPEG, PNG, GIF) to easily spot files with incorrect extensions.
 - **Smart Aspect-Ratio Padding Compression**: When zoomed out, images sit centered with empty border spaces (padding). As you zoom in, the borders automatically shrink and disappear, scaling the image to fully cover the terminal space.
 - **Pixel-Perfect Deep Zooming**: Supports zooming beyond a 1:1 pixel scale (up to 10000%) with clean Nearest Neighbor scaling—perfect for inspection and pixel-art view.
+- **Predefined Level Jumps**: Instantly snap zoom levels using `I` and `O` through a calculated sequence of target scales: Shrink to Fit, Fit View, Crop to Fill, 1:1, 2:1, and 4:1.
 - **In-Memory Rotation**: Rotate vertical or misaligned images clockwise and counter-clockwise in-memory (does not modify files on disk).
 - **Centering Layout**: Fits and centers images horizontally and vertically when they are smaller than the terminal size.
 - **Interactive Command Palette & File Search**: Press `:` to trigger the command palette or `f` to search for files, utilizing the high-performance `nucleo` fuzzy matching engine to rank and display the best candidates first.
@@ -32,7 +34,9 @@ ______________________________________________________________________
 | **Next Image**                     | `n`         | `Space` / `]`               |
 | **Previous Image**                 | `p`         | `Backspace` / `[`           |
 | **Zoom In**                        | `i`         | `+` / `=` / Mouse Scroll Up |
+| **Zoom In (predefined levels)**    | `I`         |                             |
 | **Zoom Out**                       | `o`         | `-` / Mouse Scroll Down     |
+| **Zoom Out (predefined levels)**   | `O`         |                             |
 | **Actual Size (100% Zoom)**        | `a`         |                             |
 | **Reset View (Fit Screen)**        | `r`         |                             |
 | **Rotate Clockwise (90°)**         | `e`         | `R` / `>`                   |
