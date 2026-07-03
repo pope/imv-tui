@@ -534,6 +534,8 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
     true
 }
 
+type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32)>>>;
+
 /// App state
 pub struct App {
     pub images: Vec<ImageSource>,
@@ -582,7 +584,7 @@ pub struct App {
     pub last_help_toggle: Option<Instant>,
     pub brightness: i32,
     pub contrast: f32,
-    prefetch_cache: Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32)>>>,
+    prefetch_cache: PrefetchCache,
 }
 
 impl App {
