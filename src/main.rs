@@ -838,7 +838,7 @@ impl App {
         }
     }
 
-    pub fn open_palette(&mut self, mode: PaletteMode, viewport_height: u16) {
+    pub fn open_palette(&mut self, mode: PaletteMode) {
         self.palette_mode = mode;
         self.palette_query.clear();
         self.palette_selected_index = match mode {
@@ -848,33 +848,23 @@ impl App {
         };
         self.needs_clear = true;
 
-        let (max_text_width, total_items) = match mode {
-            PaletteMode::File => {
-                let max_w = self
-                    .display_names
-                    .iter()
-                    .map(|name| name.len())
-                    .max()
-                    .unwrap_or(0) as u16;
-                (max_w, self.images.len())
-            }
-            PaletteMode::Command => {
-                let max_w = COMMANDS
-                    .iter()
-                    .map(|cmd| cmd.name.len() + 3 + cmd.description.len())
-                    .max()
-                    .unwrap_or(0) as u16;
-                (max_w, COMMANDS.len())
-            }
-            _ => (0, 0),
+        let max_text_width = match mode {
+            PaletteMode::File => self
+                .display_names
+                .iter()
+                .map(|name| name.len())
+                .max()
+                .unwrap_or(0) as u16,
+            PaletteMode::Command => COMMANDS
+                .iter()
+                .map(|cmd| cmd.name.len() + 3 + cmd.description.len())
+                .max()
+                .unwrap_or(0) as u16,
+            _ => 0,
         };
 
         self.palette_width = max_text_width + 5;
-
-        let max_height = (viewport_height as f64 * 0.5).round() as u16;
-        let mut palette_h = (total_items as u16 + 4).max(12);
-        palette_h = palette_h.min(max_height);
-        self.palette_height = palette_h;
+        self.palette_height = 0;
     }
 
     /// Start loading the image at the current index in the background
@@ -1683,6 +1673,21 @@ fn ui(frame: &mut Frame, app: &mut App) {
             _ => "",
         };
 
+        // Determine dynamic visible_count and palette_height
+        let total_items = match app.palette_mode {
+            PaletteMode::File => app.get_filtered_files().len(),
+            PaletteMode::Command => app.get_filtered_commands().len(),
+            _ => 0,
+        };
+        let max_height = (chunks[0].height as f64 * 0.5).round() as u16;
+        let mut palette_h = (total_items as u16 + 4).max(12);
+        palette_h = palette_h.min(max_height);
+
+        if app.palette_height != palette_h {
+            app.palette_height = palette_h;
+            app.needs_clear_once = true;
+        }
+
         let visible_count = (app.palette_height as usize).saturating_sub(4);
         let palette_height = app.palette_height;
 
@@ -2148,15 +2153,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     // Command Palette
                                     KeyCode::Char(':') => {
-                                        let size = terminal.size().unwrap_or_default();
-                                        let viewport_h = size.height.saturating_sub(1);
-                                        app.open_palette(PaletteMode::Command, viewport_h);
+                                        app.open_palette(PaletteMode::Command);
                                     }
                                     // File Palette
                                     KeyCode::Char('f') => {
-                                        let size = terminal.size().unwrap_or_default();
-                                        let viewport_h = size.height.saturating_sub(1);
-                                        app.open_palette(PaletteMode::File, viewport_h);
+                                        app.open_palette(PaletteMode::File);
                                     }
                                     // Next image
                                     KeyCode::Char('n')

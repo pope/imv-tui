@@ -222,16 +222,20 @@ img.apply_orientation(orientation);
 
 ______________________________________________________________________
 
-## 11. Frozen Dialog/Palette Width and Height on Open
+## 11. Frozen Dialog/Palette Width and Dynamic Height with Visual Clearing
 
 ### The Learning
 
-Recalculating a dialog or search palette's width and height dynamically on every character input (based on the currently filtered list) results in screen-draw artifacts (border "ghosts") when the dialog box shrinks, and creates a jittery, bouncing visual layout.
+Recalculating a dialog or search palette's width dynamically on every character input (based on the currently filtered list) results in screen-draw artifacts (border "ghosts") when the dialog box shrinks, and creates a jittery, bouncing visual layout.
+
+However, if dynamic height shrinking is desired to fit the filtered candidates list:
+- **Shrinking Height Artifacts**: As the list of matched items shrinks, the target popup height decreases, leaving the old bottom border and extra text characters frozen on the terminal screen.
+- **Selective Clear Trigger**: To cleanly wipe these remnants without inducing screen flicker on every keystroke, track the previous frame's calculated palette height. If the height changes (shrinks or expands), trigger a single `needs_clear_once = true` to force an unconditional terminal screen clear prior to rendering the new layout.
 
 ### Guidelines for Future Work
 
 - **Freeze Layout Width on Open**: When opening search or command palettes, scan the *unfiltered* list of all possible items once to calculate the maximum text length. Set and freeze `self.palette_width` inside the state constructor.
-- **Freeze Layout Height on Open**: Calculate the height of the palette once at open time using the unfiltered item list size: `(total_items + 4)`. Set the minimum height to 12 cells and clamp the maximum height to 50% of the viewport. Lock this value into `self.palette_height` and use it throughout the palette lifecycle.
+- **Dynamic Height with Clear Trigger**: Calculate the palette height dynamically on each draw step: `(filtered_items.len() + 4).max(12).min(max_height)`. If the height differs from the previous step's value, set `self.palette_height = new_height` and trigger `self.needs_clear_once = true`.
 - **Constraints**: Apply rendering constraints in the draw loop, forcing a minimum dialog width (e.g., 40 cells) and capping the maximum width at a percentage of horizontal screen space (e.g., 75% of screen width). Generate horizontal separator lines dynamically based on this static width.
 
 ______________________________________________________________________
