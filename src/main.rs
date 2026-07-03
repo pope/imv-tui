@@ -478,7 +478,7 @@ impl ScaleMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum Command {
     ShowHelp,
     ResetView,
@@ -569,6 +569,7 @@ impl Command {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct CommandItem {
     pub cmd: Command,
     pub name: &'static str,
@@ -577,253 +578,275 @@ pub struct CommandItem {
     pub show_in_palette: bool,
 }
 
-const COMMANDS: &[CommandItem] = &[
-    CommandItem {
-        cmd: Command::ShowHelp,
-        name: "Show Help",
-        description: "Toggle Help",
-        shortcut: Some("?, /"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::ResetView,
-        name: "Reset View",
-        description: "Reset View",
-        shortcut: Some("r"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::ActualSize,
-        name: "Actual Size",
-        description: "Actual Size",
-        shortcut: Some("a"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::RotateClockwise,
-        name: "Rotate Clockwise",
-        description: "Rotate CW 90°",
-        shortcut: Some("e, R, >"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::RotateCounterClockwise,
-        name: "Rotate Counter-Clockwise",
-        description: "Rotate CCW 90°",
-        shortcut: Some("E, <"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::NextImage,
-        name: "Next Image",
-        description: "Next image",
-        shortcut: Some("n, Space, ]"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::PreviousImage,
-        name: "Previous Image",
-        description: "Previous image",
-        shortcut: Some("p, Backspace, ["),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::ZoomIn,
-        name: "Zoom In",
-        description: "Zoom In",
-        shortcut: Some("i, +"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::ZoomOut,
-        name: "Zoom Out",
-        description: "Zoom Out",
-        shortcut: Some("o, -"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::Quit,
-        name: "Quit",
-        description: "Quit",
-        shortcut: Some("q, Esc"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterNearest,
-        name: "Set Filter: Nearest",
-        description: "Use Nearest Neighbor scaling (sharp, pixelated)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterLinear,
-        name: "Set Filter: Linear",
-        description: "Use Bilinear scaling",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterCubic,
-        name: "Set Filter: Cubic",
-        description: "Use Bicubic scaling (Catmull-Rom)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterMitchell,
-        name: "Set Filter: Mitchell",
-        description: "Use Mitchell-Netravali scaling",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterGaussian,
-        name: "Set Filter: Gaussian",
-        description: "Use Gaussian scaling",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterLanczos,
-        name: "Set Filter: Lanczos",
-        description: "Use Lanczos3 scaling (high quality)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetFilterHamming,
-        name: "Set Filter: Hamming",
-        description: "Use Hamming scaling",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::NextFilter,
-        name: "Next Filter",
-        description: "Next scaling filter",
-        shortcut: Some("S"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::GoToImage,
-        name: "Go to Image",
-        description: "Jump to a specific image index",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetBrightness,
-        name: "Set Brightness",
-        description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetContrast,
-        name: "Set Contrast",
-        description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetScaleNone,
-        name: "Set Scale: None",
-        description: "Do not scale the image (show at actual size 1:1)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetScaleShrink,
-        name: "Set Scale: Shrink to Fit",
-        description: "Scale larger images down to fit, leave smaller images untouched",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetScaleFit,
-        name: "Set Scale: Fit View",
-        description: "Scale images up or down to fit the viewport perfectly",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::SetScaleCrop,
-        name: "Set Scale: Crop to Fill",
-        description: "Scale images to completely fill the viewport (cropping excess)",
-        shortcut: None,
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::CycleScaleMode,
-        name: "Cycle Scale Mode",
-        description: "Cycle scale mode",
-        shortcut: Some("s"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::PredefinedZoomIn,
-        name: "Predefined Zoom In",
-        description: "Predefined Zoom In",
-        shortcut: Some("I"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::PredefinedZoomOut,
-        name: "Predefined Zoom Out",
-        description: "Predefined Zoom Out",
-        shortcut: Some("O"),
-        show_in_palette: true,
-    },
-    CommandItem {
-        cmd: Command::IncreaseBrightness,
-        name: "Brightness +/-",
-        description: "Brightness +/-",
-        shortcut: Some("b, B"),
-        show_in_palette: false,
-    },
-    CommandItem {
-        cmd: Command::IncreaseContrast,
-        name: "Contrast +/-",
-        description: "Contrast +/-",
-        shortcut: Some("c, C"),
-        show_in_palette: false,
-    },
-    CommandItem {
-        cmd: Command::PanLeft,
-        name: "Pan Left/Down/Up/Right",
-        description: "Pan Left/Down/Up/Right",
-        shortcut: Some("h, j, k, l"),
-        show_in_palette: false,
-    },
-    CommandItem {
-        cmd: Command::PanRight,
-        name: "Pan image",
-        description: "Pan image",
-        shortcut: Some("Arrow Keys"),
-        show_in_palette: false,
-    },
-    CommandItem {
-        cmd: Command::CommandPalette,
-        name: "Command Palette",
-        description: "Command Palette",
-        shortcut: Some(":"),
-        show_in_palette: false,
-    },
-    CommandItem {
-        cmd: Command::FileSearch,
-        name: "File Search",
-        description: "File Search",
-        shortcut: Some("f"),
-        show_in_palette: false,
-    },
-    CommandItem {
-        cmd: Command::ZoomIn,
-        name: "Zoom",
-        description: "Zoom In / Out",
-        shortcut: Some("Mouse Scroll"),
-        show_in_palette: false,
-    },
-];
+impl Command {
+    pub fn get_metadata(self) -> &'static [CommandItem] {
+        match self {
+            Self::ShowHelp => &[CommandItem {
+                cmd: Self::ShowHelp,
+                name: "Show Help",
+                description: "Toggle Help",
+                shortcut: Some("?, /"),
+                show_in_palette: true,
+            }],
+            Self::ResetView => &[CommandItem {
+                cmd: Self::ResetView,
+                name: "Reset View",
+                description: "Reset View",
+                shortcut: Some("r"),
+                show_in_palette: true,
+            }],
+            Self::ActualSize => &[CommandItem {
+                cmd: Self::ActualSize,
+                name: "Actual Size",
+                description: "Actual Size",
+                shortcut: Some("a"),
+                show_in_palette: true,
+            }],
+            Self::RotateClockwise => &[CommandItem {
+                cmd: Self::RotateClockwise,
+                name: "Rotate Clockwise",
+                description: "Rotate CW 90°",
+                shortcut: Some("e, R, >"),
+                show_in_palette: true,
+            }],
+            Self::RotateCounterClockwise => &[CommandItem {
+                cmd: Self::RotateCounterClockwise,
+                name: "Rotate Counter-Clockwise",
+                description: "Rotate CCW 90°",
+                shortcut: Some("E, <"),
+                show_in_palette: true,
+            }],
+            Self::NextImage => &[CommandItem {
+                cmd: Self::NextImage,
+                name: "Next Image",
+                description: "Next image",
+                shortcut: Some("n, Space, ]"),
+                show_in_palette: true,
+            }],
+            Self::PreviousImage => &[CommandItem {
+                cmd: Self::PreviousImage,
+                name: "Previous Image",
+                description: "Previous image",
+                shortcut: Some("p, Backspace, ["),
+                show_in_palette: true,
+            }],
+            Self::ZoomIn => &[
+                CommandItem {
+                    cmd: Self::ZoomIn,
+                    name: "Zoom In",
+                    description: "Zoom In",
+                    shortcut: Some("i, +"),
+                    show_in_palette: true,
+                },
+                CommandItem {
+                    cmd: Self::ZoomIn,
+                    name: "Zoom",
+                    description: "Zoom In / Out",
+                    shortcut: Some("Mouse Scroll"),
+                    show_in_palette: false,
+                },
+            ],
+            Self::ZoomOut => &[CommandItem {
+                cmd: Self::ZoomOut,
+                name: "Zoom Out",
+                description: "Zoom Out",
+                shortcut: Some("o, -"),
+                show_in_palette: true,
+            }],
+            Self::Quit => &[CommandItem {
+                cmd: Self::Quit,
+                name: "Quit",
+                description: "Quit",
+                shortcut: Some("q, Esc"),
+                show_in_palette: true,
+            }],
+            Self::SetFilterNearest => &[CommandItem {
+                cmd: Self::SetFilterNearest,
+                name: "Set Filter: Nearest",
+                description: "Use Nearest Neighbor scaling (sharp, pixelated)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetFilterLinear => &[CommandItem {
+                cmd: Self::SetFilterLinear,
+                name: "Set Filter: Linear",
+                description: "Use Bilinear scaling",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetFilterCubic => &[CommandItem {
+                cmd: Self::SetFilterCubic,
+                name: "Set Filter: Cubic",
+                description: "Use Bicubic scaling (Catmull-Rom)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetFilterMitchell => &[CommandItem {
+                cmd: Self::SetFilterMitchell,
+                name: "Set Filter: Mitchell",
+                description: "Use Mitchell-Netravali scaling",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetFilterGaussian => &[CommandItem {
+                cmd: Self::SetFilterGaussian,
+                name: "Set Filter: Gaussian",
+                description: "Use Gaussian scaling",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetFilterLanczos => &[CommandItem {
+                cmd: Self::SetFilterLanczos,
+                name: "Set Filter: Lanczos",
+                description: "Use Lanczos3 scaling (high quality)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetFilterHamming => &[CommandItem {
+                cmd: Self::SetFilterHamming,
+                name: "Set Filter: Hamming",
+                description: "Use Hamming scaling",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::NextFilter => &[CommandItem {
+                cmd: Self::NextFilter,
+                name: "Next Filter",
+                description: "Next scaling filter",
+                shortcut: Some("S"),
+                show_in_palette: true,
+            }],
+            Self::GoToImage => &[CommandItem {
+                cmd: Self::GoToImage,
+                name: "Go to Image",
+                description: "Jump to a specific image index",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetBrightness => &[CommandItem {
+                cmd: Self::SetBrightness,
+                name: "Set Brightness",
+                description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetContrast => &[CommandItem {
+                cmd: Self::SetContrast,
+                name: "Set Contrast",
+                description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetScaleNone => &[CommandItem {
+                cmd: Self::SetScaleNone,
+                name: "Set Scale: None",
+                description: "Do not scale the image (show at actual size 1:1)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetScaleShrink => &[CommandItem {
+                cmd: Self::SetScaleShrink,
+                name: "Set Scale: Shrink to Fit",
+                description: "Scale larger images down to fit, leave smaller images untouched",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetScaleFit => &[CommandItem {
+                cmd: Self::SetScaleFit,
+                name: "Set Scale: Fit View",
+                description: "Scale images up or down to fit the viewport perfectly",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::SetScaleCrop => &[CommandItem {
+                cmd: Self::SetScaleCrop,
+                name: "Set Scale: Crop to Fill",
+                description: "Scale images to completely fill the viewport (cropping excess)",
+                shortcut: None,
+                show_in_palette: true,
+            }],
+            Self::CycleScaleMode => &[CommandItem {
+                cmd: Self::CycleScaleMode,
+                name: "Cycle Scale Mode",
+                description: "Cycle scale mode",
+                shortcut: Some("s"),
+                show_in_palette: true,
+            }],
+            Self::PredefinedZoomIn => &[CommandItem {
+                cmd: Self::PredefinedZoomIn,
+                name: "Predefined Zoom In",
+                description: "Predefined Zoom In",
+                shortcut: Some("I"),
+                show_in_palette: true,
+            }],
+            Self::PredefinedZoomOut => &[CommandItem {
+                cmd: Self::PredefinedZoomOut,
+                name: "Predefined Zoom Out",
+                description: "Predefined Zoom Out",
+                shortcut: Some("O"),
+                show_in_palette: true,
+            }],
+            Self::IncreaseBrightness => &[CommandItem {
+                cmd: Self::IncreaseBrightness,
+                name: "Brightness +/-",
+                description: "Brightness +/-",
+                shortcut: Some("b, B"),
+                show_in_palette: false,
+            }],
+            Self::DecreaseBrightness => &[],
+            Self::IncreaseContrast => &[CommandItem {
+                cmd: Self::IncreaseContrast,
+                name: "Contrast +/-",
+                description: "Contrast +/-",
+                shortcut: Some("c, C"),
+                show_in_palette: false,
+            }],
+            Self::DecreaseContrast => &[],
+            Self::PanLeft => &[CommandItem {
+                cmd: Self::PanLeft,
+                name: "Pan Left/Down/Up/Right",
+                description: "Pan Left/Down/Up/Right",
+                shortcut: Some("h, j, k, l"),
+                show_in_palette: false,
+            }],
+            Self::PanRight => &[CommandItem {
+                cmd: Self::PanRight,
+                name: "Pan image",
+                description: "Pan image",
+                shortcut: Some("Arrow Keys"),
+                show_in_palette: false,
+            }],
+            Self::PanUp => &[],
+            Self::PanDown => &[],
+            Self::ToggleHelp => &[],
+            Self::CommandPalette => &[CommandItem {
+                cmd: Self::CommandPalette,
+                name: "Command Palette",
+                description: "Command Palette",
+                shortcut: Some(":"),
+                show_in_palette: false,
+            }],
+            Self::FileSearch => &[CommandItem {
+                cmd: Self::FileSearch,
+                name: "File Search",
+                description: "File Search",
+                shortcut: Some("f"),
+                show_in_palette: false,
+            }],
+        }
+    }
+}
+
+pub fn get_commands() -> &'static [CommandItem] {
+    static LIST: std::sync::OnceLock<Vec<CommandItem>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut list = Vec::new();
+        for cmd in <Command as strum::IntoEnumIterator>::iter() {
+            list.extend_from_slice(cmd.get_metadata());
+        }
+        list
+    })
+}
 
 type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32, &'static str)>>>;
 
@@ -1061,7 +1084,10 @@ impl App {
     pub fn get_filtered_commands(&mut self) -> Vec<&'static CommandItem> {
         let query = &self.palette_query;
         if query.is_empty() {
-            return COMMANDS.iter().filter(|cmd| cmd.show_in_palette).collect();
+            return get_commands()
+                .iter()
+                .filter(|cmd| cmd.show_in_palette)
+                .collect();
         }
 
         let pattern = nucleo::pattern::Pattern::parse(
@@ -1081,7 +1107,7 @@ impl App {
             }
         }
 
-        let candidates: Vec<CmdCandidate> = COMMANDS
+        let candidates: Vec<CmdCandidate> = get_commands()
             .iter()
             .enumerate()
             .filter(|(_, cmd)| cmd.show_in_palette)
@@ -1099,7 +1125,7 @@ impl App {
 
         matches
             .into_iter()
-            .map(|(candidate, _score)| &COMMANDS[candidate.cmd_index])
+            .map(|(candidate, _score)| &get_commands()[candidate.cmd_index])
             .collect()
     }
 
@@ -1228,7 +1254,7 @@ impl App {
                 .map(|name| name.len())
                 .max()
                 .unwrap_or(0) as u16,
-            PaletteMode::Command => COMMANDS
+            PaletteMode::Command => get_commands()
                 .iter()
                 .filter(|cmd| cmd.show_in_palette)
                 .map(|cmd| cmd.name.len() + 3 + cmd.description.len())
@@ -2332,7 +2358,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Line::from(" imv-tui Keyboard Shortcuts ".bold().yellow()),
             Line::from(" ───────────────────────────────── ".gray()),
         ];
-        for item in COMMANDS {
+        for item in get_commands() {
             if let Some(shortcut) = item.shortcut {
                 help_lines.push(Line::from(vec![
                     format!("  {:<15}", shortcut).cyan(),
