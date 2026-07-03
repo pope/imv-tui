@@ -1902,10 +1902,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 "  h, j, k, l     ".cyan(),
                 "- Pan Left/Down/Up/Right".into(),
             ]),
-            Line::from(vec![
-                "  Arrow Keys     ".cyan(),
-                "- Pan or Prev/Next image".into(),
-            ]),
+            Line::from(vec!["  Arrow Keys     ".cyan(), "- Pan image".into()]),
             Line::from(vec!["  e, R, >        ".cyan(), "- Rotate CW 90°".into()]),
             Line::from(vec!["  E, <           ".cyan(), "- Rotate CCW 90°".into()]),
             Line::from(vec![

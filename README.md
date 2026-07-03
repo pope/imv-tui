@@ -16,6 +16,8 @@ ______________________________________________________________________
 - **Pixel-Perfect Deep Zooming**: Supports zooming beyond a 1:1 pixel scale (up to 10000%) with clean Nearest Neighbor scaling—perfect for inspection and pixel-art view.
 - **In-Memory Rotation**: Rotate vertical or misaligned images clockwise and counter-clockwise in-memory (does not modify files on disk).
 - **Centering Layout**: Fits and centers images horizontally and vertically when they are smaller than the terminal size.
+- **Interactive Command Palette & File Search**: Press `:` to trigger the command palette or `f` to search for files, utilizing the high-performance `nucleo` fuzzy matching engine to rank and display the best candidates first.
+- **Dynamic Parameter Value Prompts**: Adjust brightness, contrast, or jump directly to a specific image index (via `Go to Image`, `Set Brightness`, and `Set Contrast` commands in the command palette) using absolute numbers or relative offsets (e.g. `+10` or `-5`).
 - **Graphics & Fallbacks**: Auto-detects terminal capabilities. Uses high-performance Kitty graphics protocol or Sixel if supported, falling back gracefully to ANSI **Half-blocks** on standard terminals.
 
 ______________________________________________________________________
@@ -39,7 +41,7 @@ ______________________________________________________________________
 | **Cycle Image Scaling Mode**       | `s`         |                             |
 | **Pan Left / Right**               | `h` / `l`   | `Left` / `Right Arrow`      |
 | **Pan Up / Down**                  | `k` / `j`   | `Up` / `Down Arrow`         |
-| **Toggle Help Screen**             | `?`         |                             |
+| **Toggle Help Screen**             | `?`         | `/`                         |
 | **Command Palette**                | `:`         |                             |
 | **File Search**                    | `f`         |                             |
 
@@ -106,8 +108,8 @@ If no path is specified, it scans and opens images from the current directory (`
 ### Command Line Options
 
 - `-f, --filter <nearest|linear|cubic|mitchell|gaussian|lanczos|hamming>`: Set the initial image scaling filter (defaults to `nearest`).
-- `-s, --scale <none|actual|shrink|full|crop>`: Set the initial image scaling mode (defaults to `shrink`).
-- `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection).
+- `-s, --scale <none|actual|shrink|full|crop>`: Set the initial image scaling mode (defaults to `shrink`). `actual` maps to `none`, and `fit` maps to `full`.
+- `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection). `halfblock` maps to `halfblocks`.
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
 
 ______________________________________________________________________
