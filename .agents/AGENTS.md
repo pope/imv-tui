@@ -222,15 +222,16 @@ img.apply_orientation(orientation);
 
 ______________________________________________________________________
 
-## 11. Frozen Dialog/Palette Width on Open
+## 11. Frozen Dialog/Palette Width and Height on Open
 
 ### The Learning
 
-Recalculating a dialog or search palette's width dynamically on every character input (based on the currently filtered list) results in screen-draw artifacts (border "ghosts") when the dialog box shrinks, and creates a jittery, bouncing visual layout.
+Recalculating a dialog or search palette's width and height dynamically on every character input (based on the currently filtered list) results in screen-draw artifacts (border "ghosts") when the dialog box shrinks, and creates a jittery, bouncing visual layout.
 
 ### Guidelines for Future Work
 
 - **Freeze Layout Width on Open**: When opening search or command palettes, scan the *unfiltered* list of all possible items once to calculate the maximum text length. Set and freeze `self.palette_width` inside the state constructor.
+- **Freeze Layout Height on Open**: Calculate the height of the palette once at open time using the unfiltered item list size: `(total_items + 4)`. Set the minimum height to 12 cells and clamp the maximum height to 50% of the viewport. Lock this value into `self.palette_height` and use it throughout the palette lifecycle.
 - **Constraints**: Apply rendering constraints in the draw loop, forcing a minimum dialog width (e.g., 40 cells) and capping the maximum width at a percentage of horizontal screen space (e.g., 75% of screen width). Generate horizontal separator lines dynamically based on this static width.
 
 ______________________________________________________________________
