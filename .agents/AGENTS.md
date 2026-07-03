@@ -123,12 +123,12 @@ ______________________________________________________________________
 When rendering text components (like the Help menu, Command Palette, or File Search dialogs) on top of active terminal graphic overlays (Kitty protocol):
 
 - **Image Redraw covers Text**: Triggering `update_protocol()` (re-rendering/re-uploading the image) while a text dialog is open causes the graphic layer to cover the text grid. Because of `ratatui`'s double buffering, only the text cells that *changed* will be redrawn on top of the image; static text elements (like borders, titles, or unchanged labels) will remain covered and invisible.
-- **Erase Text by Redrawing Image**: To optimize background rendering, `ratatui-image` configures cells occupied by the active image to be skipped by the text writer. Consequently, dismissing/closing a text dialog does not automatically clear the characters. To completely erase text from the graphics region, you must force a single redraw of the image overlay.
+- **Erase Text in Kitty/WezTerm**: To optimize background rendering, `ratatui-image` configures cells occupied by the active image to be skipped by the text writer. Consequently, dismissing/closing a text dialog does not automatically clear the characters (spaces) in double buffered Kitty-protocol terminals (like WezTerm). To cleanly wipe these character cells, you must perform a single unconditional clear of the text grid.
 
 ### Guidelines for Future Work
 
 - **No Updates on Typing/Navigation**: Do not set `needs_update = true` or call `update_protocol()` for keystrokes, character entry, or row selection inside dialog inputs.
-- **Redraw on Overlay Dismissal**: Set `needs_update = true` when dismissing or toggling an overlay *off* (such as closing the Help panel or hiding the command palette) to cleanly paint over and erase the characters.
+- **Clear Text Grid on Overlay Dismissal**: When dismissing or toggling an overlay *off* (such as closing the Help panel or hiding the command palette), set an unconditional `needs_clear_once = true` flag. This executes `terminal.clear()?` on the next frame, wiping the text grid clean of overlay characters without deleting the background graphics overlay buffer.
 
 ______________________________________________________________________
 
@@ -166,11 +166,13 @@ Sixel graphics require clear operations (`terminal.clear()?`) to wipe old frames
 
 - If we clear the screen immediately on image load, rotation, or zoom triggers, the terminal will render the old image's layout for one frame before the background thread returns the new protocol.
 - This creates double-clearing and redraw stutters.
+- **Layout Aspect-Ratio Mismatch**: If `self.rendered_size_cells` is updated on the main loop thread before sending a resize request to the worker thread, the old image protocol is rendered stretched/distorted to the new dimensions for one frame.
 
 ### Guidelines for Future Work
 
 - Defer screen clearing until the new protocol is actually received from the worker thread.
 - Do not clear the terminal during zooming and panning. Use a selective `clear_on_protocol_receive` flag to restrict screen clearing only to discrete state changes (e.g. loading a new file, resetting views, or rotations).
+- **Synchronize Protocol and Cell Layout updates**: Pass target cell layout dimensions `rendered_size_cells` along with the `ResizeRequest` to the background thread. Let the background channel yield a tuple `(StatefulProtocol, (u16, u16))` and apply both at the exact same instant inside the channel receiver. This completely eliminates layout distortion stutters.
 
 ______________________________________________________________________
 
@@ -213,3 +215,16 @@ let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
 let mut img = DynamicImage::from_decoder(decoder)?;
 img.apply_orientation(orientation);
 ```
+
+______________________________________________________________________
+
+## 11. Frozen Dialog/Palette Width on Open
+
+### The Learning
+
+Recalculating a dialog or search palette's width dynamically on every character input (based on the currently filtered list) results in screen-draw artifacts (border "ghosts") when the dialog box shrinks, and creates a jittery, bouncing visual layout.
+
+### Guidelines for Future Work
+
+- **Freeze Layout Width on Open**: When opening search or command palettes, scan the *unfiltered* list of all possible items once to calculate the maximum text length. Set and freeze `self.palette_width` inside the state constructor.
+- **Constraints**: Apply rendering constraints in the draw loop, forcing a minimum dialog width (e.g., 40 cells) and capping the maximum width at a percentage of horizontal screen space (e.g., 75% of screen width). Generate horizontal separator lines dynamically based on this static width.
