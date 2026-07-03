@@ -271,3 +271,37 @@ Providing various default image fit protocols (None, Shrink to Fit, Fit View, Cr
 
 - Map layout modes cleanly via a `ScaleMode` enum.
 - Inline scale-mode logic inside the `update_protocol()` layout initialization sequence to prevent borrow checker conflicts resulting from simultaneous mutable self references inside dynamic image borrowing scopes.
+
+______________________________________________________________________
+
+## 14. Fuzzy Match Ranking & Borrow Checker Resolution
+
+### The Learning
+
+Simple subsequence matching fails to sort the best results at the top. Incorporating a robust fuzzy matcher (like `nucleo`) solves this:
+
+- **Stable Ranking**: Retrieve scores from the pattern match engine and perform a descending score sort, adding index tie-breakers (`a.0.index.cmp(&b.0.index)`) to maintain list stability.
+- **Concatenated Search Targets**: Map command candidate matching text to a combined string `name + " " + description` to allow query matching on either property.
+- **Overlapping Immutability Borrows**: Storing a slice of a field (such as `app.palette_query.as_str()`) inside a long-lived TUI structure (like a `Line` or `Paragraph` vector) causes the entire `app` to remain immutably borrowed. This blocks calling mutable methods (like `app.get_filtered_files()`) later in the draw step.
+
+### Guidelines for Future Work
+
+- Always clone strings (e.g. `app.palette_query.clone().into()`) when building diagnostic lines to release borrows immediately.
+- Use `nucleo`'s multithread-ready `Matcher` state fully within the state controller to avoid repeated allocation overhead.
+
+______________________________________________________________________
+
+## 15. Consistent TUI Block Styling & Colors
+
+### The Learning
+
+Maintaining visual consistency across overlay windows, palettes, prompts, and status panels is critical to building a polished, professional TUI. Mixing border styles or title decorations ruins the aesthetic coherence.
+
+- **Rounded Borders**: Rounded layout boundaries look more modern and premium than straight single/double line frames in modern terminal emulators.
+- **Color Identity**: Combining a high-contrast theme (like Cyan borders with bold Yellow titles and White contents) creates a recognizable design language.
+
+### Guidelines for Future Work
+
+- **Rounded Borders**: Always configure TUI blocks with `BorderType::Rounded` borders.
+- **Cyan Borders & Bold Yellow Titles**: Set the block's `.border_style(Style::default().fg(Color::Cyan))` and `.title_style(Style::default().fg(Color::Yellow).bold())`.
+- **Title Padding**: Ensure title text has surrounding spacing (e.g., `" Help "` or `" File Search "`) to avoid letters colliding directly with the corners of the rounded border.

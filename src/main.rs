@@ -47,7 +47,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::Line,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use ratatui_image::{
     StatefulImage,
@@ -1793,7 +1793,7 @@ fn collect_sources(paths: &[PathBuf]) -> Result<Vec<ImageSource>, String> {
 fn ui(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(frame.area());
 
     // Update protocol if size has changed or update is requested
@@ -1841,9 +1841,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(loading_paragraph, chunks[0]);
     }
 
-    // Render status bar
-    let status_text = if app.images.is_empty() {
-        " No files found. Press 'q' to quit. ".to_string()
+    let (title_text, status_text) = if app.images.is_empty() {
+        (
+            " imv-tui ".to_string(),
+            " No files found. Press 'q' to quit. ".to_string(),
+        )
     } else {
         let mut extra_info = String::new();
         if app.brightness != 0 {
@@ -1853,11 +1855,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
             extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
         }
 
-        format!(
-            " [{}/{}] {} ({}x{}) | Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
+        let title = format!(" {} ", app.current_filename());
+        let info = format!(
+            " [{}/{}] ({}x{}) | Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
             app.current_index + 1,
             app.images.len(),
-            app.current_filename(),
             app.img_width,
             app.img_height,
             app.scale_mode.name(),
@@ -1866,11 +1868,20 @@ fn ui(frame: &mut Frame, app: &mut App) {
             app.pan_offset.0,
             app.pan_offset.1,
             extra_info
-        )
+        );
+        (title, info)
     };
 
-    let status_bar =
-        Paragraph::new(status_text).style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    let status_block = Block::default()
+        .title(title_text)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(Color::Yellow).bold());
+
+    let status_bar = Paragraph::new(status_text)
+        .block(status_block)
+        .style(Style::default().fg(Color::White).bg(Color::Reset));
     frame.render_widget(status_bar, chunks[1]);
 
     // Help Popup overlay
@@ -1916,7 +1927,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Block::default()
                     .title(" Help ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title_style(Style::default().fg(Color::Yellow).bold()),
             )
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
@@ -1959,7 +1972,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             ];
 
             let w = 45.min(chunks[0].width.saturating_sub(1));
-            let h = 5.min(chunks[0].height.saturating_sub(1));
+            let h = 4.min(chunks[0].height.saturating_sub(1));
 
             if app.palette_height != h {
                 app.palette_height = h;
@@ -1969,7 +1982,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let palette_block = Block::default()
                 .title(prompt_title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title_style(Style::default().fg(Color::Yellow).bold());
 
             let palette_paragraph = Paragraph::new(lines)
                 .block(palette_block)
@@ -2123,7 +2138,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let palette_block = Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title_style(Style::default().fg(Color::Yellow).bold());
 
             let palette_paragraph = Paragraph::new(lines)
                 .block(palette_block)
