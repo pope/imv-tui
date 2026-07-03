@@ -1886,11 +1886,19 @@ fn ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(loading_paragraph, chunks[0]);
     }
 
-    let (title_text, status_text) = if app.images.is_empty() {
-        (
-            " imv-tui ".to_string(),
-            " No files found. Press 'q' to quit. ".to_string(),
-        )
+    if app.images.is_empty() {
+        let status_block = Block::default()
+            .title(" imv-tui ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+        let inner_rect = status_block.inner(chunks[1]);
+        frame.render_widget(status_block, chunks[1]);
+        let empty_para = Paragraph::new(" No files found. Press 'q' to quit. ")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(empty_para, inner_rect);
     } else {
         let mut extra_info = String::new();
         if app.brightness != 0 {
@@ -1900,13 +1908,39 @@ fn ui(frame: &mut Frame, app: &mut App) {
             extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
         }
 
-        let title = format!(" {} {} ", app.current_icon, app.current_filename());
-        let info = format!(
-            " [{}/{}] ({}x{}) | Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
+        let title_text = format!(" {} {} ", app.current_icon, app.current_filename());
+        let status_block = Block::default()
+            .title(title_text)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+        let inner_rect = status_block.inner(chunks[1]);
+        frame.render_widget(status_block, chunks[1]);
+
+        let status_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(30),
+                Constraint::Min(0),
+                Constraint::Length(22),
+            ])
+            .split(inner_rect);
+
+        let left_text = format!(
+            " [{}/{}] ({}x{}) ",
             app.current_index + 1,
             app.images.len(),
             app.img_width,
-            app.img_height,
+            app.img_height
+        );
+        let left_para = Paragraph::new(left_text)
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(left_para, status_chunks[0]);
+
+        let mid_text = format!(
+            "Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){}",
             app.scale_mode.name(),
             app.filter_name(),
             app.current_zoom_pct.round() as i64,
@@ -1914,20 +1948,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
             app.pan_offset.1,
             extra_info
         );
-        (title, info)
-    };
+        let mid_para = Paragraph::new(mid_text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(mid_para, status_chunks[1]);
 
-    let status_block = Block::default()
-        .title(title_text)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title_style(Style::default().fg(Color::Yellow).bold());
-
-    let status_bar = Paragraph::new(status_text)
-        .block(status_block)
-        .style(Style::default().fg(Color::White).bg(Color::Reset));
-    frame.render_widget(status_bar, chunks[1]);
+        let right_text = "Press '?' for help ";
+        let right_para = Paragraph::new(right_text)
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(right_para, status_chunks[2]);
+    }
 
     // Help Popup overlay
     if app.show_help {
