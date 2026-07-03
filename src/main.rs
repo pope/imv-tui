@@ -478,137 +478,241 @@ impl ScaleMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Command {
+    ShowHelp,
+    ResetView,
+    ActualSize,
+    RotateClockwise,
+    RotateCounterClockwise,
+    NextImage,
+    PreviousImage,
+    ZoomIn,
+    ZoomOut,
+    PredefinedZoomIn,
+    PredefinedZoomOut,
+    Quit,
+    SetFilterNearest,
+    SetFilterLinear,
+    SetFilterCubic,
+    SetFilterMitchell,
+    SetFilterGaussian,
+    SetFilterLanczos,
+    SetFilterHamming,
+    NextFilter,
+    GoToImage,
+    SetBrightness,
+    SetContrast,
+    SetScaleNone,
+    SetScaleShrink,
+    SetScaleFit,
+    SetScaleCrop,
+    CycleScaleMode,
+    IncreaseBrightness,
+    DecreaseBrightness,
+    IncreaseContrast,
+    DecreaseContrast,
+    PanLeft,
+    PanRight,
+    PanUp,
+    PanDown,
+    ToggleHelp,
+    CommandPalette,
+    FileSearch,
+}
+
+impl Command {
+    pub fn from_key(key: event::KeyEvent) -> Option<Self> {
+        use event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Some(Self::Quit),
+            KeyCode::Char('?') | KeyCode::Char('/') => Some(Self::ToggleHelp),
+            KeyCode::Char(':') => Some(Self::CommandPalette),
+            KeyCode::Char('f') => Some(Self::FileSearch),
+            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Char(']') => Some(Self::NextImage),
+            KeyCode::Char('p') | KeyCode::Char('[') => Some(Self::PreviousImage),
+            KeyCode::Backspace => Some(Self::PreviousImage),
+            KeyCode::Char('i') | KeyCode::Char('+') | KeyCode::Char('=') => Some(Self::ZoomIn),
+            KeyCode::Char('o') | KeyCode::Char('-') => Some(Self::ZoomOut),
+            KeyCode::Char('I') => Some(Self::PredefinedZoomIn),
+            KeyCode::Char('O') => Some(Self::PredefinedZoomOut),
+            KeyCode::Char('a') => Some(Self::ActualSize),
+            KeyCode::Char('r') => Some(Self::ResetView),
+            KeyCode::Char('b') => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Some(Self::DecreaseBrightness)
+                } else {
+                    Some(Self::IncreaseBrightness)
+                }
+            }
+            KeyCode::Char('B') => Some(Self::DecreaseBrightness),
+            KeyCode::Char('c') => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Some(Self::DecreaseContrast)
+                } else {
+                    Some(Self::IncreaseContrast)
+                }
+            }
+            KeyCode::Char('C') => Some(Self::DecreaseContrast),
+            KeyCode::Char('e') | KeyCode::Char('R') | KeyCode::Char('>') => {
+                Some(Self::RotateClockwise)
+            }
+            KeyCode::Char('E') | KeyCode::Char('<') => Some(Self::RotateCounterClockwise),
+            KeyCode::Char('S') => Some(Self::NextFilter),
+            KeyCode::Char('s') => Some(Self::CycleScaleMode),
+            KeyCode::Char('h') | KeyCode::Left => Some(Self::PanLeft),
+            KeyCode::Char('l') | KeyCode::Right => Some(Self::PanRight),
+            KeyCode::Char('k') | KeyCode::Up => Some(Self::PanUp),
+            KeyCode::Char('j') | KeyCode::Down => Some(Self::PanDown),
+            _ => None,
+        }
+    }
+}
+
 pub struct CommandItem {
+    pub cmd: Command,
     pub name: &'static str,
     pub description: &'static str,
 }
 
 const COMMANDS: &[CommandItem] = &[
     CommandItem {
+        cmd: Command::ShowHelp,
         name: "Show Help",
         description: "Show keyboard shortcuts dialog",
     },
     CommandItem {
+        cmd: Command::ResetView,
         name: "Reset View",
         description: "Fit image to screen and reset panning",
     },
     CommandItem {
+        cmd: Command::ActualSize,
         name: "Actual Size",
         description: "Zoom image to 1:1 pixel scale (100%)",
     },
     CommandItem {
+        cmd: Command::RotateClockwise,
         name: "Rotate Clockwise",
-        description: "Rotate image 90 degrees clockwise",
+        description: "Rotate the image 90 degrees clockwise",
     },
     CommandItem {
+        cmd: Command::RotateCounterClockwise,
         name: "Rotate Counter-Clockwise",
-        description: "Rotate image 90 degrees counter-clockwise",
+        description: "Rotate the image 90 degrees counter-clockwise",
     },
     CommandItem {
+        cmd: Command::NextImage,
         name: "Next Image",
-        description: "Switch to the next image in directory",
+        description: "Load the next image in the directory",
     },
     CommandItem {
+        cmd: Command::PreviousImage,
         name: "Previous Image",
-        description: "Switch to the previous image in directory",
+        description: "Load the previous image in the directory",
     },
     CommandItem {
+        cmd: Command::ZoomIn,
         name: "Zoom In",
-        description: "Zoom in closer",
+        description: "Zoom into the image",
     },
     CommandItem {
+        cmd: Command::ZoomOut,
         name: "Zoom Out",
-        description: "Zoom out further",
+        description: "Zoom out of the image",
     },
     CommandItem {
+        cmd: Command::Quit,
         name: "Quit",
-        description: "Close the application",
+        description: "Exit the application",
     },
     CommandItem {
+        cmd: Command::SetFilterNearest,
         name: "Set Filter: Nearest",
-        description: "Use Nearest Neighbor scaling (sharp, fast)",
+        description: "Use Nearest Neighbor scaling (sharp, pixelated)",
     },
     CommandItem {
+        cmd: Command::SetFilterLinear,
         name: "Set Filter: Linear",
-        description: "Use Bilinear/Triangle scaling (smooth)",
+        description: "Use Bilinear scaling",
     },
     CommandItem {
+        cmd: Command::SetFilterCubic,
         name: "Set Filter: Cubic",
-        description: "Use Bicubic/Catmull-Rom scaling (sharp cubic)",
+        description: "Use Bicubic scaling (Catmull-Rom)",
     },
     CommandItem {
+        cmd: Command::SetFilterMitchell,
         name: "Set Filter: Mitchell",
-        description: "Use Mitchell-Netravali scaling (smooth cubic)",
+        description: "Use Mitchell-Netravali scaling",
     },
     CommandItem {
+        cmd: Command::SetFilterGaussian,
         name: "Set Filter: Gaussian",
-        description: "Use Gaussian scaling (smooth, blurred)",
+        description: "Use Gaussian scaling",
     },
     CommandItem {
+        cmd: Command::SetFilterLanczos,
         name: "Set Filter: Lanczos",
-        description: "Use Lanczos3 scaling (highest quality)",
+        description: "Use Lanczos3 scaling (high quality)",
     },
     CommandItem {
+        cmd: Command::SetFilterHamming,
         name: "Set Filter: Hamming",
-        description: "Use Hamming scaling (sharp downscaling)",
+        description: "Use Hamming scaling",
     },
     CommandItem {
-        name: "Increase Brightness",
-        description: "Increase image brightness (+10)",
-    },
-    CommandItem {
-        name: "Decrease Brightness",
-        description: "Decrease image brightness (-10)",
-    },
-    CommandItem {
-        name: "Increase Contrast",
-        description: "Increase image contrast (+10%)",
-    },
-    CommandItem {
-        name: "Decrease Contrast",
-        description: "Decrease image contrast (-10%)",
-    },
-    CommandItem {
+        cmd: Command::NextFilter,
         name: "Next Filter",
-        description: "Cycle to the next image scaling filter",
+        description: "Cycle to the next scaling filter",
     },
     CommandItem {
+        cmd: Command::GoToImage,
         name: "Go to Image",
-        description: "Go to an image by index or relative offset (e.g. 40, +10, -10)",
+        description: "Jump to a specific image index",
     },
     CommandItem {
+        cmd: Command::SetBrightness,
         name: "Set Brightness",
         description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
     },
     CommandItem {
+        cmd: Command::SetContrast,
         name: "Set Contrast",
         description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
     },
     CommandItem {
+        cmd: Command::SetScaleNone,
         name: "Set Scale: None",
         description: "Do not scale the image (show at actual size 1:1)",
     },
     CommandItem {
+        cmd: Command::SetScaleShrink,
         name: "Set Scale: Shrink to Fit",
         description: "Scale larger images down to fit, leave smaller images untouched",
     },
     CommandItem {
+        cmd: Command::SetScaleFit,
         name: "Set Scale: Fit View",
         description: "Scale images up or down to fit the viewport perfectly",
     },
     CommandItem {
+        cmd: Command::SetScaleCrop,
         name: "Set Scale: Crop to Fill",
         description: "Scale images to completely fill the viewport (cropping excess)",
     },
     CommandItem {
+        cmd: Command::CycleScaleMode,
         name: "Cycle Scale Mode",
         description: "Rotate through the different scaling modes (None -> Shrink -> Fit -> Crop)",
     },
     CommandItem {
+        cmd: Command::PredefinedZoomIn,
         name: "Predefined Zoom In",
         description: "Jump to the next predefined zoom level (Crop, 1:1, 2:1, 4:1)",
     },
     CommandItem {
+        cmd: Command::PredefinedZoomOut,
         name: "Predefined Zoom Out",
         description: "Jump to the previous predefined zoom level",
     },
@@ -919,77 +1023,83 @@ impl App {
         self.needs_update = true;
     }
 
-    pub fn execute_command(&mut self, name: &str) {
-        match name {
-            "Show Help" => {
+    pub fn execute_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::ShowHelp => {
                 self.show_help = true;
                 self.needs_clear = true;
             }
-            "Reset View" => self.reset_view(),
-            "Actual Size" => self.set_actual_size(),
-            "Rotate Clockwise" => self.rotate_clockwise(),
-            "Rotate Counter-Clockwise" => self.rotate_counter_clockwise(),
-            "Next Image" => self.next_image(),
-            "Previous Image" => self.prev_image(),
-            "Zoom In" => self.zoom_in(),
-            "Zoom Out" => self.zoom_out(),
-            "Quit" => self.running = false,
-            "Set Filter: Nearest" => {
+            Command::ResetView => self.reset_view(),
+            Command::ActualSize => self.set_actual_size(),
+            Command::RotateClockwise => self.rotate_clockwise(),
+            Command::RotateCounterClockwise => self.rotate_counter_clockwise(),
+            Command::NextImage => self.next_image(),
+            Command::PreviousImage => self.prev_image(),
+            Command::ZoomIn => self.zoom_in(),
+            Command::ZoomOut => self.zoom_out(),
+            Command::Quit => self.running = false,
+            Command::SetFilterNearest => {
                 self.filter_type = FilterType::Nearest;
                 self.needs_update = true;
             }
-            "Set Filter: Linear" => {
+            Command::SetFilterLinear => {
                 self.filter_type = FilterType::Triangle;
                 self.needs_update = true;
             }
-            "Set Filter: Cubic" => {
+            Command::SetFilterCubic => {
                 self.filter_type = FilterType::CatmullRom;
                 self.needs_update = true;
             }
-            "Set Filter: Mitchell" => {
+            Command::SetFilterMitchell => {
                 self.filter_type = FilterType::Mitchell;
                 self.needs_update = true;
             }
-            "Set Filter: Gaussian" => {
+            Command::SetFilterGaussian => {
                 self.filter_type = FilterType::Gaussian;
                 self.needs_update = true;
             }
-            "Set Filter: Lanczos" => {
+            Command::SetFilterLanczos => {
                 self.filter_type = FilterType::Lanczos3;
                 self.needs_update = true;
             }
-            "Set Filter: Hamming" => {
+            Command::SetFilterHamming => {
                 self.filter_type = FilterType::Hamming;
                 self.needs_update = true;
             }
-            "Next Filter" => self.cycle_filter(),
-            "Go to Image" => self.open_prompt(PromptType::GoToImage),
-            "Set Brightness" => self.open_prompt(PromptType::SetBrightness),
-            "Set Contrast" => self.open_prompt(PromptType::SetContrast),
-            "Set Scale: None" => {
+            Command::NextFilter => self.cycle_filter(),
+            Command::GoToImage => self.open_prompt(PromptType::GoToImage),
+            Command::SetBrightness => self.open_prompt(PromptType::SetBrightness),
+            Command::SetContrast => self.open_prompt(PromptType::SetContrast),
+            Command::SetScaleNone => {
                 self.scale_mode = ScaleMode::None;
                 self.apply_scale_mode();
             }
-            "Set Scale: Shrink to Fit" => {
+            Command::SetScaleShrink => {
                 self.scale_mode = ScaleMode::Shrink;
                 self.apply_scale_mode();
             }
-            "Set Scale: Fit View" => {
+            Command::SetScaleFit => {
                 self.scale_mode = ScaleMode::Full;
                 self.apply_scale_mode();
             }
-            "Set Scale: Crop to Fill" => {
+            Command::SetScaleCrop => {
                 self.scale_mode = ScaleMode::Crop;
                 self.apply_scale_mode();
             }
-            "Cycle Scale Mode" => self.cycle_scale_mode(),
-            "Increase Brightness" => self.increase_brightness(),
-            "Decrease Brightness" => self.decrease_brightness(),
-            "Increase Contrast" => self.increase_contrast(),
-            "Decrease Contrast" => self.decrease_contrast(),
-            "Predefined Zoom In" => self.jump_zoom_in(),
-            "Predefined Zoom Out" => self.jump_zoom_out(),
-            _ => {}
+            Command::CycleScaleMode => self.cycle_scale_mode(),
+            Command::IncreaseBrightness => self.increase_brightness(),
+            Command::DecreaseBrightness => self.decrease_brightness(),
+            Command::IncreaseContrast => self.increase_contrast(),
+            Command::DecreaseContrast => self.decrease_contrast(),
+            Command::PredefinedZoomIn => self.jump_zoom_in(),
+            Command::PredefinedZoomOut => self.jump_zoom_out(),
+            Command::PanLeft => self.pan_left(),
+            Command::PanRight => self.pan_right(),
+            Command::PanUp => self.pan_up(),
+            Command::PanDown => self.pan_down(),
+            Command::ToggleHelp => self.toggle_help(),
+            Command::CommandPalette => self.open_palette(PaletteMode::Command),
+            Command::FileSearch => self.open_palette(PaletteMode::File),
         }
     }
 
@@ -2630,8 +2740,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if !cmds.is_empty()
                                             && app.palette_selected_index < cmds.len()
                                         {
-                                            let cmd_name = cmds[app.palette_selected_index].name;
-                                            app.execute_command(cmd_name);
+                                            let cmd = cmds[app.palette_selected_index].cmd;
+                                            app.execute_command(cmd);
                                         }
                                         if app.palette_mode == PaletteMode::Command {
                                             app.palette_mode = PaletteMode::Closed;
@@ -2742,116 +2852,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            if !key_handled {
-                                match key.code {
-                                    KeyCode::Char('q') | KeyCode::Esc => {
-                                        app.running = false;
-                                    }
-                                    KeyCode::Char('?') | KeyCode::Char('/') => {
-                                        app.toggle_help();
-                                    }
-                                    // Command Palette
-                                    KeyCode::Char(':') => {
-                                        app.open_palette(PaletteMode::Command);
-                                    }
-                                    // File Palette
-                                    KeyCode::Char('f') => {
-                                        app.open_palette(PaletteMode::File);
-                                    }
-                                    // Next image
-                                    KeyCode::Char('n')
-                                    | KeyCode::Char(' ')
-                                    | KeyCode::Char(']') => {
-                                        app.next_image();
-                                    }
-                                    // Prev image
-                                    KeyCode::Char('p')
-                                    | KeyCode::Char('[')
-                                    | KeyCode::Backspace => {
-                                        app.prev_image();
-                                    }
-                                    // Zoom
-                                    KeyCode::Char('i')
-                                    | KeyCode::Char('+')
-                                    | KeyCode::Char('=') => {
-                                        app.zoom_in();
-                                    }
-                                    KeyCode::Char('o') | KeyCode::Char('-') => {
-                                        app.zoom_out();
-                                    }
-                                    KeyCode::Char('I') => {
-                                        app.jump_zoom_in();
-                                    }
-                                    KeyCode::Char('O') => {
-                                        app.jump_zoom_out();
-                                    }
-                                    // Actual size
-                                    KeyCode::Char('a') => {
-                                        app.set_actual_size();
-                                    }
-                                    // Reset
-                                    KeyCode::Char('r') => {
-                                        app.reset_view();
-                                    }
-                                    // Brightness
-                                    KeyCode::Char('b') => {
-                                        app.increase_brightness();
-                                    }
-                                    KeyCode::Char('B') => {
-                                        app.decrease_brightness();
-                                    }
-                                    // Contrast
-                                    KeyCode::Char('c') => {
-                                        app.increase_contrast();
-                                    }
-                                    KeyCode::Char('C') => {
-                                        app.decrease_contrast();
-                                    }
-                                    // Rotation
-                                    KeyCode::Char('e')
-                                    | KeyCode::Char('R')
-                                    | KeyCode::Char('>') => {
-                                        app.rotate_clockwise();
-                                    }
-                                    KeyCode::Char('E') | KeyCode::Char('<') => {
-                                        app.rotate_counter_clockwise();
-                                    }
-                                    // Cycle Filter
-                                    KeyCode::Char('S') => {
-                                        app.cycle_filter();
-                                    }
-                                    // Cycle Scale Mode
-                                    KeyCode::Char('s') => {
-                                        app.cycle_scale_mode();
-                                    }
-                                    // Vim Navigation (Pan)
-                                    KeyCode::Char('h') => {
-                                        app.pan_left();
-                                    }
-                                    KeyCode::Char('l') => {
-                                        app.pan_right();
-                                    }
-                                    KeyCode::Char('k') => {
-                                        app.pan_up();
-                                    }
-                                    KeyCode::Char('j') => {
-                                        app.pan_down();
-                                    }
-                                    // Arrow Keys (Pan)
-                                    KeyCode::Left => {
-                                        app.pan_left();
-                                    }
-                                    KeyCode::Right => {
-                                        app.pan_right();
-                                    }
-                                    KeyCode::Up => {
-                                        app.pan_up();
-                                    }
-                                    KeyCode::Down => {
-                                        app.pan_down();
-                                    }
-                                    _ => {}
-                                }
+                            if !key_handled && let Some(cmd) = Command::from_key(key) {
+                                app.execute_command(cmd);
                             }
                         }
                     }
@@ -2863,10 +2865,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         match mouse_event.kind {
                             MouseEventKind::ScrollUp => {
-                                app.zoom_in();
+                                app.execute_command(Command::ZoomIn);
                             }
                             MouseEventKind::ScrollDown => {
-                                app.zoom_out();
+                                app.execute_command(Command::ZoomOut);
                             }
                             _ => {}
                         }
