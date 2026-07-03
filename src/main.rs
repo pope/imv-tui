@@ -523,6 +523,10 @@ const COMMANDS: &[CommandItem] = &[
         name: "Decrease Contrast",
         description: "Decrease image contrast (-10%)",
     },
+    CommandItem {
+        name: "Next Filter",
+        description: "Cycle to the next image scaling filter",
+    },
 ];
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -767,6 +771,19 @@ impl App {
         }
     }
 
+    pub fn cycle_filter(&mut self) {
+        self.filter_type = match self.filter_type {
+            FilterType::Nearest => FilterType::Hamming,
+            FilterType::Hamming => FilterType::Triangle,
+            FilterType::Triangle => FilterType::CatmullRom,
+            FilterType::CatmullRom => FilterType::Mitchell,
+            FilterType::Mitchell => FilterType::Gaussian,
+            FilterType::Gaussian => FilterType::Lanczos3,
+            FilterType::Lanczos3 => FilterType::Nearest,
+        };
+        self.needs_update = true;
+    }
+
     pub fn execute_command(&mut self, name: &str) {
         match name {
             "Show Help" => {
@@ -810,6 +827,7 @@ impl App {
                 self.filter_type = FilterType::Hamming;
                 self.needs_update = true;
             }
+            "Next Filter" => self.cycle_filter(),
             "Increase Brightness" => self.increase_brightness(),
             "Decrease Brightness" => self.decrease_brightness(),
             "Increase Contrast" => self.increase_contrast(),
@@ -1612,6 +1630,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
             ]),
             Line::from(vec!["  e, R, >        ".cyan(), "- Rotate CW 90°".into()]),
             Line::from(vec!["  E, <           ".cyan(), "- Rotate CCW 90°".into()]),
+            Line::from(vec![
+                "  S              ".cyan(),
+                "- Next scaling filter".into(),
+            ]),
             Line::from(vec!["  :              ".cyan(), "- Command Palette".into()]),
             Line::from(vec!["  f              ".cyan(), "- File Search".into()]),
             Line::from(vec!["  Mouse Scroll   ".cyan(), "- Zoom In / Out".into()]),
@@ -2147,6 +2169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     KeyCode::Char('E') | KeyCode::Char('<') => {
                                         app.rotate_counter_clockwise();
+                                    }
+                                    // Cycle Filter
+                                    KeyCode::Char('S') => {
+                                        app.cycle_filter();
                                     }
                                     // Vim Navigation (Pan)
                                     KeyCode::Char('h') => {
