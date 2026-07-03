@@ -449,6 +449,7 @@ pub enum PromptType {
     GoToImage,
     SetBrightness,
     SetContrast,
+    SetSlideshow,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -521,6 +522,9 @@ pub enum Command {
     PanUp,
     PanDown,
     ToggleHelp,
+    SlideshowIncrease,
+    SlideshowDecrease,
+    SetSlideshow,
 }
 
 impl Command {
@@ -533,6 +537,7 @@ impl Command {
                     CommandGroup::Brightness(b) => b,
                     CommandGroup::Contrast(b) => b,
                     CommandGroup::Pan(b) => b,
+                    CommandGroup::Slideshow(b) => b,
                 };
                 for bind in bindings {
                     if bind.matches(key) {
@@ -662,6 +667,7 @@ pub enum CommandGroup {
     Brightness(&'static [KeyDef]),
     Contrast(&'static [KeyDef]),
     Pan(&'static [KeyDef]),
+    Slideshow(&'static [KeyDef]),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -969,6 +975,24 @@ impl Command {
                 show_in_palette: true,
                 group: CommandGroup::Normal(&[KeyDef::Char('f')]),
             }],
+            Self::SlideshowIncrease => &[CommandItem {
+                name: "Increase Slideshow",
+                description: "Increase slideshow by 1s",
+                show_in_palette: true,
+                group: CommandGroup::Slideshow(&[KeyDef::Char('t')]),
+            }],
+            Self::SlideshowDecrease => &[CommandItem {
+                name: "Decrease Slideshow",
+                description: "Decrease slideshow by 1s",
+                show_in_palette: true,
+                group: CommandGroup::Slideshow(&[KeyDef::Char('T')]),
+            }],
+            Self::SetSlideshow => &[CommandItem {
+                name: "Set Slideshow",
+                description: "Set slideshow duration in seconds or offset (e.g. 5, +1, -1)",
+                show_in_palette: true,
+                group: CommandGroup::Hidden,
+            }],
         }
     }
 }
@@ -1042,6 +1066,8 @@ pub struct App {
     pub brightness: i32,
     pub contrast: f32,
     prefetch_cache: PrefetchCache,
+    pub slideshow_seconds: u32,
+    pub slideshow_last_transition: std::time::Instant,
 }
 
 impl App {
@@ -1162,6 +1188,8 @@ impl App {
             brightness: 0,
             contrast: 0.0,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            slideshow_seconds: 0,
+            slideshow_last_transition: std::time::Instant::now(),
         };
 
         app.start_load_image();
@@ -1388,6 +1416,15 @@ impl App {
             Command::ToggleHelp => self.toggle_help(),
             Command::CommandPalette => self.open_palette(PaletteMode::Command),
             Command::FileSearch => self.open_palette(PaletteMode::File),
+            Command::SlideshowIncrease => {
+                self.slideshow_seconds = self.slideshow_seconds.saturating_add(1).max(1);
+                self.slideshow_last_transition = std::time::Instant::now();
+            }
+            Command::SlideshowDecrease => {
+                self.slideshow_seconds = self.slideshow_seconds.saturating_sub(1);
+                self.slideshow_last_transition = std::time::Instant::now();
+            }
+            Command::SetSlideshow => self.open_prompt(PromptType::SetSlideshow),
         }
     }
 
@@ -1500,6 +1537,27 @@ impl App {
                     }
                 }
             }
+            PromptType::SetSlideshow => {
+                let input = self.palette_query.trim();
+                if !input.is_empty() {
+                    let mut new_val = self.slideshow_seconds;
+                    if let Some(stripped) = input.strip_prefix('+') {
+                        if let Ok(offset) = stripped.parse::<u32>() {
+                            new_val = self.slideshow_seconds.saturating_add(offset);
+                        }
+                    } else if let Some(stripped) = input.strip_prefix('-') {
+                        if let Ok(offset) = stripped.parse::<u32>() {
+                            new_val = self.slideshow_seconds.saturating_sub(offset);
+                        }
+                    } else if let Ok(val) = input.parse::<u32>() {
+                        new_val = val;
+                    }
+                    if new_val != self.slideshow_seconds {
+                        self.slideshow_seconds = new_val;
+                        self.slideshow_last_transition = std::time::Instant::now();
+                    }
+                }
+            }
         }
         self.palette_mode = PaletteMode::Closed;
         self.prompt_type = None;
@@ -1573,6 +1631,7 @@ impl App {
 
         self.error_message = None;
         self.clear_on_protocol_receive = true;
+        self.slideshow_last_transition = std::time::Instant::now();
 
         // Check if the image is in the prefetch cache
         let cached = {
@@ -2453,6 +2512,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         if app.contrast != 0.0 {
             extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
         }
+        if app.slideshow_seconds > 0 {
+            extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_seconds));
+        }
 
         let title_text = format!(" {} {} ", app.current_icon, app.current_filename());
         let status_block = Block::default()
@@ -2516,6 +2578,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let mut printed_contrast = false;
         let mut printed_pan_vim = false;
         let mut printed_pan_arrows = false;
+        let mut printed_slideshow = false;
 
         for cmd in <Command as strum::IntoEnumIterator>::iter() {
             for def in cmd.get_metadata() {
@@ -2573,6 +2636,15 @@ fn ui(frame: &mut Frame, app: &mut App) {
                             }
                         }
                     }
+                    CommandGroup::Slideshow(_) => {
+                        if !printed_slideshow {
+                            printed_slideshow = true;
+                            help_lines.push(Line::from(vec![
+                                format!("  {:<15}", "t, T").cyan(),
+                                "- Slideshow +/- 1s".into(),
+                            ]));
+                        }
+                    }
                 }
             }
         }
@@ -2608,12 +2680,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Some(PromptType::GoToImage) => " Go to Image ",
                 Some(PromptType::SetBrightness) => " Set Brightness ",
                 Some(PromptType::SetContrast) => " Set Contrast ",
+                Some(PromptType::SetSlideshow) => " Set Slideshow ",
                 None => " Input ",
             };
             let prompt_label = match app.prompt_type {
                 Some(PromptType::GoToImage) => "Enter index (e.g. 40, +10, -10):",
                 Some(PromptType::SetBrightness) => "Enter brightness (e.g. 50, +10, -10):",
                 Some(PromptType::SetContrast) => "Enter contrast % (e.g. 20, +5, -5):",
+                Some(PromptType::SetSlideshow) => {
+                    "Enter slideshow delay in seconds (e.g. 5, +1, -1):"
+                }
                 None => "Enter value:",
             };
 
@@ -2847,6 +2923,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut filter_opt = None;
     let mut protocol_opt = None;
     let mut scale_opt = None;
+    let mut slideshow_opt = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -2884,6 +2961,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--slideshow" | "-t" => {
+                if i + 1 < args.len() {
+                    if let Ok(sec) = args[i + 1].parse::<u32>() {
+                        slideshow_opt = Some(sec);
+                    } else {
+                        eprintln!("Error: -t / --slideshow requires a positive integer argument");
+                        std::process::exit(1);
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("Error: -t / --slideshow requires an argument");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -2898,6 +2989,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!(
                     "  -s, --scale <mode>         Initial image scaling mode: none, actual, shrink, full, crop (defaults to shrink)"
+                );
+                println!(
+                    "  -t, --slideshow <seconds>  Start the slideshow with the given delay in seconds"
                 );
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
@@ -3004,10 +3098,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    if let Some(sec) = slideshow_opt {
+        app.slideshow_seconds = sec;
+        app.slideshow_last_transition = std::time::Instant::now();
+    }
 
     // Main event loop
     while app.running {
         app.update_channels();
+
+        // Automatic slideshow transition
+        if app.slideshow_seconds > 0
+            && !app.is_loading
+            && app.slideshow_last_transition.elapsed()
+                >= std::time::Duration::from_secs(app.slideshow_seconds as u64)
+        {
+            app.next_image();
+            app.slideshow_last_transition = std::time::Instant::now();
+        }
 
         if app.needs_clear_once {
             app.needs_clear_once = false;
