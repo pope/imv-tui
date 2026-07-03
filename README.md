@@ -2,7 +2,7 @@
 
 `imv-tui` is a fast, keyboard-driven terminal image viewer written in Rust. Heavily inspired by the native `imv` image viewer, it enables zooming, panning, rotation, and directory-based navigation directly inside your terminal window.
 
-![imv-tui Screenshot](screenshots/01.png)
+![imv-tui Screenshot](https://p0.pe/my-git-repos/imv-tui.git/plain/screenshots/01.png)
 
 It is built on top of [`ratatui`](https://crates.io/crates/ratatui) and [`ratatui-image`](https://crates.io/crates/ratatui-image).
 
