@@ -588,27 +588,6 @@ const COMMANDS: &[CommandItem] = &[
     },
 ];
 
-fn fuzzy_match(text: &str, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let mut text_chars = text.chars();
-    for q_char in query.chars() {
-        let mut found = false;
-        let q_lower = q_char.to_lowercase();
-        for t_char in text_chars.by_ref() {
-            if t_char.to_lowercase().eq(q_lower.clone()) {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return false;
-        }
-    }
-    true
-}
-
 type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32)>>>;
 
 /// App state
@@ -650,6 +629,7 @@ pub struct App {
     pub prompt_type: Option<PromptType>,
     pub filter_type: FilterType,
     pub scale_mode: ScaleMode,
+    pub matcher: nucleo::Matcher,
 
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
@@ -770,6 +750,7 @@ impl App {
             prompt_type: None,
             filter_type,
             scale_mode,
+            matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT),
             resize_tx,
             protocol_rx,
             loader_tx,
@@ -789,39 +770,96 @@ impl App {
         Ok(app)
     }
 
-    pub fn get_filtered_files(&self) -> Vec<(usize, String)> {
-        let query_lower = self.palette_query.to_lowercase();
-        self.display_names
+    pub fn get_filtered_files(&mut self) -> Vec<(usize, String)> {
+        let query = &self.palette_query;
+        if query.is_empty() {
+            return self
+                .display_names
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| (idx, name.clone()))
+                .collect();
+        }
+
+        let pattern = nucleo::pattern::Pattern::parse(
+            query,
+            nucleo::pattern::CaseMatching::Ignore,
+            nucleo::pattern::Normalization::Smart,
+        );
+
+        #[derive(Clone)]
+        struct FileCandidate {
+            index: usize,
+            name: String,
+        }
+        impl AsRef<str> for FileCandidate {
+            fn as_ref(&self) -> &str {
+                &self.name
+            }
+        }
+
+        let candidates: Vec<FileCandidate> = self
+            .display_names_lowercase
             .iter()
             .enumerate()
-            .filter(|(idx, _)| {
-                let file_lower = &self.display_names_lowercase[*idx];
-                let mut file_chars = file_lower.chars();
-                for q_char in query_lower.chars() {
-                    let mut found = false;
-                    for f_char in file_chars.by_ref() {
-                        if f_char == q_char {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        return false;
-                    }
-                }
-                true
+            .map(|(index, name)| FileCandidate {
+                index,
+                name: name.clone(),
             })
-            .map(|(idx, name)| (idx, name.clone()))
+            .collect();
+
+        let mut matches = pattern.match_list(candidates, &mut self.matcher);
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.index.cmp(&b.0.index)));
+
+        matches
+            .into_iter()
+            .map(|(candidate, _score)| {
+                (candidate.index, self.display_names[candidate.index].clone())
+            })
             .collect()
     }
 
-    pub fn get_filtered_commands(&self) -> Vec<&'static CommandItem> {
-        COMMANDS
+    pub fn get_filtered_commands(&mut self) -> Vec<&'static CommandItem> {
+        let query = &self.palette_query;
+        if query.is_empty() {
+            return COMMANDS.iter().collect();
+        }
+
+        let pattern = nucleo::pattern::Pattern::parse(
+            query,
+            nucleo::pattern::CaseMatching::Ignore,
+            nucleo::pattern::Normalization::Smart,
+        );
+
+        #[derive(Clone)]
+        struct CmdCandidate {
+            cmd_index: usize,
+            search_text: String,
+        }
+        impl AsRef<str> for CmdCandidate {
+            fn as_ref(&self) -> &str {
+                &self.search_text
+            }
+        }
+
+        let candidates: Vec<CmdCandidate> = COMMANDS
             .iter()
-            .filter(|cmd| {
-                fuzzy_match(cmd.name, &self.palette_query)
-                    || fuzzy_match(cmd.description, &self.palette_query)
+            .enumerate()
+            .map(|(cmd_index, cmd)| CmdCandidate {
+                cmd_index,
+                search_text: format!("{} {}", cmd.name, cmd.description),
             })
+            .collect();
+
+        let mut matches = pattern.match_list(candidates, &mut self.matcher);
+        matches.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.cmd_index.cmp(&b.0.cmd_index))
+        });
+
+        matches
+            .into_iter()
+            .map(|(candidate, _score)| &COMMANDS[candidate.cmd_index])
             .collect()
     }
 
@@ -1971,7 +2009,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let mut lines = vec![
                 Line::from(vec![
                     " > ".bold().cyan(),
-                    app.palette_query.as_str().into(),
+                    app.palette_query.clone().into(),
                     "▊".cyan(), // cursor block
                 ]),
                 Line::from("──────────────────────────────────────────────────────────".gray()),
