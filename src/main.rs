@@ -427,10 +427,16 @@ impl ImageSource {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PromptType {
+    GoToImage,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     Closed,
     Command,
     File,
+    Prompt,
 }
 
 pub struct CommandItem {
@@ -527,6 +533,10 @@ const COMMANDS: &[CommandItem] = &[
         name: "Next Filter",
         description: "Cycle to the next image scaling filter",
     },
+    CommandItem {
+        name: "Go to Image",
+        description: "Go to an image by index or relative offset (e.g. 40, +10, -10)",
+    },
 ];
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -588,6 +598,7 @@ pub struct App {
     pub palette_selected_index: usize,
     pub palette_width: u16,
     pub palette_height: u16,
+    pub prompt_type: Option<PromptType>,
     pub filter_type: FilterType,
 
     // Thread communication channels
@@ -705,6 +716,7 @@ impl App {
             palette_selected_index: 0,
             palette_width: 0,
             palette_height: 0,
+            prompt_type: None,
             filter_type,
             resize_tx,
             protocol_rx,
@@ -830,6 +842,7 @@ impl App {
                 self.needs_update = true;
             }
             "Next Filter" => self.cycle_filter(),
+            "Go to Image" => self.open_prompt(PromptType::GoToImage),
             "Increase Brightness" => self.increase_brightness(),
             "Decrease Brightness" => self.decrease_brightness(),
             "Increase Contrast" => self.increase_contrast(),
@@ -865,6 +878,47 @@ impl App {
 
         self.palette_width = max_text_width + 5;
         self.palette_height = 0;
+    }
+
+    pub fn open_prompt(&mut self, prompt_type: PromptType) {
+        self.palette_mode = PaletteMode::Prompt;
+        self.prompt_type = Some(prompt_type);
+        self.palette_query.clear();
+        self.palette_selected_index = 0;
+        self.palette_width = 45;
+        self.palette_height = 0;
+        self.needs_clear = true;
+    }
+
+    pub fn execute_prompt(&mut self, prompt_type: PromptType) {
+        match prompt_type {
+            PromptType::GoToImage => {
+                let input = self.palette_query.trim();
+                if !input.is_empty() && !self.images.is_empty() {
+                    let mut new_idx = self.current_index;
+                    if let Some(stripped) = input.strip_prefix('+') {
+                        if let Ok(offset) = stripped.parse::<usize>() {
+                            new_idx = (self.current_index + offset).min(self.images.len() - 1);
+                        }
+                    } else if let Some(stripped) = input.strip_prefix('-') {
+                        if let Ok(offset) = stripped.parse::<usize>() {
+                            new_idx = self.current_index.saturating_sub(offset);
+                        }
+                    } else if let Ok(Some(val_minus_1)) =
+                        input.parse::<usize>().map(|v| v.checked_sub(1))
+                    {
+                        new_idx = val_minus_1.min(self.images.len() - 1);
+                    }
+                    if new_idx != self.current_index {
+                        self.current_index = new_idx;
+                        self.start_load_image();
+                    }
+                }
+            }
+        }
+        self.palette_mode = PaletteMode::Closed;
+        self.prompt_type = None;
+        self.needs_clear_once = true;
     }
 
     /// Start loading the image at the current index in the background
@@ -1667,160 +1721,206 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     // Command / File Palette popup
     if app.palette_mode != PaletteMode::Closed {
-        let title = match app.palette_mode {
-            PaletteMode::File => " File Search ",
-            PaletteMode::Command => " Command Palette ",
-            _ => "",
-        };
+        if app.palette_mode == PaletteMode::Prompt {
+            let prompt_title = match app.prompt_type {
+                Some(PromptType::GoToImage) => " Go to Image ",
+                None => " Input ",
+            };
+            let prompt_label = match app.prompt_type {
+                Some(PromptType::GoToImage) => "Enter index (e.g. 40, +10, -10):",
+                None => "Enter value:",
+            };
 
-        // Determine dynamic visible_count and palette_height
-        let total_items = match app.palette_mode {
-            PaletteMode::File => app.get_filtered_files().len(),
-            PaletteMode::Command => app.get_filtered_commands().len(),
-            _ => 0,
-        };
-        let max_height = (chunks[0].height as f64 * 0.5).round() as u16;
-        let mut palette_h = (total_items as u16 + 4).max(12);
-        palette_h = palette_h.min(max_height);
+            let lines = vec![
+                Line::from(format!("   {}", prompt_label).gray()),
+                Line::from(vec![
+                    " > ".bold().cyan(),
+                    app.palette_query.as_str().into(),
+                    "▊".cyan(), // cursor block
+                ]),
+            ];
 
-        if app.palette_height != palette_h {
-            app.palette_height = palette_h;
-            app.needs_clear_once = true;
-        }
+            let w = 45.min(chunks[0].width.saturating_sub(1));
+            let h = 5.min(chunks[0].height.saturating_sub(1));
 
-        let visible_count = (app.palette_height as usize).saturating_sub(4);
-        let palette_height = app.palette_height;
-
-        let mut lines = vec![
-            Line::from(vec![
-                " > ".bold().cyan(),
-                app.palette_query.as_str().into(),
-                "▊".cyan(), // cursor block
-            ]),
-            Line::from("──────────────────────────────────────────────────────────".gray()),
-        ];
-
-        match app.palette_mode {
-            PaletteMode::File => {
-                let filtered_files = app.get_filtered_files();
-                if !filtered_files.is_empty() {
-                    app.palette_selected_index =
-                        app.palette_selected_index.min(filtered_files.len() - 1);
-                } else {
-                    app.palette_selected_index = 0;
-                }
-
-                let total_files = filtered_files.len();
-                let half_visible = visible_count / 2;
-                let start_idx = if total_files <= visible_count
-                    || app.palette_selected_index < half_visible
-                {
-                    0
-                } else if app.palette_selected_index >= total_files.saturating_sub(half_visible) {
-                    total_files.saturating_sub(visible_count)
-                } else {
-                    app.palette_selected_index.saturating_sub(half_visible)
-                };
-
-                for (i, (_, filename)) in filtered_files
-                    .iter()
-                    .enumerate()
-                    .skip(start_idx)
-                    .take(visible_count)
-                {
-                    let mut line = Line::from(format!("   {}", filename));
-                    if i == app.palette_selected_index {
-                        line = Line::from(format!(" > {}", filename))
-                            .bold()
-                            .yellow()
-                            .on_blue();
-                    }
-                    lines.push(line);
-                }
-
-                if filtered_files.is_empty() {
-                    lines.push(Line::from("   No matches found.".gray().italic()));
-                }
+            if app.palette_height != h {
+                app.palette_height = h;
+                app.needs_clear_once = true;
             }
-            PaletteMode::Command => {
-                let filtered_commands = app.get_filtered_commands();
-                if !filtered_commands.is_empty() {
-                    app.palette_selected_index =
-                        app.palette_selected_index.min(filtered_commands.len() - 1);
-                } else {
-                    app.palette_selected_index = 0;
-                }
 
-                let total_cmds = filtered_commands.len();
-                let half_visible = visible_count / 2;
-                let start_idx = if total_cmds <= visible_count
-                    || app.palette_selected_index < half_visible
-                {
-                    0
-                } else if app.palette_selected_index >= total_cmds.saturating_sub(half_visible) {
-                    total_cmds.saturating_sub(visible_count)
-                } else {
-                    app.palette_selected_index.saturating_sub(half_visible)
-                };
+            let palette_block = Block::default()
+                .title(prompt_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
 
-                for (i, cmd) in filtered_commands
-                    .iter()
-                    .enumerate()
-                    .skip(start_idx)
-                    .take(visible_count)
-                {
-                    let cmd_line = vec![
+            let palette_paragraph = Paragraph::new(lines)
+                .block(palette_block)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+            let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+            let y = chunks[0].y.saturating_add(1);
+
+            let popup_area = Rect::new(x, y, w, h);
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(palette_paragraph, popup_area);
+        } else {
+            let title = match app.palette_mode {
+                PaletteMode::File => " File Search ",
+                PaletteMode::Command => " Command Palette ",
+                _ => "",
+            };
+
+            // Determine dynamic visible_count and palette_height
+            let total_items = match app.palette_mode {
+                PaletteMode::File => app.get_filtered_files().len(),
+                PaletteMode::Command => app.get_filtered_commands().len(),
+                _ => 0,
+            };
+            let max_height = (chunks[0].height as f64 * 0.5).round() as u16;
+            let mut palette_h = (total_items as u16 + 4).max(12);
+            palette_h = palette_h.min(max_height);
+
+            if app.palette_height != palette_h {
+                app.palette_height = palette_h;
+                app.needs_clear_once = true;
+            }
+
+            let visible_count = (app.palette_height as usize).saturating_sub(4);
+            let palette_height = app.palette_height;
+
+            let mut lines = vec![
+                Line::from(vec![
+                    " > ".bold().cyan(),
+                    app.palette_query.as_str().into(),
+                    "▊".cyan(), // cursor block
+                ]),
+                Line::from("──────────────────────────────────────────────────────────".gray()),
+            ];
+
+            match app.palette_mode {
+                PaletteMode::File => {
+                    let filtered_files = app.get_filtered_files();
+                    if !filtered_files.is_empty() {
+                        app.palette_selected_index =
+                            app.palette_selected_index.min(filtered_files.len() - 1);
+                    } else {
+                        app.palette_selected_index = 0;
+                    }
+
+                    let total_files = filtered_files.len();
+                    let half_visible = visible_count / 2;
+                    let start_idx = if total_files <= visible_count
+                        || app.palette_selected_index < half_visible
+                    {
+                        0
+                    } else if app.palette_selected_index >= total_files.saturating_sub(half_visible)
+                    {
+                        total_files.saturating_sub(visible_count)
+                    } else {
+                        app.palette_selected_index.saturating_sub(half_visible)
+                    };
+
+                    for (i, (_, filename)) in filtered_files
+                        .iter()
+                        .enumerate()
+                        .skip(start_idx)
+                        .take(visible_count)
+                    {
+                        let mut line = Line::from(format!("   {}", filename));
                         if i == app.palette_selected_index {
-                            " > "
-                        } else {
-                            "   "
+                            line = Line::from(format!(" > {}", filename))
+                                .bold()
+                                .yellow()
+                                .on_blue();
                         }
-                        .into(),
-                        cmd.name.bold(),
-                        " - ".into(),
-                        cmd.description.gray(),
-                    ];
-                    let mut line = Line::from(cmd_line);
-                    if i == app.palette_selected_index {
-                        line = line.yellow().on_blue();
+                        lines.push(line);
                     }
-                    lines.push(line);
-                }
 
-                if filtered_commands.is_empty() {
-                    lines.push(Line::from("   No matches found.".gray().italic()));
+                    if filtered_files.is_empty() {
+                        lines.push(Line::from("   No matches found.".gray().italic()));
+                    }
                 }
+                PaletteMode::Command => {
+                    let filtered_commands = app.get_filtered_commands();
+                    if !filtered_commands.is_empty() {
+                        app.palette_selected_index =
+                            app.palette_selected_index.min(filtered_commands.len() - 1);
+                    } else {
+                        app.palette_selected_index = 0;
+                    }
+
+                    let total_cmds = filtered_commands.len();
+                    let half_visible = visible_count / 2;
+                    let start_idx = if total_cmds <= visible_count
+                        || app.palette_selected_index < half_visible
+                    {
+                        0
+                    } else if app.palette_selected_index >= total_cmds.saturating_sub(half_visible)
+                    {
+                        total_cmds.saturating_sub(visible_count)
+                    } else {
+                        app.palette_selected_index.saturating_sub(half_visible)
+                    };
+
+                    for (i, cmd) in filtered_commands
+                        .iter()
+                        .enumerate()
+                        .skip(start_idx)
+                        .take(visible_count)
+                    {
+                        let cmd_line = vec![
+                            if i == app.palette_selected_index {
+                                " > "
+                            } else {
+                                "   "
+                            }
+                            .into(),
+                            cmd.name.bold(),
+                            " - ".into(),
+                            cmd.description.gray(),
+                        ];
+                        let mut line = Line::from(cmd_line);
+                        if i == app.palette_selected_index {
+                            line = line.yellow().on_blue();
+                        }
+                        lines.push(line);
+                    }
+
+                    if filtered_commands.is_empty() {
+                        lines.push(Line::from("   No matches found.".gray().italic()));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+
+            let mut palette_width = app.palette_width;
+            let cap_width = (chunks[0].width as f64 * 0.75).round() as u16;
+            palette_width = palette_width.max(40).min(cap_width);
+
+            if lines.len() > 1 {
+                let inner_w = palette_width.saturating_sub(2) as usize;
+                lines[1] = Line::from("─".repeat(inner_w).gray());
+            }
+
+            let palette_block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+
+            let palette_paragraph = Paragraph::new(lines)
+                .block(palette_block)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+            let w = palette_width.min(chunks[0].width.saturating_sub(1));
+            let h = palette_height.min(chunks[0].height.saturating_sub(1));
+            let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+            let y = chunks[0].y.saturating_add(1);
+
+            let popup_area = Rect::new(x, y, w, h);
+
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(palette_paragraph, popup_area);
         }
-
-        let mut palette_width = app.palette_width;
-        let cap_width = (chunks[0].width as f64 * 0.75).round() as u16;
-        palette_width = palette_width.max(40).min(cap_width);
-
-        if lines.len() > 1 {
-            let inner_w = palette_width.saturating_sub(2) as usize;
-            lines[1] = Line::from("─".repeat(inner_w).gray());
-        }
-
-        let palette_block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
-
-        let palette_paragraph = Paragraph::new(lines)
-            .block(palette_block)
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-
-        let w = palette_width.min(chunks[0].width.saturating_sub(1));
-        let h = palette_height.min(chunks[0].height.saturating_sub(1));
-        let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
-        let y = chunks[0].y.saturating_add(1);
-
-        let popup_area = Rect::new(x, y, w, h);
-
-        frame.render_widget(Clear, popup_area);
-        frame.render_widget(palette_paragraph, popup_area);
     }
 }
 
@@ -2019,34 +2119,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.needs_update = true;
                                     app.needs_clear_once = true;
                                 }
-                                KeyCode::Enter => {
-                                    match app.palette_mode {
-                                        PaletteMode::File => {
-                                            let files = app.get_filtered_files();
-                                            if !files.is_empty()
-                                                && app.palette_selected_index < files.len()
-                                            {
-                                                app.current_index =
-                                                    files[app.palette_selected_index].0;
-                                                app.start_load_image();
-                                            }
+                                KeyCode::Enter => match app.palette_mode {
+                                    PaletteMode::File => {
+                                        let files = app.get_filtered_files();
+                                        if !files.is_empty()
+                                            && app.palette_selected_index < files.len()
+                                        {
+                                            app.current_index = files[app.palette_selected_index].0;
+                                            app.start_load_image();
                                         }
-                                        PaletteMode::Command => {
-                                            let cmds = app.get_filtered_commands();
-                                            if !cmds.is_empty()
-                                                && app.palette_selected_index < cmds.len()
-                                            {
-                                                let cmd_name =
-                                                    cmds[app.palette_selected_index].name;
-                                                app.execute_command(cmd_name);
-                                            }
-                                        }
-                                        _ => {}
+                                        app.palette_mode = PaletteMode::Closed;
+                                        app.needs_update = true;
+                                        app.needs_clear_once = true;
                                     }
-                                    app.palette_mode = PaletteMode::Closed;
-                                    app.needs_update = true;
-                                    app.needs_clear_once = true;
-                                }
+                                    PaletteMode::Command => {
+                                        let cmds = app.get_filtered_commands();
+                                        if !cmds.is_empty()
+                                            && app.palette_selected_index < cmds.len()
+                                        {
+                                            let cmd_name = cmds[app.palette_selected_index].name;
+                                            app.execute_command(cmd_name);
+                                        }
+                                        if app.palette_mode == PaletteMode::Command {
+                                            app.palette_mode = PaletteMode::Closed;
+                                            app.needs_update = true;
+                                            app.needs_clear_once = true;
+                                        }
+                                    }
+                                    PaletteMode::Prompt => {
+                                        if let Some(prompt_type) = app.prompt_type {
+                                            app.execute_prompt(prompt_type);
+                                        }
+                                    }
+                                    _ => {}
+                                },
                                 KeyCode::Up if app.palette_selected_index > 0 => {
                                     app.palette_selected_index -= 1;
                                 }

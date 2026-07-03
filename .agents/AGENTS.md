@@ -229,6 +229,7 @@ ______________________________________________________________________
 Recalculating a dialog or search palette's width dynamically on every character input (based on the currently filtered list) results in screen-draw artifacts (border "ghosts") when the dialog box shrinks, and creates a jittery, bouncing visual layout.
 
 However, if dynamic height shrinking is desired to fit the filtered candidates list:
+
 - **Shrinking Height Artifacts**: As the list of matched items shrinks, the target popup height decreases, leaving the old bottom border and extra text characters frozen on the terminal screen.
 - **Selective Clear Trigger**: To cleanly wipe these remnants without inducing screen flicker on every keystroke, track the previous frame's calculated palette height. If the height changes (shrinks or expands), trigger a single `needs_clear_once = true` to force an unconditional terminal screen clear prior to rendering the new layout.
 
