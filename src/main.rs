@@ -527,7 +527,14 @@ impl Command {
     pub fn from_key(key: event::KeyEvent) -> Option<Self> {
         for cmd in <Self as strum::IntoEnumIterator>::iter() {
             for def in cmd.get_metadata() {
-                for bind in def.bindings {
+                let bindings = match def.group {
+                    CommandGroup::Hidden => &[],
+                    CommandGroup::Normal(b) => b,
+                    CommandGroup::Brightness(b) => b,
+                    CommandGroup::Contrast(b) => b,
+                    CommandGroup::Pan(b) => b,
+                };
+                for bind in bindings {
                     if bind.matches(key) {
                         return Some(cmd);
                     }
@@ -649,13 +656,12 @@ impl KeyDef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelpGroup {
-    None,
-    Normal,
-    Brightness,
-    Contrast,
-    PanVim,
-    PanArrows,
+pub enum CommandGroup {
+    Hidden,
+    Normal(&'static [KeyDef]),
+    Brightness(&'static [KeyDef]),
+    Contrast(&'static [KeyDef]),
+    Pan(&'static [KeyDef]),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -663,8 +669,7 @@ pub struct CommandItem {
     pub name: &'static str,
     pub description: &'static str,
     pub show_in_palette: bool,
-    pub help_group: HelpGroup,
-    pub bindings: &'static [KeyDef],
+    pub group: CommandGroup,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -680,281 +685,289 @@ impl Command {
                 name: "Show Help",
                 description: "Toggle Help",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('?'), KeyDef::Char('/')],
+                group: CommandGroup::Normal(&[KeyDef::Char('?'), KeyDef::Char('/')]),
             }],
             Self::ResetView => &[CommandItem {
                 name: "Reset View",
                 description: "Reset View",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('r')],
+                group: CommandGroup::Normal(&[KeyDef::Char('r')]),
             }],
             Self::ActualSize => &[CommandItem {
                 name: "Actual Size",
                 description: "Actual Size",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('a')],
+                group: CommandGroup::Normal(&[KeyDef::Char('a')]),
             }],
             Self::RotateClockwise => &[CommandItem {
                 name: "Rotate Clockwise",
                 description: "Rotate CW 90°",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('e'), KeyDef::Char('R'), KeyDef::Char('>')],
+                group: CommandGroup::Normal(&[
+                    KeyDef::Char('e'),
+                    KeyDef::Char('R'),
+                    KeyDef::Char('>'),
+                ]),
             }],
             Self::RotateCounterClockwise => &[CommandItem {
                 name: "Rotate Counter-Clockwise",
                 description: "Rotate CCW 90°",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('E'), KeyDef::Char('<')],
+                group: CommandGroup::Normal(&[KeyDef::Char('E'), KeyDef::Char('<')]),
             }],
             Self::NextImage => &[CommandItem {
                 name: "Next Image",
                 description: "Next image",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('n'), KeyDef::Char(' '), KeyDef::Char(']')],
+                group: CommandGroup::Normal(&[
+                    KeyDef::Char('n'),
+                    KeyDef::Char(' '),
+                    KeyDef::Char(']'),
+                ]),
             }],
             Self::PreviousImage => &[CommandItem {
                 name: "Previous Image",
                 description: "Previous image",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[
+                group: CommandGroup::Normal(&[
                     KeyDef::Char('p'),
                     KeyDef::Code(event::KeyCode::Backspace),
                     KeyDef::Char('['),
-                ],
+                ]),
             }],
             Self::ZoomIn => &[
                 CommandItem {
                     name: "Zoom In",
                     description: "Zoom In",
                     show_in_palette: true,
-                    help_group: HelpGroup::Normal,
-                    bindings: &[KeyDef::Char('i'), KeyDef::Char('+'), KeyDef::Char('=')],
+                    group: CommandGroup::Normal(&[
+                        KeyDef::Char('i'),
+                        KeyDef::Char('+'),
+                        KeyDef::Char('='),
+                    ]),
                 },
                 CommandItem {
                     name: "Zoom (mouse)",
                     description: "Zoom In / Out",
                     show_in_palette: false,
-                    help_group: HelpGroup::Normal,
-                    bindings: &[KeyDef::MouseScroll],
+                    group: CommandGroup::Normal(&[KeyDef::MouseScroll]),
                 },
             ],
             Self::ZoomOut => &[CommandItem {
                 name: "Zoom Out",
                 description: "Zoom Out",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('o'), KeyDef::Char('-')],
+                group: CommandGroup::Normal(&[KeyDef::Char('o'), KeyDef::Char('-')]),
             }],
             Self::Quit => &[CommandItem {
                 name: "Quit",
                 description: "Quit",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('q'), KeyDef::Code(event::KeyCode::Esc)],
+                group: CommandGroup::Normal(&[
+                    KeyDef::Char('q'),
+                    KeyDef::Code(event::KeyCode::Esc),
+                ]),
             }],
             Self::SetFilterNearest => &[CommandItem {
                 name: "Set Filter: Nearest",
                 description: "Use Nearest Neighbor scaling (sharp, pixelated)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetFilterLinear => &[CommandItem {
                 name: "Set Filter: Linear",
                 description: "Use Bilinear scaling",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetFilterCubic => &[CommandItem {
                 name: "Set Filter: Cubic",
                 description: "Use Bicubic scaling (Catmull-Rom)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetFilterMitchell => &[CommandItem {
                 name: "Set Filter: Mitchell",
                 description: "Use Mitchell-Netravali scaling",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetFilterGaussian => &[CommandItem {
                 name: "Set Filter: Gaussian",
                 description: "Use Gaussian scaling",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetFilterLanczos => &[CommandItem {
                 name: "Set Filter: Lanczos",
                 description: "Use Lanczos3 scaling (high quality)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetFilterHamming => &[CommandItem {
                 name: "Set Filter: Hamming",
                 description: "Use Hamming scaling",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::NextFilter => &[CommandItem {
                 name: "Next Filter",
                 description: "Next scaling filter",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('S')],
+                group: CommandGroup::Normal(&[KeyDef::Char('S')]),
             }],
             Self::GoToImage => &[CommandItem {
                 name: "Go to Image",
                 description: "Jump to a specific image index",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetBrightness => &[CommandItem {
                 name: "Set Brightness",
                 description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetContrast => &[CommandItem {
                 name: "Set Contrast",
                 description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetScaleNone => &[CommandItem {
                 name: "Set Scale: None",
                 description: "Do not scale the image (show at actual size 1:1)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetScaleShrink => &[CommandItem {
                 name: "Set Scale: Shrink to Fit",
                 description: "Scale larger images down to fit, leave smaller images untouched",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetScaleFit => &[CommandItem {
                 name: "Set Scale: Fit View",
                 description: "Scale images up or down to fit the viewport perfectly",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::SetScaleCrop => &[CommandItem {
                 name: "Set Scale: Crop to Fill",
                 description: "Scale images to completely fill the viewport (cropping excess)",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[],
+                group: CommandGroup::Hidden,
             }],
             Self::CycleScaleMode => &[CommandItem {
                 name: "Cycle Scale Mode",
                 description: "Cycle scale mode",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('s')],
+                group: CommandGroup::Normal(&[KeyDef::Char('s')]),
             }],
             Self::PredefinedZoomIn => &[CommandItem {
                 name: "Predefined Zoom In",
                 description: "Predefined Zoom In",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('I')],
+                group: CommandGroup::Normal(&[KeyDef::Char('I')]),
             }],
             Self::PredefinedZoomOut => &[CommandItem {
                 name: "Predefined Zoom Out",
                 description: "Predefined Zoom Out",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('O')],
+                group: CommandGroup::Normal(&[KeyDef::Char('O')]),
             }],
             Self::IncreaseBrightness => &[CommandItem {
                 name: "Increase Brightness",
                 description: "Increase brightness by 10",
                 show_in_palette: true,
-                help_group: HelpGroup::Brightness,
-                bindings: &[KeyDef::Char('b')],
+                group: CommandGroup::Brightness(&[KeyDef::Char('b')]),
             }],
             Self::DecreaseBrightness => &[CommandItem {
                 name: "Decrease Brightness",
                 description: "Decrease brightness by 10",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[KeyDef::Char('B')],
+                group: CommandGroup::Brightness(&[KeyDef::Char('B')]),
             }],
             Self::IncreaseContrast => &[CommandItem {
                 name: "Increase Contrast",
                 description: "Increase contrast by 5%",
                 show_in_palette: true,
-                help_group: HelpGroup::Contrast,
-                bindings: &[KeyDef::Char('c')],
+                group: CommandGroup::Contrast(&[KeyDef::Char('c')]),
             }],
             Self::DecreaseContrast => &[CommandItem {
                 name: "Decrease Contrast",
                 description: "Decrease contrast by 5%",
                 show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[KeyDef::Char('C')],
+                group: CommandGroup::Contrast(&[KeyDef::Char('C')]),
             }],
-            Self::PanLeft => &[CommandItem {
-                name: "Pan Left",
-                description: "Pan view left",
-                show_in_palette: true,
-                help_group: HelpGroup::PanVim,
-                bindings: &[KeyDef::Char('h'), KeyDef::Code(event::KeyCode::Left)],
-            }],
-            Self::PanRight => &[CommandItem {
-                name: "Pan Right",
-                description: "Pan view right",
-                show_in_palette: true,
-                help_group: HelpGroup::PanArrows,
-                bindings: &[KeyDef::Char('l'), KeyDef::Code(event::KeyCode::Right)],
-            }],
-            Self::PanUp => &[CommandItem {
-                name: "Pan Up",
-                description: "Pan view up",
-                show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[KeyDef::Char('k'), KeyDef::Code(event::KeyCode::Up)],
-            }],
-            Self::PanDown => &[CommandItem {
-                name: "Pan Down",
-                description: "Pan view down",
-                show_in_palette: true,
-                help_group: HelpGroup::None,
-                bindings: &[KeyDef::Char('j'), KeyDef::Code(event::KeyCode::Down)],
-            }],
+            Self::PanLeft => &[
+                CommandItem {
+                    name: "Pan Left",
+                    description: "Pan view left",
+                    show_in_palette: true,
+                    group: CommandGroup::Pan(&[KeyDef::Char('h')]),
+                },
+                CommandItem {
+                    name: "Pan Left",
+                    description: "Pan view left",
+                    show_in_palette: false,
+                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Left)]),
+                },
+            ],
+            Self::PanRight => &[
+                CommandItem {
+                    name: "Pan Right",
+                    description: "Pan view right",
+                    show_in_palette: true,
+                    group: CommandGroup::Pan(&[KeyDef::Char('l')]),
+                },
+                CommandItem {
+                    name: "Pan Right",
+                    description: "Pan view right",
+                    show_in_palette: false,
+                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Right)]),
+                },
+            ],
+            Self::PanUp => &[
+                CommandItem {
+                    name: "Pan Up",
+                    description: "Pan view up",
+                    show_in_palette: true,
+                    group: CommandGroup::Pan(&[KeyDef::Char('k')]),
+                },
+                CommandItem {
+                    name: "Pan Up",
+                    description: "Pan view up",
+                    show_in_palette: false,
+                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Up)]),
+                },
+            ],
+            Self::PanDown => &[
+                CommandItem {
+                    name: "Pan Down",
+                    description: "Pan view down",
+                    show_in_palette: true,
+                    group: CommandGroup::Pan(&[KeyDef::Char('j')]),
+                },
+                CommandItem {
+                    name: "Pan Down",
+                    description: "Pan view down",
+                    show_in_palette: false,
+                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Down)]),
+                },
+            ],
             Self::ToggleHelp => &[],
             Self::CommandPalette => &[CommandItem {
                 name: "Command Palette",
                 description: "Command Palette",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char(':')],
+                group: CommandGroup::Normal(&[KeyDef::Char(':')]),
             }],
             Self::FileSearch => &[CommandItem {
                 name: "File Search",
                 description: "File Search",
                 show_in_palette: true,
-                help_group: HelpGroup::Normal,
-                bindings: &[KeyDef::Char('f')],
+                group: CommandGroup::Normal(&[KeyDef::Char('f')]),
             }],
         }
     }
@@ -2499,14 +2512,18 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Line::from(" imv-tui Keyboard Shortcuts ".bold().yellow()),
             Line::from(" ───────────────────────────────── ".gray()),
         ];
+        let mut printed_brightness = false;
+        let mut printed_contrast = false;
+        let mut printed_pan_vim = false;
+        let mut printed_pan_arrows = false;
+
         for cmd in <Command as strum::IntoEnumIterator>::iter() {
             for def in cmd.get_metadata() {
-                match def.help_group {
-                    HelpGroup::None => {}
-                    HelpGroup::Normal => {
-                        if !def.bindings.is_empty() {
-                            let shortcut = def
-                                .bindings
+                match def.group {
+                    CommandGroup::Hidden => {}
+                    CommandGroup::Normal(bindings) => {
+                        if !bindings.is_empty() {
+                            let shortcut = bindings
                                 .iter()
                                 .map(|b| b.format())
                                 .collect::<Vec<_>>()
@@ -2517,29 +2534,44 @@ fn ui(frame: &mut Frame, app: &mut App) {
                             ]));
                         }
                     }
-                    HelpGroup::Brightness => {
-                        help_lines.push(Line::from(vec![
-                            format!("  {:<15}", "b, B").cyan(),
-                            "- Brightness +/-".into(),
-                        ]));
+                    CommandGroup::Brightness(_) => {
+                        if !printed_brightness {
+                            printed_brightness = true;
+                            help_lines.push(Line::from(vec![
+                                format!("  {:<15}", "b, B").cyan(),
+                                "- Brightness +/-".into(),
+                            ]));
+                        }
                     }
-                    HelpGroup::Contrast => {
-                        help_lines.push(Line::from(vec![
-                            format!("  {:<15}", "c, C").cyan(),
-                            "- Contrast +/-".into(),
-                        ]));
+                    CommandGroup::Contrast(_) => {
+                        if !printed_contrast {
+                            printed_contrast = true;
+                            help_lines.push(Line::from(vec![
+                                format!("  {:<15}", "c, C").cyan(),
+                                "- Contrast +/-".into(),
+                            ]));
+                        }
                     }
-                    HelpGroup::PanVim => {
-                        help_lines.push(Line::from(vec![
-                            format!("  {:<15}", "h, j, k, l").cyan(),
-                            "- Pan Left/Down/Up/Right".into(),
-                        ]));
-                    }
-                    HelpGroup::PanArrows => {
-                        help_lines.push(Line::from(vec![
-                            format!("  {:<15}", "Arrow Keys").cyan(),
-                            "- Pan image".into(),
-                        ]));
+                    CommandGroup::Pan(bindings) => {
+                        if let Some(first_bind) = bindings.first() {
+                            match first_bind {
+                                KeyDef::Char(_) if !printed_pan_vim => {
+                                    printed_pan_vim = true;
+                                    help_lines.push(Line::from(vec![
+                                        format!("  {:<15}", "h, j, k, l").cyan(),
+                                        "- Pan Left/Down/Up/Right".into(),
+                                    ]));
+                                }
+                                KeyDef::Code(_) if !printed_pan_arrows => {
+                                    printed_pan_arrows = true;
+                                    help_lines.push(Line::from(vec![
+                                        format!("  {:<15}", "Arrow Keys").cyan(),
+                                        "- Pan image".into(),
+                                    ]));
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
