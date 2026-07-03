@@ -55,7 +55,9 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 
-fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), String> {
+fn decode_image_source(
+    source: ImageSource,
+) -> Result<(DynamicImage, u32, u32, &'static str), String> {
     match source {
         ImageSource::Local(path) => {
             let format = image::ImageReader::open(&path)
@@ -89,7 +91,7 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
                     img.apply_orientation(orientation);
                     let w = img.width();
                     let h = img.height();
-                    return Ok((img, w, h));
+                    return Ok((img, w, h, "\u{F0225}"));
                 }
             }
 
@@ -103,6 +105,14 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
                         e
                     )
                 })?;
+
+            let fmt = reader.format();
+            let icon = match fmt {
+                Some(image::ImageFormat::Jpeg) => "\u{F0225}",
+                Some(image::ImageFormat::Png) => "\u{F0E2D}",
+                Some(image::ImageFormat::Gif) => "\u{F0D78}",
+                _ => "\u{F021F}",
+            };
 
             let mut decoder = reader.into_decoder().map_err(|e| {
                 format!(
@@ -127,7 +137,7 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
             let rgba_img = img.to_rgba8();
             let w = rgba_img.width();
             let h = rgba_img.height();
-            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h, icon))
         }
         ImageSource::Cbz {
             zip_path,
@@ -187,7 +197,7 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
                     img.apply_orientation(orientation);
                     let w = img.width();
                     let h = img.height();
-                    return Ok((img, w, h));
+                    return Ok((img, w, h, "\u{F0225}"));
                 }
             }
 
@@ -195,6 +205,14 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
             let reader = image::ImageReader::new(cursor)
                 .with_guessed_format()
                 .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
+
+            let fmt = reader.format();
+            let icon = match fmt {
+                Some(image::ImageFormat::Jpeg) => "\u{F0225}",
+                Some(image::ImageFormat::Png) => "\u{F0E2D}",
+                Some(image::ImageFormat::Gif) => "\u{F0D78}",
+                _ => "\u{F021F}",
+            };
 
             let mut decoder = reader
                 .into_decoder()
@@ -209,7 +227,7 @@ fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32), 
             let rgba_img = img.to_rgba8();
             let w = rgba_img.width();
             let h = rgba_img.height();
-            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h))
+            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h, icon))
         }
     }
 }
@@ -390,7 +408,7 @@ struct LoaderRequest {
 
 struct LoaderResponse {
     idx: usize,
-    result: Result<(DynamicImage, u32, u32), String>,
+    result: Result<(DynamicImage, u32, u32, &'static str), String>,
     is_prefetch: bool,
     sequence: u64,
 }
@@ -588,7 +606,7 @@ const COMMANDS: &[CommandItem] = &[
     },
 ];
 
-type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32)>>>;
+type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32, &'static str)>>>;
 
 /// App state
 pub struct App {
@@ -630,6 +648,7 @@ pub struct App {
     pub filter_type: FilterType,
     pub scale_mode: ScaleMode,
     pub matcher: nucleo::Matcher,
+    pub current_icon: &'static str,
 
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
@@ -751,6 +770,7 @@ impl App {
             filter_type,
             scale_mode,
             matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT),
+            current_icon: "\u{F021F}",
             resize_tx,
             protocol_rx,
             loader_tx,
@@ -1153,9 +1173,10 @@ impl App {
             cache.remove(&self.current_index)
         };
 
-        if let Some((img, w, h)) = cached {
+        if let Some((img, w, h, icon)) = cached {
             self.current_sequence += 1;
             self.original_image = Some(img);
+            self.current_icon = icon;
             self.img_width = w;
             self.img_height = h;
             self.zoom_factor = 1.0;
@@ -1191,17 +1212,18 @@ impl App {
             }
 
             match resp.result {
-                Ok((img, w, h)) => {
+                Ok((img, w, h, icon)) => {
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
                         let window_indices = self.get_sliding_window_indices();
                         if window_indices.contains(&resp.idx) {
                             let mut cache = self.prefetch_cache.lock().unwrap();
-                            cache.insert(resp.idx, (shared_img, w, h));
+                            cache.insert(resp.idx, (shared_img, w, h, icon));
                         }
                     } else if resp.idx == self.current_index {
                         self.img_width = w;
                         self.img_height = h;
+                        self.current_icon = icon;
                         self.original_image = Some(shared_img);
                         self.error_message = None;
                         self.zoom_factor = 1.0;
@@ -1878,7 +1900,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
         }
 
-        let title = format!(" {} ", app.current_filename());
+        let title = format!(" {} {} ", app.current_icon, app.current_filename());
         let info = format!(
             " [{}/{}] ({}x{}) | Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){} | Press '?' for help ",
             app.current_index + 1,
