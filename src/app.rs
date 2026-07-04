@@ -59,6 +59,35 @@ pub enum Classification {
     Reject,
 }
 
+impl Classification {
+    /// Returns the emoji icon representing the classification.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Unflagged => "⚪",
+            Self::Pick => "⭐",
+            Self::Reject => "❌",
+        }
+    }
+
+    /// Returns the combined icon and label string (e.g. "⭐ Pick").
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Unflagged => "⚪ Unflagged",
+            Self::Pick => "⭐ Pick",
+            Self::Reject => "❌ Reject",
+        }
+    }
+
+    /// Returns the short prefix for list views, leaving Unflagged blank for visual cleanliness.
+    pub fn search_prefix(&self) -> &'static str {
+        match self {
+            Self::Unflagged => "   ",
+            Self::Pick => "⭐ ",
+            Self::Reject => "❌ ",
+        }
+    }
+}
+
 /// The display filtering view mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewMode {
@@ -648,18 +677,6 @@ impl App {
             .get(self.queue.current_index)
             .cloned()
             .unwrap_or(Classification::Unflagged)
-    }
-
-    /// Returns the flagged status text/icon to show in the status/info bar.
-    pub fn current_flagged_status_label(&self) -> &'static str {
-        if self.queue.images.is_empty() || self.get_visible_count() == 0 {
-            return "";
-        }
-        match self.current_classification() {
-            Classification::Unflagged => "⚪ Unflagged",
-            Classification::Pick => "⭐ Pick",
-            Classification::Reject => "❌ Reject",
-        }
     }
 
     /// Imports image classification states from a prefix-prefixed text file or a JSON manifest.

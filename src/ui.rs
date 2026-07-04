@@ -11,7 +11,7 @@ use ratatui::{
 use ratatui_image::StatefulImage;
 use std::time::Duration;
 
-use crate::app::{App, PaletteMode, PromptType};
+use crate::app::{App, Classification, PaletteMode, PromptType};
 
 /// Renders the entire view layout: including centered images (via Kitty, Sixel,
 /// or Halfblocks protocol), error details, loading spinners, bottom status HUD,
@@ -106,14 +106,31 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             ));
         }
 
-        let title_text = format!(
-            " {} {} [{}] ",
-            app.current_icon,
-            app.current_filename(),
-            app.view_mode_name()
-        );
+        let classification = app.current_classification();
+        let flag_icon = classification.icon();
+
+        let filename_color = match classification {
+            Classification::Pick => Color::Green,
+            Classification::Reject => Color::Red,
+            Classification::Unflagged => Color::Yellow,
+        };
+
+        let left_title_line = ratatui::text::Line::from(vec![
+            ratatui::text::Span::raw(format!(" {} ", flag_icon)),
+            ratatui::text::Span::styled(
+                app.current_filename(),
+                Style::default().fg(filename_color).bold(),
+            ),
+            ratatui::text::Span::raw(" "),
+        ])
+        .left_aligned();
+
+        let right_title_line =
+            ratatui::text::Line::from(format!(" [{}] ", app.view_mode_name())).right_aligned();
+
         let status_block = Block::default()
-            .title(title_text)
+            .title(left_title_line)
+            .title(right_title_line)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan))
@@ -121,17 +138,10 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         let inner_rect = status_block.inner(chunks[1]);
         frame.render_widget(status_block, chunks[1]);
 
-        let flagged_label = app.current_flagged_status_label();
-        let flagged_part = if flagged_label.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", flagged_label)
-        };
         let left_text = format!(
-            " [{}/{}]{} ({}x{}){} ",
+            " [{}/{}] ({}x{}){} ",
             app.get_visible_position().map(|pos| pos + 1).unwrap_or(0),
             app.get_visible_count(),
-            flagged_part,
             app.img_width,
             app.img_height,
             if app.show_thumbnail_only {
@@ -315,14 +325,16 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                     " Dimensions: ".bold().cyan(),
                     pixels_str.as_str().into(),
                 ]));
-                let flag_style = match app.current_classification() {
+                let classification = app.current_classification();
+                let flag_style = match classification {
                     crate::app::Classification::Unflagged => Style::default().fg(Color::Gray),
                     crate::app::Classification::Pick => Style::default().fg(Color::Green).bold(),
                     crate::app::Classification::Reject => Style::default().fg(Color::Red).bold(),
                 };
+                let flag_label = classification.display_label();
                 lines.push(Line::from(vec![
                     " Flag State: ".bold().cyan(),
-                    Span::styled(app.current_flagged_status_label(), flag_style),
+                    Span::styled(flag_label, flag_style),
                 ]));
 
                 let inner_w = w.saturating_sub(2) as usize;
@@ -472,11 +484,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                             .get(orig_idx)
                             .cloned()
                             .unwrap_or(crate::app::Classification::Unflagged);
-                        let class_prefix = match class {
-                            crate::app::Classification::Unflagged => "   ",
-                            crate::app::Classification::Pick => "⭐ ",
-                            crate::app::Classification::Reject => "❌ ",
-                        };
+                        let class_prefix = class.search_prefix();
                         let line = if i == app.palette_selected_index {
                             Line::from(vec![
                                 " > ".bold().yellow().on_blue(),
