@@ -86,6 +86,15 @@ impl ViewMode {
     }
 }
 
+/// Helper struct for JSON serialization/deserialization of classifications.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClassificationJsonItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
+    pub filename: String,
+    pub flag: String,
+}
+
 /// Encapsulates list of images, starting index, and cached display name lists.
 pub struct ImageQueue {
     /// Loaded list of image sources.
@@ -651,6 +660,147 @@ impl App {
             Classification::Pick => "⭐ Pick",
             Classification::Reject => "❌ Reject",
         }
+    }
+
+    /// Imports image classification states from a prefix-prefixed text file or a JSON manifest.
+    pub fn import_classifications(&mut self, import_path: &std::path::Path) -> Result<(), String> {
+        let content = std::fs::read_to_string(import_path)
+            .map_err(|e| format!("Failed to read import file: {}", e))?;
+
+        let mut imported: HashMap<String, Classification> = HashMap::new();
+
+        if import_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            let parsed: Vec<ClassificationJsonItem> = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse JSON manifest: {}", e))?;
+            for item in parsed {
+                let class = match item.flag.to_lowercase().as_str() {
+                    "pick" | "picked" => Classification::Pick,
+                    "reject" | "rejected" => Classification::Reject,
+                    _ => Classification::Unflagged,
+                };
+                let key = if let Some(ref archive_path) = item.archive {
+                    format!("{}::{}", archive_path, item.filename)
+                } else {
+                    item.filename
+                };
+                imported.insert(key, class);
+            }
+        } else {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let split_res = line.split_once('\t').or_else(|| line.split_once(':'));
+                if let Some((prefix, ident)) = split_res {
+                    let ident = ident.trim().to_string();
+                    let class = match prefix.trim().to_uppercase().as_str() {
+                        "PICK" | "PICKED" => Classification::Pick,
+                        "REJECT" | "REJECTED" => Classification::Reject,
+                        "UNFLAGGED" => Classification::Unflagged,
+                        _ => continue,
+                    };
+                    imported.insert(ident, class);
+                }
+            }
+        }
+
+        // Apply imported states to existing files
+        for (idx, img) in self.queue.images.iter().enumerate() {
+            let ident = img.identifier();
+            if let Some(&class) = imported.get(&ident) {
+                self.classifications[idx] = class;
+            }
+        }
+
+        // Adjust selected index for visibility in case files are filtered out
+        self.adjust_current_index_for_visibility();
+
+        Ok(())
+    }
+
+    /// Exports image classification states to a prefix-prefixed text file or a JSON manifest.
+    pub fn export_classifications(&self, export_path: &std::path::Path) -> Result<(), String> {
+        let mut text_lines = Vec::new();
+        let mut json_items = Vec::new();
+
+        for (idx, img) in self.queue.images.iter().enumerate() {
+            let class = self
+                .classifications
+                .get(idx)
+                .cloned()
+                .unwrap_or(Classification::Unflagged);
+            if class == Classification::Unflagged {
+                continue;
+            }
+            let ident = img.identifier();
+
+            let (archive, filename) = match img {
+                ImageSource::Local(path) => {
+                    let abs = if path.is_absolute() {
+                        path.clone()
+                    } else if let Ok(curr) = std::env::current_dir() {
+                        curr.join(path)
+                    } else {
+                        path.clone()
+                    };
+                    (None, abs.to_string_lossy().into_owned())
+                }
+                ImageSource::Cbz {
+                    zip_path,
+                    file_in_zip,
+                } => {
+                    let abs_zip = if zip_path.is_absolute() {
+                        zip_path.clone()
+                    } else if let Ok(curr) = std::env::current_dir() {
+                        curr.join(zip_path)
+                    } else {
+                        zip_path.clone()
+                    };
+                    (
+                        Some(abs_zip.to_string_lossy().into_owned()),
+                        file_in_zip.clone(),
+                    )
+                }
+            };
+
+            let flag_str = match class {
+                Classification::Pick => "picked",
+                Classification::Reject => "rejected",
+                Classification::Unflagged => "unflagged",
+            };
+            json_items.push(ClassificationJsonItem {
+                archive,
+                filename,
+                flag: flag_str.to_string(),
+            });
+
+            let text_state = match class {
+                Classification::Pick => "PICK",
+                Classification::Reject => "REJECT",
+                Classification::Unflagged => "UNFLAGGED",
+            };
+            text_lines.push(format!("{}\t{}", text_state, ident));
+        }
+
+        if export_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            let json_str = serde_json::to_string_pretty(&json_items)
+                .map_err(|e| format!("Failed to serialize classifications: {}", e))?;
+            std::fs::write(export_path, json_str)
+                .map_err(|e| format!("Failed to write export JSON file: {}", e))?;
+        } else {
+            let content = text_lines.join("\n");
+            std::fs::write(export_path, content)
+                .map_err(|e| format!("Failed to write export text file: {}", e))?;
+        }
+
+        Ok(())
     }
 
     /// Returns cached filtered files matching the current search query.
@@ -2107,5 +2257,89 @@ impl App {
                 self.execute_command(cmd);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_worker::ImageSource;
+    use ratatui_image::picker::Picker;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_import_export_text_and_json() {
+        let _ = std::fs::create_dir_all("target/tmp");
+        let json_path = PathBuf::from("target/tmp/test_classifications.json");
+        let txt_path = PathBuf::from("target/tmp/test_classifications.txt");
+
+        let images = vec![
+            ImageSource::Local(PathBuf::from("img1.png")),
+            ImageSource::Local(PathBuf::from("img2.png")),
+            ImageSource::Cbz {
+                zip_path: PathBuf::from("archive.cbz"),
+                file_in_zip: "page1.png".to_string(),
+            },
+        ];
+
+        let picker = Picker::halfblocks();
+        let mut app = App::new(
+            images.clone(),
+            0,
+            picker,
+            crate::image_worker::FilterType::Nearest,
+            crate::image_worker::ScaleMode::Shrink,
+            true,
+        )
+        .unwrap();
+
+        app.classifications[0] = Classification::Pick;
+        app.classifications[1] = Classification::Reject;
+        app.classifications[2] = Classification::Pick;
+
+        // Test Export to JSON
+        app.export_classifications(&json_path).unwrap();
+        assert!(json_path.exists());
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        // Check that it's serialized as a JSON array of objects
+        let parsed_json: Vec<ClassificationJsonItem> = serde_json::from_str(&json_content).unwrap();
+        assert_eq!(parsed_json.len(), 3);
+        assert_eq!(parsed_json[0].flag, "picked");
+        assert_eq!(parsed_json[0].archive, None);
+        assert_eq!(parsed_json[1].flag, "rejected");
+        assert_eq!(parsed_json[1].archive, None);
+        assert_eq!(parsed_json[2].flag, "picked");
+        assert!(parsed_json[2].archive.is_some());
+        assert_eq!(parsed_json[2].filename, "page1.png");
+
+        // Test Export to Text
+        app.export_classifications(&txt_path).unwrap();
+        assert!(txt_path.exists());
+        let txt_content = std::fs::read_to_string(&txt_path).unwrap();
+        // Verify that the tab character is used to separate
+        assert!(txt_content.contains("PICK\t"));
+        assert!(txt_content.contains("REJECT\t"));
+
+        // Clear classifications in app
+        app.classifications = vec![Classification::Unflagged; 3];
+
+        // Import from JSON
+        app.import_classifications(&json_path).unwrap();
+        assert_eq!(app.classifications[0], Classification::Pick);
+        assert_eq!(app.classifications[1], Classification::Reject);
+        assert_eq!(app.classifications[2], Classification::Pick);
+
+        // Clear classifications again
+        app.classifications = vec![Classification::Unflagged; 3];
+
+        // Import from Text
+        app.import_classifications(&txt_path).unwrap();
+        assert_eq!(app.classifications[0], Classification::Pick);
+        assert_eq!(app.classifications[1], Classification::Reject);
+        assert_eq!(app.classifications[2], Classification::Pick);
+
+        // Clean up
+        let _ = std::fs::remove_file(json_path);
+        let _ = std::fs::remove_file(txt_path);
     }
 }

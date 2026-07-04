@@ -80,6 +80,35 @@ pub enum ImageSource {
 }
 
 impl ImageSource {
+    /// Returns a unique absolute identifier string for the image source (local path or cbz path + page).
+    pub fn identifier(&self) -> String {
+        match self {
+            Self::Local(path) => {
+                let abs = if path.is_absolute() {
+                    path.clone()
+                } else if let Ok(curr) = std::env::current_dir() {
+                    curr.join(path)
+                } else {
+                    path.clone()
+                };
+                abs.to_string_lossy().into_owned()
+            }
+            Self::Cbz {
+                zip_path,
+                file_in_zip,
+            } => {
+                let abs_zip = if zip_path.is_absolute() {
+                    zip_path.clone()
+                } else if let Ok(curr) = std::env::current_dir() {
+                    curr.join(zip_path)
+                } else {
+                    zip_path.clone()
+                };
+                format!("{}::{}", abs_zip.to_string_lossy(), file_in_zip)
+            }
+        }
+    }
+
     /// Generates a display name for listing the image source in the status bar/palettes.
     pub fn display_name(&self) -> String {
         match self {

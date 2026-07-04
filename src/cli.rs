@@ -19,6 +19,10 @@ pub struct CliOptions {
     pub check_magic: bool,
     /// If true, disables EXIF thumbnail loading/display entirely.
     pub no_thumbnail: bool,
+    /// Path to a file to import classification states from.
+    pub import_path: Option<PathBuf>,
+    /// Path to a file to export classification states to on exit.
+    pub export_path: Option<PathBuf>,
 }
 
 /// Reads piped file paths from standard input when stdin is not a terminal,
@@ -109,6 +113,8 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
     let mut slideshow = None;
     let mut check_magic = false;
     let mut no_thumbnail = false;
+    let mut import_path = None;
+    let mut export_path = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -184,6 +190,16 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 no_thumbnail = true;
                 i += 1;
             }
+            "--import" | "-i" => {
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                import_path = Some(PathBuf::from(val));
+            }
+            "--export" | "-o" => {
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                export_path = Some(PathBuf::from(val));
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -207,6 +223,12 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 );
                 println!(
                     "      --no-thumbnail         Disable low-res EXIF thumbnail placeholder loading"
+                );
+                println!(
+                    "  -i, --import <file>        Import image classification/flagged states from a file (.json or prefix text)"
+                );
+                println!(
+                    "  -o, --export <file>        Export image classification/flagged states to a file on exit (.json or prefix text)"
                 );
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
@@ -236,5 +258,7 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
         slideshow,
         check_magic,
         no_thumbnail,
+        import_path,
+        export_path,
     })
 }

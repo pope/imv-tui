@@ -132,7 +132,43 @@ If no path is specified, it scans and opens images from the current directory (`
 - `-t, --slideshow <seconds>`: Start the slideshow with the given delay in seconds.
 - `-m, --check-magic`: Check file magic bytes on startup (slower on network drives).
 - `--no-thumbnail`: Disable low-res EXIF thumbnail placeholder loading entirely.
+- `-i, --import <file>`: Import image classification/flagged states from a file (.json or prefix text).
+- `-o, --export <file>`: Export image classification/flagged states to a file on exit (.json or prefix text).
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
+
+______________________________________________________________________
+
+## Classification File Formats & Piping
+
+When exporting or importing classifications via `-o`/`--export` or `-i`/`--import`, `imv-tui` identifies format requirements by the output file extension:
+
+- **JSON Format (`.json`)**: Formatted as a structured array of objects where each item tracks the image path and flag state.
+  - For **local files**, the `filename` contains the absolute file path, and the `archive` field is omitted:
+    ```json
+    [
+      { "filename": "/absolute/path/to/image.jpg", "flag": "picked" }
+    ]
+    ```
+  - For **CBZ/ZIP archive entries**, the `filename` contains the relative page path inside the zip file, and the absolute path of the parent zip is stored in the `archive` field:
+    ```json
+    [
+      { "archive": "/absolute/path/to/manga.cbz", "filename": "page1.png", "flag": "picked" }
+    ]
+    ```
+- **Text Format (Any other extension)**: Formatted as tab-separated values (`\t`) prefixing the state and target path. It also supports backward-compatible parsing of colon-separated (`:`) values upon import:
+  ```text
+  PICK	/absolute/path/to/image.jpg
+  REJECT	/absolute/path/to/rejected.jpg
+  ```
+
+### Pipelining & Stdout Fallback
+
+If **no export path** is explicitly specified via `--export` / `-o`, `imv-tui` will automatically print the flagged image classification list directly to standard output (`stdout`) using the tab-separated format when the application exits. This enables clean shell composition and piping:
+
+```bash
+# Open directory, flag some images, then copy picks to another folder on exit
+imv-tui | awk -F'\t' '$1 == "PICK" {print $2}' | xargs -I {} cp {} ~/favorites/
+```
 
 ______________________________________________________________________
 

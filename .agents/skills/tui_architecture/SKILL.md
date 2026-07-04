@@ -20,6 +20,7 @@ When building TUI applications, standard crash panics or early returns (`?`) can
   }
   ```
 - **Custom Panic Hooks**: Register a custom panic hook at startup to clean up alternate screen and raw modes before writing panic details to stderr.
+- **Stdout Output on Exit**: If the TUI application outputs data (e.g. classification lists, paths, stats) to stdout upon termination for pipe/shell composition, ensure the `TerminalGuard` is dropped (e.g. `drop(_guard)`) *before* printing the output. This returns the terminal from raw mode to the primary screen buffer first so that the printed output is preserved and visible in the parent shell scrollback.
 
 ### 2. Pure Rendering Viewports & separation of concerns
 

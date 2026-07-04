@@ -16,7 +16,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
-use crate::app::{App, PaletteMode};
+use crate::app::{App, Classification, PaletteMode};
 use crate::cli::{parse_cli_args, read_piped_stdin};
 use crate::image_worker::{
     ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory,
@@ -101,6 +101,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.slideshow_config = cfg;
         app.slideshow_last_transition = std::time::Instant::now();
     }
+    if let Some(ref path) = options.import_path {
+        app.import_classifications(path).map_err(io::Error::other)?;
+    }
 
     let mut last_loop_tick = std::time::Instant::now();
 
@@ -154,6 +157,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             events
                 .into_iter()
                 .for_each(|ev| app.handle_event(ev, term_size.height));
+        }
+    }
+
+    drop(_guard);
+
+    if let Some(ref path) = options.export_path {
+        app.export_classifications(path).map_err(io::Error::other)?;
+    } else {
+        // Output flagged files to stdout using tab-separated format
+        for (idx, img) in app.queue.images.iter().enumerate() {
+            let class = app
+                .classifications
+                .get(idx)
+                .cloned()
+                .unwrap_or(Classification::Unflagged);
+            if class != Classification::Unflagged {
+                let state_str = match class {
+                    Classification::Pick => "PICK",
+                    Classification::Reject => "REJECT",
+                    Classification::Unflagged => "UNFLAGGED",
+                };
+                println!("{}\t{}", state_str, img.identifier());
+            }
         }
     }
 
