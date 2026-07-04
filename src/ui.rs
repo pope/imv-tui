@@ -1,9 +1,12 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style, Stylize},
     text::Line,
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
 };
 use ratatui_image::StatefulImage;
 use std::time::Duration;
@@ -397,6 +400,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
             let visible_count = (app.palette_height as usize).saturating_sub(4);
             let palette_height = app.palette_height;
+            let mut scroll_pos = 0;
+            let mut total_items = 0;
 
             let mut lines = vec![
                 Line::from(vec![
@@ -423,6 +428,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                     } else {
                         app.palette_selected_index.saturating_sub(half_visible)
                     };
+                    scroll_pos = start_idx;
+                    total_items = total_files;
 
                     for (i, (_, filename)) in filtered_files
                         .iter()
@@ -460,6 +467,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                     } else {
                         app.palette_selected_index.saturating_sub(half_visible)
                     };
+                    scroll_pos = start_idx;
+                    total_items = total_cmds;
 
                     for (i, cmd) in filtered_commands
                         .iter()
@@ -528,6 +537,28 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
             frame.render_widget(Clear, popup_area);
             frame.render_widget(palette_paragraph, popup_area);
+
+            if total_items > visible_count {
+                let mut scrollbar_state =
+                    ScrollbarState::new(total_items.saturating_sub(visible_count) + 1)
+                        .position(scroll_pos);
+
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("↑"))
+                    .end_symbol(Some("↓"))
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("║")
+                    .thumb_style(Style::default().bold());
+
+                frame.render_stateful_widget(
+                    scrollbar,
+                    popup_area.inner(Margin {
+                        vertical: 1,
+                        horizontal: 0,
+                    }),
+                    &mut scrollbar_state,
+                );
+            }
         }
     }
 }
