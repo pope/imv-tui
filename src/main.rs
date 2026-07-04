@@ -33,7 +33,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_piped = !piped_files.is_empty();
 
     // Parse CLI arguments
-    let options = parse_cli_args();
+    let options = match parse_cli_args() {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
     let initial_path = options.initial_path;
     let filter_opt = options.filter;
     let protocol_opt = options.protocol;
@@ -134,8 +140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    if let Some(sec) = slideshow_opt {
-        app.slideshow_seconds = sec;
+    if let Some(cfg) = slideshow_opt {
+        app.slideshow_config = cfg;
         app.slideshow_last_transition = std::time::Instant::now();
     }
 
@@ -144,10 +150,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.update_channels();
 
         // Automatic slideshow transition
-        if app.slideshow_seconds > 0
+        if app.slideshow_config.is_active()
             && !app.is_loading
             && app.slideshow_last_transition.elapsed()
-                >= std::time::Duration::from_secs(app.slideshow_seconds as u64)
+                >= std::time::Duration::from_secs(app.slideshow_config.seconds() as u64)
         {
             app.next_image();
             app.slideshow_last_transition = std::time::Instant::now();

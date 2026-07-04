@@ -12,6 +12,7 @@ use crate::commands::{Command, CommandItem, PaletteCommand, get_commands};
 use crate::image_worker::{
     FilterType, ImageSource, LoaderRequest, LoaderResponse, ResizeRequest, ScaleMode,
     decode_image_source, process_resize, Brightness, Contrast, PanOffset, CropBox, ImageIntersection,
+    SlideshowConfig,
 };
 /// Represents an absolute or relative adjustment to a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,8 +162,8 @@ pub struct App {
     /// Active contrast bias value.
     pub contrast: Contrast,
     prefetch_cache: PrefetchCache,
-    /// Duration in seconds between transitions during slideshow mode.
-    pub slideshow_seconds: u32,
+    /// The slideshow transition configuration delay.
+    pub slideshow_config: SlideshowConfig,
     /// Last slideshow transition timestamp.
     pub slideshow_last_transition: std::time::Instant,
 }
@@ -285,7 +286,7 @@ impl App {
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
-            slideshow_seconds: 0,
+            slideshow_config: SlideshowConfig::OFF,
             slideshow_last_transition: std::time::Instant::now(),
         };
 
@@ -501,11 +502,13 @@ impl App {
             Command::CommandPalette => self.open_palette(PaletteMode::Command),
             Command::FileSearch => self.open_palette(PaletteMode::File),
             Command::SlideshowIncrease => {
-                self.slideshow_seconds = self.slideshow_seconds.saturating_add(1).max(1);
+                let current_sec = self.slideshow_config.seconds();
+                self.slideshow_config = SlideshowConfig::new(current_sec.saturating_add(1).max(1));
                 self.slideshow_last_transition = std::time::Instant::now();
             }
             Command::SlideshowDecrease => {
-                self.slideshow_seconds = self.slideshow_seconds.saturating_sub(1);
+                let current_sec = self.slideshow_config.seconds();
+                self.slideshow_config = SlideshowConfig::new(current_sec.saturating_sub(1));
                 self.slideshow_last_transition = std::time::Instant::now();
             }
             Command::SetSlideshow => self.open_prompt(PromptType::SetSlideshow),
@@ -623,14 +626,14 @@ impl App {
                     let Ok(adj) = input.parse::<Adjustment<u32>>() else {
                         return;
                     };
-                    let mut new_val = self.slideshow_seconds;
+                    let mut new_val = self.slideshow_config.seconds();
                     match adj {
                         Adjustment::Absolute(val) => new_val = val,
                         Adjustment::RelativeAdd(val) => new_val = new_val.saturating_add(val),
                         Adjustment::RelativeSub(val) => new_val = new_val.saturating_sub(val),
                     }
-                    if new_val != self.slideshow_seconds {
-                        self.slideshow_seconds = new_val;
+                    if new_val != self.slideshow_config.seconds() {
+                        self.slideshow_config = SlideshowConfig::new(new_val);
                         self.slideshow_last_transition = std::time::Instant::now();
                     }
                 }

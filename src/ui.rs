@@ -85,8 +85,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         if app.contrast.value() != 0.0 {
             extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.value().round() as i32));
         }
-        if app.slideshow_seconds > 0 {
-            extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_seconds));
+        if app.slideshow_config.is_active() {
+            extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_config.seconds()));
         }
 
         let title_text = format!(" {} {} ", app.current_icon, app.current_filename());

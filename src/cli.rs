@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
+use crate::image_worker::SlideshowConfig;
 
 /// Parsed CLI option arguments.
 pub struct CliOptions {
@@ -12,7 +13,7 @@ pub struct CliOptions {
     /// Image scale mode: none, actual, shrink, full, crop.
     pub scale: Option<String>,
     /// Delay duration in seconds for slideshow transitions.
-    pub slideshow: Option<u32>,
+    pub slideshow: Option<SlideshowConfig>,
     /// If true, validates files by checking their magic bytes instead of extensions.
     pub check_magic: bool,
 }
@@ -48,7 +49,7 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
 }
 
 /// Parses the command-line options from environment arguments.
-pub fn parse_cli_args() -> CliOptions {
+pub fn parse_cli_args() -> Result<CliOptions, String> {
     let args: Vec<String> = std::env::args().collect();
     let mut initial_path = None;
     let mut filter = None;
@@ -65,10 +66,9 @@ pub fn parse_cli_args() -> CliOptions {
                     filter = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    eprintln!(
-                        "Error: --filter / -f requires an argument (nearest, linear, cubic, mitchell, gaussian, lanczos, hamming)"
+                    return Err(
+                        "Error: --filter / -f requires an argument (nearest, linear, cubic, mitchell, gaussian, lanczos, hamming)".into()
                     );
-                    std::process::exit(1);
                 }
             }
             "--protocol" | "-p" => {
@@ -76,10 +76,9 @@ pub fn parse_cli_args() -> CliOptions {
                     protocol = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    eprintln!(
-                        "Error: --protocol / -p requires an argument (kitty, sixel, halfblocks, iterm2)"
+                    return Err(
+                        "Error: --protocol / -p requires an argument (kitty, sixel, halfblocks, iterm2)".into()
                     );
-                    std::process::exit(1);
                 }
             }
             "--scale" | "-s" => {
@@ -87,24 +86,21 @@ pub fn parse_cli_args() -> CliOptions {
                     scale = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    eprintln!(
-                        "Error: --scale / -s requires an argument (none, actual, shrink, full, crop)"
+                    return Err(
+                        "Error: --scale / -s requires an argument (none, actual, shrink, full, crop)".into()
                     );
-                    std::process::exit(1);
                 }
             }
             "--slideshow" | "-t" => {
                 if i + 1 < args.len() {
-                    if let Ok(sec) = args[i + 1].parse::<u32>() {
-                        slideshow = Some(sec);
+                    if let Ok(config) = args[i + 1].parse::<SlideshowConfig>() {
+                        slideshow = Some(config);
                     } else {
-                        eprintln!("Error: -t / --slideshow requires a positive integer argument");
-                        std::process::exit(1);
+                        return Err("Error: -t / --slideshow requires a positive integer argument".into());
                     }
                     i += 2;
                 } else {
-                    eprintln!("Error: -t / --slideshow requires an argument");
-                    std::process::exit(1);
+                    return Err("Error: -t / --slideshow requires an argument".into());
                 }
             }
             "--check-magic" | "-m" => {
@@ -144,12 +140,12 @@ pub fn parse_cli_args() -> CliOptions {
         }
     }
 
-    CliOptions {
+    Ok(CliOptions {
         initial_path,
         filter,
         protocol,
         scale,
         slideshow,
         check_magic,
-    }
+    })
 }
