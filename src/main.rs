@@ -500,7 +500,6 @@ pub enum Command {
     CycleScaleMode,
     CommandPalette,
     FileSearch,
-    ShowHelp,
 
     // Non-help/derived commands:
     SetFilterNearest,
@@ -521,7 +520,6 @@ pub enum Command {
     DecreaseContrast,
     PanUp,
     PanDown,
-    ToggleHelp,
     SlideshowIncrease,
     SlideshowDecrease,
     SetSlideshow,
@@ -530,19 +528,11 @@ pub enum Command {
 impl Command {
     pub fn from_key(key: event::KeyEvent) -> Option<Self> {
         for cmd in <Self as strum::IntoEnumIterator>::iter() {
-            for def in cmd.get_metadata() {
-                let bindings = match def.group {
-                    CommandGroup::Hidden => &[],
-                    CommandGroup::Normal(b) => b,
-                    CommandGroup::Brightness(b) => b,
-                    CommandGroup::Contrast(b) => b,
-                    CommandGroup::Pan(b) => b,
-                    CommandGroup::Slideshow(b) => b,
-                };
-                for bind in bindings {
-                    if bind.matches(key) {
-                        return Some(cmd);
-                    }
+            let def = cmd.get_metadata();
+            let bindings = def.shortcuts.unwrap_or(&[]);
+            for bind in bindings {
+                if bind.matches(key) {
+                    return Some(cmd);
                 }
             }
         }
@@ -556,7 +546,8 @@ pub enum KeyDef {
     Code(event::KeyCode),
     Ctrl(char),
     Shift(event::KeyCode),
-    MouseScroll,
+    ScrollUp,
+    ScrollDown,
 }
 
 impl KeyDef {
@@ -596,7 +587,7 @@ impl KeyDef {
             Self::Shift(code) => {
                 event.code == code && event.modifiers.contains(KeyModifiers::SHIFT)
             }
-            Self::MouseScroll => false,
+            Self::ScrollUp | Self::ScrollDown => false,
         }
     }
 
@@ -655,19 +646,10 @@ impl KeyDef {
                 _ => "Ctrl+?",
             },
             Self::Shift(_) => "Shift+?",
-            Self::MouseScroll => "Mouse Scroll",
+            Self::ScrollUp => "Scroll Up",
+            Self::ScrollDown => "Scroll Down",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandGroup {
-    Hidden,
-    Normal(&'static [KeyDef]),
-    Brightness(&'static [KeyDef]),
-    Contrast(&'static [KeyDef]),
-    Pan(&'static [KeyDef]),
-    Slideshow(&'static [KeyDef]),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -675,324 +657,267 @@ pub struct CommandItem {
     pub name: &'static str,
     pub description: &'static str,
     pub show_in_palette: bool,
-    pub group: CommandGroup,
+    pub shortcuts: Option<&'static [KeyDef]>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct PaletteCommand {
     pub cmd: Command,
-    pub item: &'static CommandItem,
+    pub item: CommandItem,
 }
 
 impl Command {
-    pub fn get_metadata(self) -> &'static [CommandItem] {
+    pub fn get_metadata(self) -> CommandItem {
         match self {
-            Self::ShowHelp => &[CommandItem {
-                name: "Show Help",
-                description: "Toggle Help",
-                show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('?'), KeyDef::Char('/')]),
-            }],
-            Self::ResetView => &[CommandItem {
+            Self::ResetView => CommandItem {
                 name: "Reset View",
                 description: "Reset View",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('r')]),
-            }],
-            Self::ActualSize => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('r')]),
+            },
+            Self::ActualSize => CommandItem {
                 name: "Actual Size",
                 description: "Actual Size",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('a')]),
-            }],
-            Self::RotateClockwise => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('a')]),
+            },
+            Self::RotateClockwise => CommandItem {
                 name: "Rotate Clockwise",
                 description: "Rotate CW 90°",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[
-                    KeyDef::Char('e'),
-                    KeyDef::Char('R'),
-                    KeyDef::Char('>'),
-                ]),
-            }],
-            Self::RotateCounterClockwise => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('e'), KeyDef::Char('R'), KeyDef::Char('>')]),
+            },
+            Self::RotateCounterClockwise => CommandItem {
                 name: "Rotate Counter-Clockwise",
                 description: "Rotate CCW 90°",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('E'), KeyDef::Char('<')]),
-            }],
-            Self::NextImage => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('E'), KeyDef::Char('<')]),
+            },
+            Self::NextImage => CommandItem {
                 name: "Next Image",
                 description: "Next image",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[
-                    KeyDef::Char('n'),
-                    KeyDef::Char(' '),
-                    KeyDef::Char(']'),
-                ]),
-            }],
-            Self::PreviousImage => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('n'), KeyDef::Char(' '), KeyDef::Char(']')]),
+            },
+            Self::PreviousImage => CommandItem {
                 name: "Previous Image",
                 description: "Previous image",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[
+                shortcuts: Some(&[
                     KeyDef::Char('p'),
                     KeyDef::Code(event::KeyCode::Backspace),
                     KeyDef::Char('['),
                 ]),
-            }],
-            Self::ZoomIn => &[
-                CommandItem {
-                    name: "Zoom In",
-                    description: "Zoom In",
-                    show_in_palette: true,
-                    group: CommandGroup::Normal(&[
-                        KeyDef::Char('i'),
-                        KeyDef::Char('+'),
-                        KeyDef::Char('='),
-                    ]),
-                },
-                CommandItem {
-                    name: "Zoom (mouse)",
-                    description: "Zoom In / Out",
-                    show_in_palette: false,
-                    group: CommandGroup::Normal(&[KeyDef::MouseScroll]),
-                },
-            ],
-            Self::ZoomOut => &[CommandItem {
+            },
+            Self::ZoomIn => CommandItem {
+                name: "Zoom In",
+                description: "Zoom In",
+                show_in_palette: true,
+                shortcuts: Some(&[
+                    KeyDef::Char('i'),
+                    KeyDef::Char('+'),
+                    KeyDef::Char('='),
+                    KeyDef::ScrollUp,
+                ]),
+            },
+            Self::ZoomOut => CommandItem {
                 name: "Zoom Out",
                 description: "Zoom Out",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('o'), KeyDef::Char('-')]),
-            }],
-            Self::Quit => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('o'), KeyDef::Char('-'), KeyDef::ScrollDown]),
+            },
+            Self::Quit => CommandItem {
                 name: "Quit",
                 description: "Quit",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[
-                    KeyDef::Char('q'),
-                    KeyDef::Code(event::KeyCode::Esc),
-                ]),
-            }],
-            Self::SetFilterNearest => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('q'), KeyDef::Code(event::KeyCode::Esc)]),
+            },
+            Self::SetFilterNearest => CommandItem {
                 name: "Set Filter: Nearest",
                 description: "Use Nearest Neighbor scaling (sharp, pixelated)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetFilterLinear => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetFilterLinear => CommandItem {
                 name: "Set Filter: Linear",
                 description: "Use Bilinear scaling",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetFilterCubic => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetFilterCubic => CommandItem {
                 name: "Set Filter: Cubic",
                 description: "Use Bicubic scaling (Catmull-Rom)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetFilterMitchell => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetFilterMitchell => CommandItem {
                 name: "Set Filter: Mitchell",
                 description: "Use Mitchell-Netravali scaling",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetFilterGaussian => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetFilterGaussian => CommandItem {
                 name: "Set Filter: Gaussian",
                 description: "Use Gaussian scaling",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetFilterLanczos => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetFilterLanczos => CommandItem {
                 name: "Set Filter: Lanczos",
                 description: "Use Lanczos3 scaling (high quality)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetFilterHamming => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetFilterHamming => CommandItem {
                 name: "Set Filter: Hamming",
                 description: "Use Hamming scaling",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::NextFilter => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::NextFilter => CommandItem {
                 name: "Next Filter",
                 description: "Next scaling filter",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('S')]),
-            }],
-            Self::GoToImage => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('S')]),
+            },
+            Self::GoToImage => CommandItem {
                 name: "Go to Image",
                 description: "Jump to a specific image index",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetBrightness => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetBrightness => CommandItem {
                 name: "Set Brightness",
                 description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetContrast => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetContrast => CommandItem {
                 name: "Set Contrast",
                 description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetScaleNone => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetScaleNone => CommandItem {
                 name: "Set Scale: None",
                 description: "Do not scale the image (show at actual size 1:1)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetScaleShrink => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetScaleShrink => CommandItem {
                 name: "Set Scale: Shrink to Fit",
                 description: "Scale larger images down to fit, leave smaller images untouched",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetScaleFit => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetScaleFit => CommandItem {
                 name: "Set Scale: Fit View",
                 description: "Scale images up or down to fit the viewport perfectly",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::SetScaleCrop => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::SetScaleCrop => CommandItem {
                 name: "Set Scale: Crop to Fill",
                 description: "Scale images to completely fill the viewport (cropping excess)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
-            Self::CycleScaleMode => &[CommandItem {
+                shortcuts: None,
+            },
+            Self::CycleScaleMode => CommandItem {
                 name: "Cycle Scale Mode",
                 description: "Cycle scale mode",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('s')]),
-            }],
-            Self::PredefinedZoomIn => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('s')]),
+            },
+            Self::PredefinedZoomIn => CommandItem {
                 name: "Predefined Zoom In",
                 description: "Predefined Zoom In",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('I')]),
-            }],
-            Self::PredefinedZoomOut => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('I')]),
+            },
+            Self::PredefinedZoomOut => CommandItem {
                 name: "Predefined Zoom Out",
                 description: "Predefined Zoom Out",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('O')]),
-            }],
-            Self::IncreaseBrightness => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('O')]),
+            },
+            Self::IncreaseBrightness => CommandItem {
                 name: "Increase Brightness",
                 description: "Increase brightness by 10",
                 show_in_palette: true,
-                group: CommandGroup::Brightness(&[KeyDef::Char('b')]),
-            }],
-            Self::DecreaseBrightness => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('b')]),
+            },
+            Self::DecreaseBrightness => CommandItem {
                 name: "Decrease Brightness",
                 description: "Decrease brightness by 10",
                 show_in_palette: true,
-                group: CommandGroup::Brightness(&[KeyDef::Char('B')]),
-            }],
-            Self::IncreaseContrast => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('B')]),
+            },
+            Self::IncreaseContrast => CommandItem {
                 name: "Increase Contrast",
                 description: "Increase contrast by 5%",
                 show_in_palette: true,
-                group: CommandGroup::Contrast(&[KeyDef::Char('c')]),
-            }],
-            Self::DecreaseContrast => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('c')]),
+            },
+            Self::DecreaseContrast => CommandItem {
                 name: "Decrease Contrast",
                 description: "Decrease contrast by 5%",
                 show_in_palette: true,
-                group: CommandGroup::Contrast(&[KeyDef::Char('C')]),
-            }],
-            Self::PanLeft => &[
-                CommandItem {
-                    name: "Pan Left",
-                    description: "Pan view left",
-                    show_in_palette: true,
-                    group: CommandGroup::Pan(&[KeyDef::Char('h')]),
-                },
-                CommandItem {
-                    name: "Pan Left",
-                    description: "Pan view left",
-                    show_in_palette: false,
-                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Left)]),
-                },
-            ],
-            Self::PanRight => &[
-                CommandItem {
-                    name: "Pan Right",
-                    description: "Pan view right",
-                    show_in_palette: true,
-                    group: CommandGroup::Pan(&[KeyDef::Char('l')]),
-                },
-                CommandItem {
-                    name: "Pan Right",
-                    description: "Pan view right",
-                    show_in_palette: false,
-                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Right)]),
-                },
-            ],
-            Self::PanUp => &[
-                CommandItem {
-                    name: "Pan Up",
-                    description: "Pan view up",
-                    show_in_palette: true,
-                    group: CommandGroup::Pan(&[KeyDef::Char('k')]),
-                },
-                CommandItem {
-                    name: "Pan Up",
-                    description: "Pan view up",
-                    show_in_palette: false,
-                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Up)]),
-                },
-            ],
-            Self::PanDown => &[
-                CommandItem {
-                    name: "Pan Down",
-                    description: "Pan view down",
-                    show_in_palette: true,
-                    group: CommandGroup::Pan(&[KeyDef::Char('j')]),
-                },
-                CommandItem {
-                    name: "Pan Down",
-                    description: "Pan view down",
-                    show_in_palette: false,
-                    group: CommandGroup::Pan(&[KeyDef::Code(event::KeyCode::Down)]),
-                },
-            ],
-            Self::ToggleHelp => &[],
-            Self::CommandPalette => &[CommandItem {
-                name: "Command Palette",
-                description: "Command Palette",
+                shortcuts: Some(&[KeyDef::Char('C')]),
+            },
+            Self::PanLeft => CommandItem {
+                name: "Pan Left",
+                description: "Pan view left",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char(':')]),
-            }],
-            Self::FileSearch => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('h'), KeyDef::Code(event::KeyCode::Left)]),
+            },
+            Self::PanRight => CommandItem {
+                name: "Pan Right",
+                description: "Pan view right",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('l'), KeyDef::Code(event::KeyCode::Right)]),
+            },
+            Self::PanUp => CommandItem {
+                name: "Pan Up",
+                description: "Pan view up",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('k'), KeyDef::Code(event::KeyCode::Up)]),
+            },
+            Self::PanDown => CommandItem {
+                name: "Pan Down",
+                description: "Pan view down",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('j'), KeyDef::Code(event::KeyCode::Down)]),
+            },
+            Self::CommandPalette => CommandItem {
+                name: "Command Palette",
+                description: "Open the Command Palette to search commands & shortcuts",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char(':'), KeyDef::Char('?'), KeyDef::Char('/')]),
+            },
+            Self::FileSearch => CommandItem {
                 name: "File Search",
                 description: "File Search",
                 show_in_palette: true,
-                group: CommandGroup::Normal(&[KeyDef::Char('f')]),
-            }],
-            Self::SlideshowIncrease => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('f')]),
+            },
+            Self::SlideshowIncrease => CommandItem {
                 name: "Increase Slideshow",
                 description: "Increase slideshow by 1s",
                 show_in_palette: true,
-                group: CommandGroup::Slideshow(&[KeyDef::Char('t')]),
-            }],
-            Self::SlideshowDecrease => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('t')]),
+            },
+            Self::SlideshowDecrease => CommandItem {
                 name: "Decrease Slideshow",
                 description: "Decrease slideshow by 1s",
                 show_in_palette: true,
-                group: CommandGroup::Slideshow(&[KeyDef::Char('T')]),
-            }],
-            Self::SetSlideshow => &[CommandItem {
+                shortcuts: Some(&[KeyDef::Char('T')]),
+            },
+            Self::SetSlideshow => CommandItem {
                 name: "Set Slideshow",
                 description: "Set slideshow duration in seconds or offset (e.g. 5, +1, -1)",
                 show_in_palette: true,
-                group: CommandGroup::Hidden,
-            }],
+                shortcuts: None,
+            },
         }
     }
 }
@@ -1000,11 +925,9 @@ impl Command {
 pub fn get_commands() -> &'static [CommandItem] {
     static LIST: std::sync::OnceLock<Vec<CommandItem>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
-        let mut list = Vec::new();
-        for cmd in <Command as strum::IntoEnumIterator>::iter() {
-            list.extend_from_slice(cmd.get_metadata());
-        }
-        list
+        <Command as strum::IntoEnumIterator>::iter()
+            .map(|cmd| cmd.get_metadata())
+            .collect()
     })
 }
 
@@ -1027,7 +950,6 @@ pub struct App {
     pub pan_offset: (i64, i64),
 
     pub running: bool,
-    pub show_help: bool,
     pub error_message: Option<String>,
 
     pub last_widget_size: (u16, u16),
@@ -1062,7 +984,6 @@ pub struct App {
     pub loading_start_time: Option<Instant>,
     pub clear_on_protocol_receive: bool,
     pub zoom_needs_initialization: bool,
-    pub last_help_toggle: Option<Instant>,
     pub brightness: i32,
     pub contrast: f32,
     prefetch_cache: PrefetchCache,
@@ -1157,7 +1078,6 @@ impl App {
             zoom_factor: 1.0,
             pan_offset: (0, 0),
             running: true,
-            show_help: false,
             error_message: None,
             last_widget_size: (0, 0),
             needs_update: true,
@@ -1184,7 +1104,6 @@ impl App {
             loading_start_time: None,
             clear_on_protocol_receive: false,
             zoom_needs_initialization: false,
-            last_help_toggle: None,
             brightness: 0,
             contrast: 0.0,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1250,10 +1169,9 @@ impl App {
         if query.is_empty() {
             let mut list = Vec::new();
             for cmd in <Command as strum::IntoEnumIterator>::iter() {
-                for item in cmd.get_metadata() {
-                    if item.show_in_palette {
-                        list.push(PaletteCommand { cmd, item });
-                    }
+                let item = cmd.get_metadata();
+                if item.show_in_palette {
+                    list.push(PaletteCommand { cmd, item });
                 }
             }
             return list;
@@ -1268,7 +1186,7 @@ impl App {
         #[derive(Clone)]
         struct CmdCandidate {
             cmd: Command,
-            item_index: usize,
+            item: CommandItem,
             search_text: String,
         }
         impl AsRef<str> for CmdCandidate {
@@ -1279,34 +1197,27 @@ impl App {
 
         let mut candidates = Vec::new();
         for cmd in <Command as strum::IntoEnumIterator>::iter() {
-            for (item_index, item) in cmd.get_metadata().iter().enumerate() {
-                if item.show_in_palette {
-                    candidates.push(CmdCandidate {
-                        cmd,
-                        item_index,
-                        search_text: format!("{} {}", item.name, item.description),
-                    });
-                }
+            let item = cmd.get_metadata();
+            if item.show_in_palette {
+                candidates.push(CmdCandidate {
+                    cmd,
+                    item,
+                    search_text: format!("{} {}", item.name, item.description),
+                });
             }
         }
 
         let mut matches = pattern.match_list(candidates, &mut self.matcher);
         matches.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| {
-                (a.0.cmd as usize)
-                    .cmp(&(b.0.cmd as usize))
-                    .then_with(|| a.0.item_index.cmp(&b.0.item_index))
-            })
+            b.1.cmp(&a.1)
+                .then_with(|| (a.0.cmd as usize).cmp(&(b.0.cmd as usize)))
         });
 
         matches
             .into_iter()
-            .map(|(candidate, _score)| {
-                let item = &candidate.cmd.get_metadata()[candidate.item_index];
-                PaletteCommand {
-                    cmd: candidate.cmd,
-                    item,
-                }
+            .map(|(candidate, _score)| PaletteCommand {
+                cmd: candidate.cmd,
+                item: candidate.item,
             })
             .collect()
     }
@@ -1341,10 +1252,6 @@ impl App {
 
     pub fn execute_command(&mut self, cmd: Command) {
         match cmd {
-            Command::ShowHelp => {
-                self.show_help = true;
-                self.needs_clear = true;
-            }
             Command::ResetView => self.reset_view(),
             Command::ActualSize => self.set_actual_size(),
             Command::RotateClockwise => self.rotate_clockwise(),
@@ -1413,7 +1320,6 @@ impl App {
             Command::PanRight => self.pan_right(),
             Command::PanUp => self.pan_up(),
             Command::PanDown => self.pan_down(),
-            Command::ToggleHelp => self.toggle_help(),
             Command::CommandPalette => self.open_palette(PaletteMode::Command),
             Command::FileSearch => self.open_palette(PaletteMode::File),
             Command::SlideshowIncrease => {
@@ -2102,22 +2008,6 @@ impl App {
         self.apply_scale_mode();
     }
 
-    pub fn toggle_help(&mut self) {
-        let now = Instant::now();
-        if let Some(last) = self.last_help_toggle
-            && now.duration_since(last) < std::time::Duration::from_millis(150)
-        {
-            return;
-        }
-        self.last_help_toggle = Some(now);
-        self.show_help = !self.show_help;
-        if !self.show_help {
-            self.needs_update = true;
-            self.needs_clear_once = true;
-        }
-        self.needs_clear = true;
-    }
-
     pub fn increase_brightness(&mut self) {
         if self.original_image.is_none() || self.is_loading {
             return;
@@ -2569,116 +2459,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::White).bg(Color::Reset));
         frame.render_widget(mid_para, status_chunks[1]);
 
-        let right_text = "Press '?' for help ";
+        let right_text = "Press '?' for commands ";
         let right_para = Paragraph::new(right_text)
             .alignment(Alignment::Right)
             .style(Style::default().fg(Color::White).bg(Color::Reset));
         frame.render_widget(right_para, status_chunks[2]);
-    }
-
-    // Help Popup overlay
-    if app.show_help {
-        let mut help_lines = vec![
-            Line::from(" imv-tui Keyboard Shortcuts ".bold().yellow()),
-            Line::from(" ───────────────────────────────── ".gray()),
-        ];
-        let mut printed_brightness = false;
-        let mut printed_contrast = false;
-        let mut printed_pan_vim = false;
-        let mut printed_pan_arrows = false;
-        let mut printed_slideshow = false;
-
-        for cmd in <Command as strum::IntoEnumIterator>::iter() {
-            for def in cmd.get_metadata() {
-                match def.group {
-                    CommandGroup::Hidden => {}
-                    CommandGroup::Normal(bindings) => {
-                        if !bindings.is_empty() {
-                            let shortcut = bindings
-                                .iter()
-                                .map(|b| b.format())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            help_lines.push(Line::from(vec![
-                                format!("  {:<15}", shortcut).cyan(),
-                                format!("- {}", def.description).into(),
-                            ]));
-                        }
-                    }
-                    CommandGroup::Brightness(_) => {
-                        if !printed_brightness {
-                            printed_brightness = true;
-                            help_lines.push(Line::from(vec![
-                                format!("  {:<15}", "b, B").cyan(),
-                                "- Brightness +/-".into(),
-                            ]));
-                        }
-                    }
-                    CommandGroup::Contrast(_) => {
-                        if !printed_contrast {
-                            printed_contrast = true;
-                            help_lines.push(Line::from(vec![
-                                format!("  {:<15}", "c, C").cyan(),
-                                "- Contrast +/-".into(),
-                            ]));
-                        }
-                    }
-                    CommandGroup::Pan(bindings) => {
-                        if let Some(first_bind) = bindings.first() {
-                            match first_bind {
-                                KeyDef::Char(_) if !printed_pan_vim => {
-                                    printed_pan_vim = true;
-                                    help_lines.push(Line::from(vec![
-                                        format!("  {:<15}", "h, j, k, l").cyan(),
-                                        "- Pan Left/Down/Up/Right".into(),
-                                    ]));
-                                }
-                                KeyDef::Code(_) if !printed_pan_arrows => {
-                                    printed_pan_arrows = true;
-                                    help_lines.push(Line::from(vec![
-                                        format!("  {:<15}", "Arrow Keys").cyan(),
-                                        "- Pan image".into(),
-                                    ]));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    CommandGroup::Slideshow(_) => {
-                        if !printed_slideshow {
-                            printed_slideshow = true;
-                            help_lines.push(Line::from(vec![
-                                format!("  {:<15}", "t, T").cyan(),
-                                "- Slideshow +/- 1s".into(),
-                            ]));
-                        }
-                    }
-                }
-            }
-        }
-
-        let help_paragraph = Paragraph::new(help_lines)
-            .block(
-                Block::default()
-                    .title(" Help ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title_style(Style::default().fg(Color::Yellow).bold()),
-            )
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-
-        let help_width = 44_u16;
-        let help_height = 23_u16;
-
-        let w = help_width.min(chunks[0].width.saturating_sub(1));
-        let h = help_height.min(chunks[0].height.saturating_sub(1));
-        let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
-        let y = chunks[0].y.saturating_add(1);
-
-        let popup_area = Rect::new(x, y, w, h);
-        frame.render_widget(Clear, popup_area);
-        frame.render_widget(help_paragraph, popup_area);
     }
 
     // Command / File Palette popup
@@ -2840,7 +2625,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
                         .skip(start_idx)
                         .take(visible_count)
                     {
-                        let cmd_line = vec![
+                        let mut keys = Vec::new();
+                        let item = cmd.cmd.get_metadata();
+                        if let Some(bindings) = item.shortcuts {
+                            for bind in bindings {
+                                keys.push(bind.format());
+                            }
+                        }
+                        let shortcut_str = keys.join(", ");
+
+                        let mut cmd_line = vec![
                             if i == app.palette_selected_index {
                                 " > "
                             } else {
@@ -2848,9 +2642,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
                             }
                             .into(),
                             cmd.item.name.bold(),
-                            " - ".into(),
-                            cmd.item.description.gray(),
                         ];
+
+                        if !shortcut_str.is_empty() {
+                            cmd_line.push(" [".into());
+                            cmd_line.push(shortcut_str.cyan());
+                            cmd_line.push("]".into());
+                        }
+
+                        cmd_line.push(" - ".into());
+                        cmd_line.push(cmd.item.description.gray());
                         let mut line = Line::from(cmd_line);
                         if i == app.palette_selected_index {
                             line = line.yellow().on_blue();
@@ -3272,48 +3073,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             }
                         } else {
-                            let mut key_handled = false;
-                            if app.show_help {
-                                match key.code {
-                                    KeyCode::Char('?') | KeyCode::Char('/') => {
-                                        app.toggle_help();
-                                        key_handled = true;
-                                    }
-                                    KeyCode::Char('q') | KeyCode::Esc => {
-                                        app.show_help = false;
-                                        app.needs_update = true;
-                                        app.needs_clear_once = true;
-                                        key_handled = true;
-                                    }
-                                    _ => {
-                                        app.show_help = false;
-                                        app.needs_update = true;
-                                        app.needs_clear_once = true;
-                                    }
-                                }
-                            }
-
-                            if !key_handled && let Some(cmd) = Command::from_key(key) {
+                            if let Some(cmd) = Command::from_key(key) {
                                 app.execute_command(cmd);
                             }
                         }
                     }
-                    Event::Mouse(mouse_event) => {
-                        if app.show_help {
-                            app.show_help = false;
-                            app.needs_update = true;
-                            app.needs_clear_once = true;
+                    Event::Mouse(mouse_event) => match mouse_event.kind {
+                        MouseEventKind::ScrollUp => {
+                            app.execute_command(Command::ZoomIn);
                         }
-                        match mouse_event.kind {
-                            MouseEventKind::ScrollUp => {
-                                app.execute_command(Command::ZoomIn);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                app.execute_command(Command::ZoomOut);
-                            }
-                            _ => {}
+                        MouseEventKind::ScrollDown => {
+                            app.execute_command(Command::ZoomOut);
                         }
-                    }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
