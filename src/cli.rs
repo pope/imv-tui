@@ -1,17 +1,18 @@
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use crate::image_worker::SlideshowConfig;
+use crate::image_worker::{SlideshowConfig, FilterType, ScaleMode};
+use ratatui_image::picker::ProtocolType;
 
 /// Parsed CLI option arguments.
 pub struct CliOptions {
     /// Initial path to display (can be a local file or directory, or cbz archive).
     pub initial_path: Option<PathBuf>,
     /// Scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming.
-    pub filter: Option<String>,
+    pub filter: FilterType,
     /// Terminal graphics protocol option: kitty, sixel, halfblocks, iterm2.
-    pub protocol: Option<String>,
+    pub protocol: Option<ProtocolType>,
     /// Image scale mode: none, actual, shrink, full, crop.
-    pub scale: Option<String>,
+    pub scale: ScaleMode,
     /// Delay duration in seconds for slideshow transitions.
     pub slideshow: Option<SlideshowConfig>,
     /// If true, validates files by checking their magic bytes instead of extensions.
@@ -26,11 +27,41 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
     if is_piped {
         use std::io::BufRead;
         let stdin = io::stdin();
-        for line in stdin.lock().lines().map_while(Result::ok) {
-            let path = PathBuf::from(line.trim());
-            if path.exists() && path.is_file() {
-                piped_files.push(path);
+        let mut handle = stdin.lock();
+        let mut buf = Vec::new();
+
+        // Read line-by-line using raw bytes to support non-UTF-8 unix paths
+        while let Ok(n) = handle.read_until(b'\n', &mut buf) {
+            if n == 0 {
+                break;
             }
+            // Trim trailing \n and \r
+            let mut len = buf.len();
+            while len > 0 && (buf[len - 1] == b'\n' || buf[len - 1] == b'\r') {
+                len -= 1;
+            }
+            buf.truncate(len);
+
+            if !buf.is_empty() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStringExt;
+                    let path = PathBuf::from(std::ffi::OsString::from_vec(buf.clone()));
+                    if path.exists() && path.is_file() {
+                        piped_files.push(path);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    if let Ok(s) = std::str::from_utf8(&buf) {
+                        let path = PathBuf::from(s);
+                        if path.exists() && path.is_file() {
+                            piped_files.push(path);
+                        }
+                    }
+                }
+            }
+            buf.clear();
         }
 
         // Reopen stdin from /dev/tty so crossterm can read keyboard inputs!
@@ -40,7 +71,7 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
             if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
                 let fd = tty.as_raw_fd();
                 unsafe {
-                    libc::dup2(fd, libc::STDIN_FILENO);
+                    let _ = libc::dup2(fd, libc::STDIN_FILENO);
                 }
             }
         }
@@ -48,13 +79,28 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
     piped_files
 }
 
+/// Helper function to retrieve flag value and avoid argument hijacking.
+fn get_arg(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    if *i + 1 < args.len() {
+        let val = &args[*i + 1];
+        if val.starts_with('-') {
+            return Err(format!("Error: Argument for {} cannot be another option ({})", flag, val));
+        }
+        let res = val.clone();
+        *i += 2;
+        Ok(res)
+    } else {
+        Err(format!("Error: Option {} requires an argument", flag))
+    }
+}
+
 /// Parses the command-line options from environment arguments.
 pub fn parse_cli_args() -> Result<CliOptions, String> {
     let args: Vec<String> = std::env::args().collect();
-    let mut initial_path = None;
-    let mut filter = None;
+    let mut initial_path: Option<PathBuf> = None;
+    let mut filter = FilterType::Nearest;
     let mut protocol = None;
-    let mut scale = None;
+    let mut scale = ScaleMode::Shrink;
     let mut slideshow = None;
     let mut check_magic = false;
 
@@ -62,45 +108,64 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--filter" | "-f" => {
-                if i + 1 < args.len() {
-                    filter = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    return Err(
-                        "Error: --filter / -f requires an argument (nearest, linear, cubic, mitchell, gaussian, lanczos, hamming)".into()
-                    );
-                }
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                filter = match val.to_lowercase().as_str() {
+                    "nearest" => FilterType::Nearest,
+                    "linear" => FilterType::Triangle,
+                    "cubic" => FilterType::CatmullRom,
+                    "mitchell" => FilterType::Mitchell,
+                    "gaussian" => FilterType::Gaussian,
+                    "lanczos" => FilterType::Lanczos3,
+                    "hamming" => FilterType::Hamming,
+                    other => {
+                        return Err(format!(
+                            "Error: Unknown filter '{}'. Choose from: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming",
+                            other
+                        ));
+                    }
+                };
             }
             "--protocol" | "-p" => {
-                if i + 1 < args.len() {
-                    protocol = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    return Err(
-                        "Error: --protocol / -p requires an argument (kitty, sixel, halfblocks, iterm2)".into()
-                    );
-                }
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                let proto = match val.to_lowercase().as_str() {
+                    "kitty" => ProtocolType::Kitty,
+                    "sixel" => ProtocolType::Sixel,
+                    "halfblocks" | "halfblock" => ProtocolType::Halfblocks,
+                    "iterm2" => ProtocolType::Iterm2,
+                    other => {
+                        return Err(format!(
+                            "Error: Unknown protocol '{}'. Choose from: kitty, sixel, halfblocks, iterm2",
+                            other
+                        ));
+                    }
+                };
+                protocol = Some(proto);
             }
             "--scale" | "-s" => {
-                if i + 1 < args.len() {
-                    scale = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    return Err(
-                        "Error: --scale / -s requires an argument (none, actual, shrink, full, crop)".into()
-                    );
-                }
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                scale = match val.to_lowercase().as_str() {
+                    "none" | "actual" => ScaleMode::None,
+                    "shrink" => ScaleMode::Shrink,
+                    "full" | "fit" => ScaleMode::Full,
+                    "crop" => ScaleMode::Crop,
+                    other => {
+                        return Err(format!(
+                            "Error: Unknown scale mode '{}'. Choose from: none, actual, shrink, full, crop",
+                            other
+                        ));
+                    }
+                };
             }
             "--slideshow" | "-t" => {
-                if i + 1 < args.len() {
-                    if let Ok(config) = args[i + 1].parse::<SlideshowConfig>() {
-                        slideshow = Some(config);
-                    } else {
-                        return Err("Error: -t / --slideshow requires a positive integer argument".into());
-                    }
-                    i += 2;
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                if let Ok(config) = val.parse::<SlideshowConfig>() {
+                    slideshow = Some(config);
                 } else {
-                    return Err("Error: -t / --slideshow requires an argument".into());
+                    return Err("Error: -t / --slideshow requires a positive integer argument".into());
                 }
             }
             "--check-magic" | "-m" => {
@@ -132,9 +197,17 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 std::process::exit(0);
             }
             val => {
-                if initial_path.is_none() {
-                    initial_path = Some(PathBuf::from(val));
+                if val.starts_with('-') {
+                    return Err(format!("Error: Unknown option '{}'", val));
                 }
+                if let Some(ref path) = initial_path {
+                    return Err(format!(
+                        "Error: Only a single path argument is supported, but multiple paths were provided: '{}' and '{}'",
+                        path.display(),
+                        val
+                    ));
+                }
+                initial_path = Some(PathBuf::from(val));
                 i += 1;
             }
         }

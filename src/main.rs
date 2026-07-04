@@ -14,33 +14,42 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::Picker;
 
 use crate::app::App;
 use crate::cli::{parse_cli_args, read_piped_stdin};
 use crate::image_worker::{
-    FilterType, ImageSource, ScaleMode, collect_sources, is_cbz_or_zip, list_cbz_pages,
-    scan_directory,
+    ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory,
 };
 use crate::ui::ui;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Check if we have piped input via stdin (e.g. from fd or find)
     let piped_files = read_piped_stdin();
     let is_piped = !piped_files.is_empty();
 
     // Parse CLI arguments
-    let options = match parse_cli_args() {
-        Ok(opts) => opts,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
+    let options = parse_cli_args()?;
     let initial_path = options.initial_path;
-    let filter_opt = options.filter;
-    let protocol_opt = options.protocol;
-    let scale_opt = options.scale;
+    let initial_filter = options.filter;
+    let scale_mode = options.scale;
     let slideshow_opt = options.slideshow;
     let check_magic = options.check_magic;
 
@@ -67,76 +76,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let initial_filter = match filter_opt.as_deref() {
-        Some("nearest") => FilterType::Nearest,
-        Some("linear") => FilterType::Triangle,
-        Some("cubic") => FilterType::CatmullRom,
-        Some("mitchell") => FilterType::Mitchell,
-        Some("gaussian") => FilterType::Gaussian,
-        Some("lanczos") => FilterType::Lanczos3,
-        Some("hamming") => FilterType::Hamming,
-        Some(other) => {
-            eprintln!(
-                "Error: Unknown filter '{}'. Choose from: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming",
-                other
-            );
-            std::process::exit(1);
-        }
-        None => FilterType::Nearest,
-    };
-
-    let scale_mode = match scale_opt.as_deref() {
-        Some("none") | Some("actual") => ScaleMode::None,
-        Some("shrink") => ScaleMode::Shrink,
-        Some("full") | Some("fit") => ScaleMode::Full,
-        Some("crop") => ScaleMode::Crop,
-        Some(other) => {
-            eprintln!(
-                "Error: Unknown scale mode '{}'. Choose from: none, actual, shrink, full, crop",
-                other
-            );
-            std::process::exit(1);
-        }
-        None => ScaleMode::Shrink,
-    };
-
     // Query terminal protocol before raw mode
     let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    if let Some(proto_str) = protocol_opt.as_deref() {
-        let proto = match proto_str.to_lowercase().as_str() {
-            "kitty" => ProtocolType::Kitty,
-            "sixel" => ProtocolType::Sixel,
-            "halfblocks" | "halfblock" => ProtocolType::Halfblocks,
-            "iterm2" => ProtocolType::Iterm2,
-            other => {
-                eprintln!(
-                    "Error: Unknown protocol '{}'. Choose from: kitty, sixel, halfblocks, iterm2",
-                    other
-                );
-                std::process::exit(1);
-            }
-        };
+    if let Some(proto) = options.protocol {
         picker.set_protocol_type(proto);
     }
 
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Setup terminal using RAII guard
+    let _guard = TerminalGuard::new()?;
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = match App::new(images, current_index, picker, initial_filter, scale_mode) {
-        Ok(app) => app,
-        Err(e) => {
-            // Restore terminal on init error
-            disable_raw_mode()?;
-            execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-            eprintln!("Initialization Error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let mut app = App::new(images, current_index, picker, initial_filter, scale_mode)?;
     if let Some(cfg) = slideshow_opt {
         app.slideshow_config = cfg;
         app.slideshow_last_transition = std::time::Instant::now();
@@ -183,14 +136,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Cleanup terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
     Ok(())
+}
+
+fn main() {
+    // Register custom panic hook that restores standard terminal mode
+    // before displaying panic details on console stderr.
+    std::panic::set_hook(Box::new(|panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        eprintln!("Application Panicked:\n{}", panic_info);
+    }));
+
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 }
