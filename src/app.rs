@@ -11,8 +11,39 @@ use strum::IntoEnumIterator;
 use crate::commands::{Command, CommandItem, PaletteCommand, get_commands};
 use crate::image_worker::{
     FilterType, ImageSource, LoaderRequest, LoaderResponse, ResizeRequest, ScaleMode,
-    decode_image_source, process_resize,
+    decode_image_source, process_resize, Brightness, Contrast, PanOffset, CropBox, ImageIntersection,
 };
+/// Represents an absolute or relative adjustment to a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adjustment<T> {
+    /// An absolute value assignment.
+    Absolute(T),
+    /// A relative addition to the current value.
+    RelativeAdd(T),
+    /// A relative subtraction from the current value.
+    RelativeSub(T),
+}
+
+impl<T: std::str::FromStr> std::str::FromStr for Adjustment<T> {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("Empty input".to_string());
+        }
+        if let Some(stripped) = s.strip_prefix('+') {
+            let val = stripped.parse::<T>().map_err(|_| "Invalid positive offset".to_string())?;
+            Ok(Self::RelativeAdd(val))
+        } else if let Some(stripped) = s.strip_prefix('-') {
+            let val = stripped.parse::<T>().map_err(|_| "Invalid negative offset".to_string())?;
+            Ok(Self::RelativeSub(val))
+        } else {
+            let val = s.parse::<T>().map_err(|_| "Invalid absolute value".to_string())?;
+            Ok(Self::Absolute(val))
+        }
+    }
+}
 
 /// The specific input prompt type.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,7 +98,7 @@ pub struct App {
     /// Zoom multiplier relative to fit scale.
     pub zoom_factor: f64,
     /// Viewport panning coordinate offset.
-    pub pan_offset: (i64, i64),
+    pub pan_offset: PanOffset,
 
     /// Application run lifecycle boolean.
     pub running: bool,
@@ -126,9 +157,9 @@ pub struct App {
     /// Flag to force scale mode view recalculation on load.
     pub zoom_needs_initialization: bool,
     /// Active brightness bias value.
-    pub brightness: i32,
+    pub brightness: Brightness,
     /// Active contrast bias value.
-    pub contrast: f32,
+    pub contrast: Contrast,
     prefetch_cache: PrefetchCache,
     /// Duration in seconds between transitions during slideshow mode.
     pub slideshow_seconds: u32,
@@ -223,7 +254,7 @@ impl App {
             img_width: 0,
             img_height: 0,
             zoom_factor: 1.0,
-            pan_offset: (0, 0),
+            pan_offset: PanOffset::ZERO,
             running: true,
             error_message: None,
             last_widget_size: (0, 0),
@@ -251,8 +282,8 @@ impl App {
             loading_start_time: None,
             clear_on_protocol_receive: false,
             zoom_needs_initialization: false,
-            brightness: 0,
-            contrast: 0.0,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
             slideshow_seconds: 0,
             slideshow_last_transition: std::time::Instant::now(),
@@ -522,88 +553,81 @@ impl App {
     }
 
     pub fn execute_prompt(&mut self, prompt_type: PromptType) {
-        match prompt_type {
-            PromptType::GoToImage => {
-                let input = self.palette_query.trim();
-                if !input.is_empty() && !self.images.is_empty() {
+        (|| {
+            match prompt_type {
+                PromptType::GoToImage => {
+                    if self.images.is_empty() {
+                        return;
+                    }
+                    let input = self.palette_query.trim();
+                    let Ok(adj) = input.parse::<Adjustment<usize>>() else {
+                        return;
+                    };
                     let mut new_idx = self.current_index;
-                    if let Some(stripped) = input.strip_prefix('+') {
-                        if let Ok(offset) = stripped.parse::<usize>() {
-                            new_idx = (self.current_index + offset).min(self.images.len() - 1);
+                    match adj {
+                        Adjustment::Absolute(val) => {
+                            if let Some(val_minus_1) = val.checked_sub(1) {
+                                new_idx = val_minus_1.min(self.images.len() - 1);
+                            }
                         }
-                    } else if let Some(stripped) = input.strip_prefix('-') {
-                        if let Ok(offset) = stripped.parse::<usize>() {
-                            new_idx = self.current_index.saturating_sub(offset);
+                        Adjustment::RelativeAdd(val) => {
+                            new_idx = (self.current_index + val).min(self.images.len() - 1);
                         }
-                    } else if let Ok(Some(val_minus_1)) =
-                        input.parse::<usize>().map(|v| v.checked_sub(1))
-                    {
-                        new_idx = val_minus_1.min(self.images.len() - 1);
+                        Adjustment::RelativeSub(val) => {
+                            new_idx = self.current_index.saturating_sub(val);
+                        }
                     }
                     if new_idx != self.current_index {
                         self.current_index = new_idx;
                         self.start_load_image();
                     }
                 }
-            }
-            PromptType::SetBrightness => {
-                let input = self.palette_query.trim();
-                if !input.is_empty() && self.original_image.is_some() {
-                    let mut new_val = self.brightness;
-                    if let Some(stripped) = input.strip_prefix('+') {
-                        if let Ok(offset) = stripped.parse::<i32>() {
-                            new_val = self.brightness + offset;
-                        }
-                    } else if let Some(stripped) = input.strip_prefix('-') {
-                        if let Ok(offset) = stripped.parse::<i32>() {
-                            new_val = self.brightness - offset;
-                        }
-                    } else if let Ok(val) = input.parse::<i32>() {
-                        new_val = val;
+                PromptType::SetBrightness => {
+                    if self.original_image.is_none() {
+                        return;
                     }
-                    let new_val = new_val.clamp(-255, 255);
-                    if new_val != self.brightness {
-                        self.brightness = new_val;
+                    let input = self.palette_query.trim();
+                    let Ok(adj) = input.parse::<Adjustment<i32>>() else {
+                        return;
+                    };
+                    let old = self.brightness;
+                    match adj {
+                        Adjustment::Absolute(val) => self.brightness = Brightness::new(val),
+                        Adjustment::RelativeAdd(val) => self.brightness.adjust(val),
+                        Adjustment::RelativeSub(val) => self.brightness.adjust(-val),
+                    }
+                    if old != self.brightness {
                         self.needs_update = true;
                     }
                 }
-            }
-            PromptType::SetContrast => {
-                let input = self.palette_query.trim();
-                if !input.is_empty() && self.original_image.is_some() {
-                    let mut new_val = self.contrast;
-                    if let Some(stripped) = input.strip_prefix('+') {
-                        if let Ok(offset) = stripped.parse::<f32>() {
-                            new_val = self.contrast + offset;
-                        }
-                    } else if let Some(stripped) = input.strip_prefix('-') {
-                        if let Ok(offset) = stripped.parse::<f32>() {
-                            new_val = self.contrast - offset;
-                        }
-                    } else if let Ok(val) = input.parse::<f32>() {
-                        new_val = val;
+                PromptType::SetContrast => {
+                    if self.original_image.is_none() {
+                        return;
                     }
-                    let new_val = new_val.clamp(-255.0, 255.0);
-                    if (new_val - self.contrast).abs() > f32::EPSILON {
-                        self.contrast = new_val;
+                    let input = self.palette_query.trim();
+                    let Ok(adj) = input.parse::<Adjustment<f32>>() else {
+                        return;
+                    };
+                    let mut next = self.contrast;
+                    match adj {
+                        Adjustment::Absolute(val) => next = Contrast::new(val),
+                        Adjustment::RelativeAdd(val) => next.adjust(val),
+                        Adjustment::RelativeSub(val) => next.adjust(-val),
+                    }
+                    if self.contrast.update(next.value()) {
                         self.needs_update = true;
                     }
                 }
-            }
-            PromptType::SetSlideshow => {
-                let input = self.palette_query.trim();
-                if !input.is_empty() {
+                PromptType::SetSlideshow => {
+                    let input = self.palette_query.trim();
+                    let Ok(adj) = input.parse::<Adjustment<u32>>() else {
+                        return;
+                    };
                     let mut new_val = self.slideshow_seconds;
-                    if let Some(stripped) = input.strip_prefix('+') {
-                        if let Ok(offset) = stripped.parse::<u32>() {
-                            new_val = self.slideshow_seconds.saturating_add(offset);
-                        }
-                    } else if let Some(stripped) = input.strip_prefix('-') {
-                        if let Ok(offset) = stripped.parse::<u32>() {
-                            new_val = self.slideshow_seconds.saturating_sub(offset);
-                        }
-                    } else if let Ok(val) = input.parse::<u32>() {
-                        new_val = val;
+                    match adj {
+                        Adjustment::Absolute(val) => new_val = val,
+                        Adjustment::RelativeAdd(val) => new_val = new_val.saturating_add(val),
+                        Adjustment::RelativeSub(val) => new_val = new_val.saturating_sub(val),
                     }
                     if new_val != self.slideshow_seconds {
                         self.slideshow_seconds = new_val;
@@ -611,7 +635,7 @@ impl App {
                     }
                 }
             }
-        }
+        })();
         self.palette_mode = PaletteMode::Closed;
         self.prompt_type = None;
         self.needs_clear_once = true;
@@ -696,9 +720,9 @@ impl App {
             self.img_width = w;
             self.img_height = h;
             self.zoom_factor = 1.0;
-            self.pan_offset = (0, 0);
-            self.brightness = 0;
-            self.contrast = 0.0;
+            self.pan_offset = PanOffset::ZERO;
+            self.brightness = Brightness::ZERO;
+            self.contrast = Contrast::ZERO;
             self.is_loading = false;
             self.needs_update = true;
             self.zoom_needs_initialization = true;
@@ -747,9 +771,9 @@ impl App {
                         self.original_image = Some(shared_img);
                         self.error_message = None;
                         self.zoom_factor = 1.0;
-                        self.pan_offset = (0, 0);
-                        self.brightness = 0;
-                        self.contrast = 0.0;
+                        self.pan_offset = PanOffset::ZERO;
+                        self.brightness = Brightness::ZERO;
+                        self.contrast = Contrast::ZERO;
                         self.needs_update = true;
                         self.zoom_needs_initialization = true;
                         self.trigger_prefetch();
@@ -818,7 +842,7 @@ impl App {
                     ScaleMode::Full => 1.0,
                     ScaleMode::Crop => s_w.max(s_h) / s,
                 };
-                self.pan_offset = (0, 0);
+                self.pan_offset = PanOffset::ZERO;
             }
 
             // 2. Combined scale is s * zoom_factor
@@ -838,8 +862,8 @@ impl App {
             let target_h = target_h.max(1);
 
             // Center of crop window is center of image + pan_offset
-            let center_x = (self.img_width as i64 / 2) + self.pan_offset.0;
-            let center_y = (self.img_height as i64 / 2) + self.pan_offset.1;
+            let center_x = (self.img_width as i64 / 2) + self.pan_offset.x;
+            let center_y = (self.img_height as i64 / 2) + self.pan_offset.y;
 
             // Compute top-left of crop box (can be negative if we pan past bounds)
             let crop_x1 = center_x - (crop_w as i64 / 2);
@@ -861,14 +885,8 @@ impl App {
             let req = ResizeRequest {
                 img: Arc::clone(img),
                 scale,
-                crop_x1,
-                crop_y1,
-                crop_x2,
-                crop_y2,
-                inter_x1,
-                inter_y1,
-                inter_x2,
-                inter_y2,
+                crop: CropBox::new(crop_x1, crop_y1, crop_x2, crop_y2),
+                intersection: ImageIntersection::new(inter_x1 as u32, inter_y1 as u32, inter_x2 as u32, inter_y2 as u32),
                 target_w,
                 target_h,
                 filter_type: self.filter_type,
@@ -1086,8 +1104,8 @@ impl App {
             return;
         }
         self.apply_scale_mode();
-        self.brightness = 0;
-        self.contrast = 0.0;
+        self.brightness = Brightness::ZERO;
+        self.contrast = Contrast::ZERO;
         self.clear_on_protocol_receive = true;
     }
 
@@ -1122,7 +1140,7 @@ impl App {
                     s_w.max(s_h) / s
                 }
             };
-            self.pan_offset = (0, 0);
+            self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
         }
     }
@@ -1144,43 +1162,51 @@ impl App {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        self.brightness = (self.brightness + 10).min(255);
-        self.needs_update = true;
+        let old = self.brightness;
+        self.brightness.adjust(10);
+        if old != self.brightness {
+            self.needs_update = true;
+        }
     }
 
     pub fn decrease_brightness(&mut self) {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        self.brightness = (self.brightness - 10).max(-255);
-        self.needs_update = true;
+        let old = self.brightness;
+        self.brightness.adjust(-10);
+        if old != self.brightness {
+            self.needs_update = true;
+        }
     }
 
     pub fn increase_contrast(&mut self) {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        self.contrast = (self.contrast + 10.0).min(255.0);
-        self.needs_update = true;
+        let mut next = self.contrast;
+        next.adjust(10.0);
+        if self.contrast.update(next.value()) {
+            self.needs_update = true;
+        }
     }
 
     pub fn decrease_contrast(&mut self) {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        self.contrast = (self.contrast - 10.0).max(-255.0);
-        self.needs_update = true;
+        let mut next = self.contrast;
+        next.adjust(-10.0);
+        if self.contrast.update(next.value()) {
+            self.needs_update = true;
+        }
     }
 
     pub fn clamp_pan(&mut self) {
         if self.original_image.is_none() {
             return;
         }
-        let max_pan_x = (self.img_width as i64 / 2).max(0);
-        let max_pan_y = (self.img_height as i64 / 2).max(0);
-
-        self.pan_offset.0 = self.pan_offset.0.clamp(-max_pan_x, max_pan_x);
-        self.pan_offset.1 = self.pan_offset.1.clamp(-max_pan_y, max_pan_y);
+        self.pan_offset.clamp(self.img_width, self.img_height);
     }
 
     pub fn pan_left(&mut self) {
@@ -1188,7 +1214,7 @@ impl App {
             return;
         }
         let step = self.pan_step_x();
-        self.pan_offset.0 -= step;
+        self.pan_offset.x -= step;
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1198,7 +1224,7 @@ impl App {
             return;
         }
         let step = self.pan_step_x();
-        self.pan_offset.0 += step;
+        self.pan_offset.x += step;
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1208,7 +1234,7 @@ impl App {
             return;
         }
         let step = self.pan_step_y();
-        self.pan_offset.1 -= step;
+        self.pan_offset.y -= step;
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1218,7 +1244,7 @@ impl App {
             return;
         }
         let step = self.pan_step_y();
-        self.pan_offset.1 += step;
+        self.pan_offset.y += step;
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1245,7 +1271,7 @@ impl App {
             self.img_height = rotated.height();
             self.original_image = Some(Arc::new(rotated));
             self.zoom_factor = 1.0;
-            self.pan_offset = (0, 0);
+            self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
             self.clear_on_protocol_receive = true;
         }
@@ -1261,7 +1287,7 @@ impl App {
             self.img_height = rotated.height();
             self.original_image = Some(Arc::new(rotated));
             self.zoom_factor = 1.0;
-            self.pan_offset = (0, 0);
+            self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
             self.clear_on_protocol_receive = true;
         }

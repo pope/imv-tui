@@ -79,11 +79,11 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(empty_para, inner_rect);
     } else {
         let mut extra_info = String::new();
-        if app.brightness != 0 {
-            extra_info.push_str(&format!(" | Brightness: {:+}", app.brightness));
+        if app.brightness.value() != 0 {
+            extra_info.push_str(&format!(" | Brightness: {:+}", app.brightness.value()));
         }
-        if app.contrast != 0.0 {
-            extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
+        if app.contrast.value() != 0.0 {
+            extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.value().round() as i32));
         }
         if app.slideshow_seconds > 0 {
             extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_seconds));
@@ -125,8 +125,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             app.scale_mode.name(),
             app.filter_name(),
             app.current_zoom_pct.round() as i64,
-            app.pan_offset.0,
-            app.pan_offset.1,
+            app.pan_offset.x,
+            app.pan_offset.y,
             extra_info
         );
         let mid_para = Paragraph::new(mid_text)

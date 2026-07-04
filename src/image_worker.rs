@@ -102,28 +102,186 @@ impl ImageSource {
     }
 }
 
+/// Represents an image brightness adjustment value restricted to [-255, 255].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Brightness(i32);
+
+impl Brightness {
+    /// Zero brightness adjustment.
+    pub const ZERO: Self = Self(0);
+
+    /// Constructor that clamps the value to [-255, 255].
+    pub fn new(val: i32) -> Self {
+        Self(val.clamp(-255, 255))
+    }
+
+    /// Access the underlying raw i32 value.
+    pub fn value(self) -> i32 {
+        self.0
+    }
+
+    /// Mutably adjust by a delta, clamping internally.
+    pub fn adjust(&mut self, delta: i32) {
+        self.0 = (self.0.saturating_add(delta)).clamp(-255, 255);
+    }
+}
+
+/// Represents an image contrast adjustment value restricted to [-255.0, 255.0].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Contrast(f32);
+
+impl Contrast {
+    /// Zero contrast adjustment.
+    pub const ZERO: Self = Self(0.0);
+
+    /// Constructor that clamps the value to [-255.0, 255.0].
+    pub fn new(val: f32) -> Self {
+        Self(if val.is_nan() { 0.0 } else { val.clamp(-255.0, 255.0) })
+    }
+
+    /// Access the underlying raw f32 value.
+    pub fn value(self) -> f32 {
+        self.0
+    }
+
+    /// Mutably adjust by a delta, clamping internally.
+    pub fn adjust(&mut self, delta: f32) {
+        self.0 = (self.0 + delta).clamp(-255.0, 255.0);
+    }
+
+    /// Update with a new value if it differs from the current value by more than f32::EPSILON.
+    pub fn update(&mut self, new_val: f32) -> bool {
+        let proposed = new_val.clamp(-255.0, 255.0);
+        if (proposed - self.0).abs() > f32::EPSILON {
+            self.0 = proposed;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl PartialEq for Contrast {
+    fn eq(&self, other: &Self) -> bool {
+        (self.0 - other.0).abs() <= f32::EPSILON
+    }
+}
+
+/// Stores viewport pan offsets, clamped relative to image dimensions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PanOffset {
+    /// X pan offset in pixels.
+    pub x: i64,
+    /// Y pan offset in pixels.
+    pub y: i64,
+}
+
+impl PanOffset {
+    /// Zero pan offset.
+    pub const ZERO: Self = Self { x: 0, y: 0 };
+
+    /// Constructor with starting coordinates.
+    #[allow(dead_code)]
+    pub fn new(x: i64, y: i64) -> Self {
+        Self { x, y }
+    }
+
+    /// Clamps the panning offset limits relative to the image size.
+    pub fn clamp(&mut self, img_width: u32, img_height: u32) {
+        let max_pan_x = (img_width as i64 / 2).max(0);
+        let max_pan_y = (img_height as i64 / 2).max(0);
+        self.x = self.x.clamp(-max_pan_x, max_pan_x);
+        self.y = self.y.clamp(-max_pan_y, max_pan_y);
+    }
+}
+
+/// A crop viewport in canvas/image space (can extend past image bounds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CropBox {
+    /// Left coordinate.
+    pub x1: i64,
+    /// Top coordinate.
+    pub y1: i64,
+    /// Right coordinate.
+    pub x2: i64,
+    /// Bottom coordinate.
+    pub y2: i64,
+}
+
+impl CropBox {
+    /// Constructor that normalizes coordinates so that x1 <= x2 and y1 <= y2.
+    pub fn new(x1: i64, y1: i64, x2: i64, y2: i64) -> Self {
+        Self {
+            x1: x1.min(x2),
+            y1: y1.min(y2),
+            x2: x1.max(x2),
+            y2: y1.max(y2),
+        }
+    }
+
+    /// Calculates current width of the crop box.
+    #[allow(dead_code)]
+    pub fn width(&self) -> u64 {
+        (self.x2 - self.x1) as u64
+    }
+
+    /// Calculates current height of the crop box.
+    #[allow(dead_code)]
+    pub fn height(&self) -> u64 {
+        (self.y2 - self.y1) as u64
+    }
+}
+
+/// The actual visible intersection region clamped to image dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageIntersection {
+    /// Left clamped coordinate.
+    pub x1: u32,
+    /// Top clamped coordinate.
+    pub y1: u32,
+    /// Right clamped coordinate.
+    pub x2: u32,
+    /// Bottom clamped coordinate.
+    pub y2: u32,
+}
+
+impl ImageIntersection {
+    /// Constructor that normalizes coordinates so that x1 <= x2 and y1 <= y2.
+    pub fn new(x1: u32, y1: u32, x2: u32, y2: u32) -> Self {
+        Self {
+            x1: x1.min(x2),
+            y1: y1.min(y2),
+            x2: x1.max(x2),
+            y2: y1.max(y2),
+        }
+    }
+
+    /// Clamped width of the intersection.
+    pub fn width(&self) -> u32 {
+        self.x2 - self.x1
+    }
+
+    /// Clamped height of the intersection.
+    pub fn height(&self) -> u32 {
+        self.y2 - self.y1
+    }
+
+    /// If true, the intersection is empty (no overlapping region).
+    pub fn is_empty(&self) -> bool {
+        self.x1 >= self.x2 || self.y1 >= self.y2
+    }
+}
+
 /// A request payload sent to the resizing worker threads.
 pub struct ResizeRequest {
     /// Shared reference to the decoded dynamic image.
     pub img: Arc<DynamicImage>,
     /// Calculated scaling factor.
     pub scale: f64,
-    /// Crop box x1.
-    pub crop_x1: i64,
-    /// Crop box y1.
-    pub crop_y1: i64,
-    /// Crop box x2.
-    pub crop_x2: i64,
-    /// Crop box y2.
-    pub crop_y2: i64,
-    /// Rendered intersection x1.
-    pub inter_x1: i64,
-    /// Rendered intersection y1.
-    pub inter_y1: i64,
-    /// Rendered intersection x2.
-    pub inter_x2: i64,
-    /// Rendered intersection y2.
-    pub inter_y2: i64,
+    /// Crop box geometry.
+    pub crop: CropBox,
+    /// Clamped image intersection region.
+    pub intersection: ImageIntersection,
     /// Resized target width.
     pub target_w: u32,
     /// Resized target height.
@@ -133,9 +291,9 @@ pub struct ResizeRequest {
     /// Protocol generator picker.
     pub picker: Picker,
     /// Brightness correction value.
-    pub brightness: i32,
+    pub brightness: Brightness,
     /// Contrast correction percentage.
-    pub contrast: f32,
+    pub contrast: Contrast,
     /// Output terminal grid cell dimensions.
     pub rendered_size_cells: (u16, u16),
 }
@@ -392,16 +550,16 @@ pub fn fast_resize(
 /// Processes a scaling and panning request in the background, creating/rendering
 /// the final scaled viewport on a screen-pixel canvas block to support offscreen panning boundaries.
 pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulProtocol {
-    let mut canvas = if req.inter_x1 == req.crop_x1
-        && req.inter_x2 == req.crop_x2
-        && req.inter_y1 == req.crop_y1
-        && req.inter_y2 == req.crop_y2
+    let mut canvas = if req.intersection.x1 as i64 == req.crop.x1
+        && req.intersection.x2 as i64 == req.crop.x2
+        && req.intersection.y1 as i64 == req.crop.y1
+        && req.intersection.y2 as i64 == req.crop.y2
     {
         let crop_rect = Some((
-            req.inter_x1 as f64,
-            req.inter_y1 as f64,
-            (req.inter_x2 - req.inter_x1) as f64,
-            (req.inter_y2 - req.inter_y1) as f64,
+            req.intersection.x1 as f64,
+            req.intersection.y1 as f64,
+            req.intersection.width() as f64,
+            req.intersection.height() as f64,
         ));
         match fast_resize(
             resizer,
@@ -414,10 +572,10 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
             Ok(resized) => resized,
             Err(_) => {
                 let cropped_part = req.img.crop_imm(
-                    req.inter_x1 as u32,
-                    req.inter_y1 as u32,
-                    (req.inter_x2 - req.inter_x1) as u32,
-                    (req.inter_y2 - req.inter_y1) as u32,
+                    req.intersection.x1,
+                    req.intersection.y1,
+                    req.intersection.width(),
+                    req.intersection.height(),
                 );
                 cropped_part.resize(
                     req.target_w,
@@ -429,17 +587,17 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
     } else {
         let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
 
-        if req.inter_x2 > req.inter_x1 && req.inter_y2 > req.inter_y1 {
+        if !req.intersection.is_empty() {
             let target_inter_w =
-                (((req.inter_x2 - req.inter_x1) as f64 * req.scale).round() as u32).max(1);
+                ((req.intersection.width() as f64 * req.scale).round() as u32).max(1);
             let target_inter_h =
-                (((req.inter_y2 - req.inter_y1) as f64 * req.scale).round() as u32).max(1);
+                ((req.intersection.height() as f64 * req.scale).round() as u32).max(1);
 
             let crop_rect = Some((
-                req.inter_x1 as f64,
-                req.inter_y1 as f64,
-                (req.inter_x2 - req.inter_x1) as f64,
-                (req.inter_y2 - req.inter_y1) as f64,
+                req.intersection.x1 as f64,
+                req.intersection.y1 as f64,
+                req.intersection.width() as f64,
+                req.intersection.height() as f64,
             ));
 
             let resized_part = match fast_resize(
@@ -453,10 +611,10 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
                 Ok(resized) => resized,
                 Err(_) => {
                     let cropped_part = req.img.crop_imm(
-                        req.inter_x1 as u32,
-                        req.inter_y1 as u32,
-                        (req.inter_x2 - req.inter_x1) as u32,
-                        (req.inter_y2 - req.inter_y1) as u32,
+                        req.intersection.x1,
+                        req.intersection.y1,
+                        req.intersection.width(),
+                        req.intersection.height(),
                     );
                     cropped_part.resize(
                         target_inter_w,
@@ -466,8 +624,8 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
                 }
             };
 
-            let paste_x = ((req.inter_x1 - req.crop_x1) as f64 * req.scale).round() as i64;
-            let paste_y = ((req.inter_y1 - req.crop_y1) as f64 * req.scale).round() as i64;
+            let paste_x = ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
+            let paste_y = ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
 
             let paste_x =
                 paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;
@@ -483,11 +641,11 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
         DynamicImage::ImageRgba8(screen_canvas)
     };
 
-    if req.brightness != 0 {
-        canvas = canvas.brighten(req.brightness);
+    if req.brightness.value() != 0 {
+        canvas = canvas.brighten(req.brightness.value());
     }
-    if req.contrast != 0.0 {
-        canvas = canvas.adjust_contrast(req.contrast);
+    if req.contrast.value() != 0.0 {
+        canvas = canvas.adjust_contrast(req.contrast.value());
     }
 
     req.picker.new_resize_protocol(canvas)
