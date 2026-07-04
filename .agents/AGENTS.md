@@ -314,17 +314,30 @@ ______________________________________________________________________
 
 Handling input events and displaying help menus or palette options in TUIs can easily lead to duplication, where key event handler blocks and help overlay strings must be kept manually in sync.
 
-- **Unified Metadata (`CommandGroup`)**: Merging dynamic help/visibility groupings with keyboard shortcuts into a compiler-enforced `CommandGroup` enum forces each variant to bind its key mappings explicitly:
-  ```rust
-  pub enum CommandGroup {
-      Normal(&'static [KeyDef]),
-      Hidden(&'static [KeyDef]),
-  }
-  ```
+- **1-to-1 Command Mappings**: By mapping each variant of the `Command` enum to a single metadata `CommandItem` struct, we centralize description name, palette search visibility, and keyboard shortcuts configuration in one location (`get_metadata()`).
 - **Lifetime Safety & Static Promotion**: Structuring `CommandItem` to store static slices (`&'static [KeyDef]`) and referencing static promotion strings allows slices to be evaluated at compile-time. To pass candidate results containing runtime `Command` identifiers, map queries to a temporary `PaletteCommand` adapter rather than using complex stack allocations inside the static loop.
-- **Dynamic Help Formatting**: Loop over command enumerators to dynamically format shortcut lists (using formatting rules like `KeyDef::format()`), and statically append aggregate/custom groupings at the end of the menu to keep layout rendering simple.
+- **Keyboard Mappings**: Map shortcuts collection as an `Option<&'static [KeyDef]>` to allow both standard keys (e.g. `i`), alternative symbols (e.g. `+`, `=`), and mouse actions (`ScrollUp`) to be bound to the exact same variant in a clean, unified array.
 
 ### Guidelines for Future Work
 
 - Map all keyboard inputs dynamically through `Command::from_key`.
 - Do not hardcode crossterm key comparisons in input listeners. Add the bindings directly to the enum mapping in `get_metadata()`.
+
+______________________________________________________________________
+
+## 17. Modular Encapsulation & File Separation
+
+### The Learning
+
+Storing application logic, UI design, CLI parsing, image workers, and commands in a single monolithic `src/main.rs` file scales poorly, clutters compilation scope, and makes unit-testing or targeted refactoring difficult.
+
+### Guidelines for Future Work
+
+- Keep file responsibilities clean and modularized:
+  - `src/main.rs`: Entry point and raw-mode Crossterm event loop.
+  - `src/cli.rs`: Command line parsing and stdin redirection.
+  - `src/commands.rs`: Mappings of keys, keyboard descriptions, command metadata, and shortcuts.
+  - `src/image_worker.rs`: Image source decoders, directory scans, and background resizers.
+  - `src/app.rs`: State controller and worker thread management.
+  - `src/ui.rs`: Layout and widget rendering views.
+- **Trait Scope Imports**: Ensure trait imports required for generated code (like `strum::IntoEnumIterator` for macro-derived `Command::iter()`) are imported in the scope of files referencing them, rather than relying on global namespace resolution.

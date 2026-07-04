@@ -1,0 +1,508 @@
+use crossterm::event;
+use strum::{EnumIter, IntoEnumIterator};
+
+/// Executable application commands/actions.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter)]
+pub enum Command {
+    /// Exit the application.
+    Quit,
+    /// Display the next image in the active queue.
+    NextImage,
+    /// Display the previous image in the active queue.
+    PreviousImage,
+    /// Zoom in on the current viewport.
+    ZoomIn,
+    /// Zoom out on the current viewport.
+    ZoomOut,
+    /// Predefined step-wise zoom in.
+    PredefinedZoomIn,
+    /// Predefined step-wise zoom out.
+    PredefinedZoomOut,
+    /// Scale image to 100% zoom (1:1 actual pixels).
+    ActualSize,
+    /// Reset the zoom factor, pan, brightness, and contrast.
+    ResetView,
+    /// Brighten the image (increment).
+    IncreaseBrightness,
+    /// Contrast the image (increment).
+    IncreaseContrast,
+    /// Pan view left.
+    PanLeft,
+    /// Pan view right.
+    PanRight,
+    /// Rotate the image 90 degrees clockwise in-memory.
+    RotateClockwise,
+    /// Rotate the image 90 degrees counter-clockwise in-memory.
+    RotateCounterClockwise,
+    /// Cycle through the next image scaling filter.
+    NextFilter,
+    /// Cycle through the next image scale mode.
+    CycleScaleMode,
+    /// Open the command search palette.
+    CommandPalette,
+    /// Open the file fuzzy search palette.
+    FileSearch,
+
+    // Non-help/derived commands:
+    /// Force nearest-neighbor scaling.
+    SetFilterNearest,
+    /// Force linear scaling.
+    SetFilterLinear,
+    /// Force cubic scaling.
+    SetFilterCubic,
+    /// Force mitchell scaling.
+    SetFilterMitchell,
+    /// Force gaussian scaling.
+    SetFilterGaussian,
+    /// Force lanczos scaling.
+    SetFilterLanczos,
+    /// Force hamming scaling.
+    SetFilterHamming,
+    /// Navigate to a specific image index by number.
+    GoToImage,
+    /// Set a precise brightness value.
+    SetBrightness,
+    /// Set a precise contrast percentage.
+    SetContrast,
+    /// Set scaling mode to None.
+    SetScaleNone,
+    /// Set scaling mode to Shrink.
+    SetScaleShrink,
+    /// Set scaling mode to Fit.
+    SetScaleFit,
+    /// Set scaling mode to Crop.
+    SetScaleCrop,
+    /// Darken the image (decrement).
+    DecreaseBrightness,
+    /// De-contrast the image (decrement).
+    DecreaseContrast,
+    /// Pan view up.
+    PanUp,
+    /// Pan view down.
+    PanDown,
+    /// Increase slideshow timer duration.
+    SlideshowIncrease,
+    /// Decrease slideshow timer duration.
+    SlideshowDecrease,
+    /// Set exact slideshow duration in seconds.
+    SetSlideshow,
+}
+
+impl Command {
+    /// Attempts to parse a crossterm key event into a registered Command.
+    pub fn from_key(key: event::KeyEvent) -> Option<Self> {
+        for cmd in Self::iter() {
+            let def = cmd.get_metadata();
+            let bindings = def.shortcuts.unwrap_or(&[]);
+            for bind in bindings {
+                if bind.matches(key) {
+                    return Some(cmd);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_metadata(self) -> CommandItem {
+        match self {
+            Self::ResetView => CommandItem {
+                name: "Reset View",
+                description: "Reset View",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('r')]),
+            },
+            Self::ActualSize => CommandItem {
+                name: "Actual Size",
+                description: "Actual Size",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('a')]),
+            },
+            Self::RotateClockwise => CommandItem {
+                name: "Rotate Clockwise",
+                description: "Rotate CW 90°",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('e'), KeyDef::Char('R'), KeyDef::Char('>')]),
+            },
+            Self::RotateCounterClockwise => CommandItem {
+                name: "Rotate Counter-Clockwise",
+                description: "Rotate CCW 90°",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('E'), KeyDef::Char('<')]),
+            },
+            Self::NextImage => CommandItem {
+                name: "Next Image",
+                description: "Next image",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('n'), KeyDef::Char(' '), KeyDef::Char(']')]),
+            },
+            Self::PreviousImage => CommandItem {
+                name: "Previous Image",
+                description: "Previous image",
+                show_in_palette: true,
+                shortcuts: Some(&[
+                    KeyDef::Char('p'),
+                    KeyDef::Code(event::KeyCode::Backspace),
+                    KeyDef::Char('['),
+                ]),
+            },
+            Self::ZoomIn => CommandItem {
+                name: "Zoom In",
+                description: "Zoom In",
+                show_in_palette: true,
+                shortcuts: Some(&[
+                    KeyDef::Char('i'),
+                    KeyDef::Char('+'),
+                    KeyDef::Char('='),
+                    KeyDef::ScrollUp,
+                ]),
+            },
+            Self::ZoomOut => CommandItem {
+                name: "Zoom Out",
+                description: "Zoom Out",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('o'), KeyDef::Char('-'), KeyDef::ScrollDown]),
+            },
+            Self::Quit => CommandItem {
+                name: "Quit",
+                description: "Quit",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('q'), KeyDef::Code(event::KeyCode::Esc)]),
+            },
+            Self::SetFilterNearest => CommandItem {
+                name: "Set Filter: Nearest",
+                description: "Use Nearest Neighbor scaling (sharp, pixelated)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetFilterLinear => CommandItem {
+                name: "Set Filter: Linear",
+                description: "Use Bilinear scaling",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetFilterCubic => CommandItem {
+                name: "Set Filter: Cubic",
+                description: "Use Bicubic scaling (Catmull-Rom)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetFilterMitchell => CommandItem {
+                name: "Set Filter: Mitchell",
+                description: "Use Mitchell-Netravali scaling",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetFilterGaussian => CommandItem {
+                name: "Set Filter: Gaussian",
+                description: "Use Gaussian scaling",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetFilterLanczos => CommandItem {
+                name: "Set Filter: Lanczos",
+                description: "Use Lanczos3 scaling (high quality)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetFilterHamming => CommandItem {
+                name: "Set Filter: Hamming",
+                description: "Use Hamming scaling",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::NextFilter => CommandItem {
+                name: "Next Filter",
+                description: "Next scaling filter",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('S')]),
+            },
+            Self::GoToImage => CommandItem {
+                name: "Go to Image",
+                description: "Jump to a specific image index",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetBrightness => CommandItem {
+                name: "Set Brightness",
+                description: "Set image brightness to an absolute value or offset (e.g. 50, +10, -10)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetContrast => CommandItem {
+                name: "Set Contrast",
+                description: "Set image contrast percentage to an absolute value or offset (e.g. 20, +5, -5)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetScaleNone => CommandItem {
+                name: "Set Scale: None",
+                description: "Do not scale the image (show at actual size 1:1)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetScaleShrink => CommandItem {
+                name: "Set Scale: Shrink to Fit",
+                description: "Scale larger images down to fit, leave smaller images untouched",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetScaleFit => CommandItem {
+                name: "Set Scale: Fit View",
+                description: "Scale images up or down to fit the viewport perfectly",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetScaleCrop => CommandItem {
+                name: "Set Scale: Crop to Fill",
+                description: "Scale images to completely fill the viewport (cropping excess)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::CycleScaleMode => CommandItem {
+                name: "Cycle Scale Mode",
+                description: "Cycle scale mode",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('s')]),
+            },
+            Self::PredefinedZoomIn => CommandItem {
+                name: "Predefined Zoom In",
+                description: "Predefined Zoom In",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('I')]),
+            },
+            Self::PredefinedZoomOut => CommandItem {
+                name: "Predefined Zoom Out",
+                description: "Predefined Zoom Out",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('O')]),
+            },
+            Self::IncreaseBrightness => CommandItem {
+                name: "Increase Brightness",
+                description: "Increase brightness by 10",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('b')]),
+            },
+            Self::DecreaseBrightness => CommandItem {
+                name: "Decrease Brightness",
+                description: "Decrease brightness by 10",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('B')]),
+            },
+            Self::IncreaseContrast => CommandItem {
+                name: "Increase Contrast",
+                description: "Increase contrast by 5%",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('c')]),
+            },
+            Self::DecreaseContrast => CommandItem {
+                name: "Decrease Contrast",
+                description: "Decrease contrast by 5%",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('C')]),
+            },
+            Self::PanLeft => CommandItem {
+                name: "Pan Left",
+                description: "Pan view left",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('h'), KeyDef::Code(event::KeyCode::Left)]),
+            },
+            Self::PanRight => CommandItem {
+                name: "Pan Right",
+                description: "Pan view right",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('l'), KeyDef::Code(event::KeyCode::Right)]),
+            },
+            Self::PanUp => CommandItem {
+                name: "Pan Up",
+                description: "Pan view up",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('k'), KeyDef::Code(event::KeyCode::Up)]),
+            },
+            Self::PanDown => CommandItem {
+                name: "Pan Down",
+                description: "Pan view down",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('j'), KeyDef::Code(event::KeyCode::Down)]),
+            },
+            Self::CommandPalette => CommandItem {
+                name: "Command Palette",
+                description: "Open the Command Palette to search commands & shortcuts",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char(':'), KeyDef::Char('?'), KeyDef::Char('/')]),
+            },
+            Self::FileSearch => CommandItem {
+                name: "File Search",
+                description: "File Search",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('f')]),
+            },
+            Self::SlideshowIncrease => CommandItem {
+                name: "Increase Slideshow",
+                description: "Increase slideshow by 1s",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('t')]),
+            },
+            Self::SlideshowDecrease => CommandItem {
+                name: "Decrease Slideshow",
+                description: "Decrease slideshow by 1s",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('T')]),
+            },
+            Self::SetSlideshow => CommandItem {
+                name: "Set Slideshow",
+                description: "Set slideshow duration in seconds or offset (e.g. 5, +1, -1)",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+        }
+    }
+}
+
+/// Abstract representation of keyboard keys and mouse actions for bindings.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDef {
+    /// A single character press (e.g. 'q', 'i').
+    Char(char),
+    Code(event::KeyCode),
+    Ctrl(char),
+    Shift(event::KeyCode),
+    ScrollUp,
+    ScrollDown,
+}
+
+impl KeyDef {
+    pub fn matches(self, event: event::KeyEvent) -> bool {
+        use event::{KeyCode, KeyModifiers};
+        match self {
+            Self::Char(c) => {
+                if let KeyCode::Char(key_char) = event.code {
+                    if event.modifiers.contains(KeyModifiers::CONTROL) {
+                        return false;
+                    }
+                    if c.is_alphabetic() {
+                        if c.is_lowercase() {
+                            key_char == c && !event.modifiers.contains(KeyModifiers::SHIFT)
+                        } else {
+                            key_char == c
+                                || (event.modifiers.contains(KeyModifiers::SHIFT)
+                                    && key_char.to_lowercase().next() == c.to_lowercase().next())
+                        }
+                    } else {
+                        key_char == c
+                    }
+                } else {
+                    false
+                }
+            }
+            Self::Code(code) => {
+                event.code == code && !event.modifiers.contains(KeyModifiers::CONTROL)
+            }
+            Self::Ctrl(c) => {
+                if let KeyCode::Char(key_char) = event.code {
+                    key_char == c && event.modifiers.contains(KeyModifiers::CONTROL)
+                } else {
+                    false
+                }
+            }
+            Self::Shift(code) => {
+                event.code == code && event.modifiers.contains(KeyModifiers::SHIFT)
+            }
+            Self::ScrollUp | Self::ScrollDown => false,
+        }
+    }
+
+    pub fn format(self) -> &'static str {
+        match self {
+            Self::Char(c) => match c {
+                ' ' => "Space",
+                'q' => "q",
+                'n' => "n",
+                'p' => "p",
+                'i' => "i",
+                'o' => "o",
+                'a' => "a",
+                'r' => "r",
+                'b' => "b",
+                'B' => "B",
+                'c' => "c",
+                'C' => "C",
+                'e' => "e",
+                'E' => "E",
+                'R' => "R",
+                'S' => "S",
+                's' => "s",
+                'I' => "I",
+                'O' => "O",
+                'f' => "f",
+                ':' => ":",
+                '?' => "?",
+                '/' => "/",
+                '[' => "[",
+                ']' => "]",
+                '+' => "+",
+                '=' => "=",
+                '-' => "-",
+                '<' => "<",
+                '>' => ">",
+                'h' => "h",
+                'j' => "j",
+                'k' => "k",
+                'l' => "l",
+                _ => "?",
+            },
+            Self::Code(code) => match code {
+                event::KeyCode::Esc => "Esc",
+                event::KeyCode::Backspace => "Backspace",
+                event::KeyCode::Left => "Left",
+                event::KeyCode::Right => "Right",
+                event::KeyCode::Up => "Up",
+                event::KeyCode::Down => "Down",
+                event::KeyCode::Char(' ') => "Space",
+                _ => "Other",
+            },
+            Self::Ctrl(c) => match c {
+                'k' => "Ctrl+k",
+                'j' => "Ctrl+j",
+                _ => "Ctrl+?",
+            },
+            Self::Shift(_) => "Shift+?",
+            Self::ScrollUp => "Scroll Up",
+            Self::ScrollDown => "Scroll Down",
+        }
+    }
+}
+
+/// User-facing metadata for a Command.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandItem {
+    /// Human-readable name of the command.
+    pub name: &'static str,
+    /// Detailed description of what the command does.
+    pub description: &'static str,
+    /// Whether this command should be searchable/listed inside the command palette.
+    pub show_in_palette: bool,
+    /// Configured shortcuts/triggers associated with this command.
+    pub shortcuts: Option<&'static [KeyDef]>,
+}
+
+/// A wrapper struct coupling a Command variant with its CommandItem metadata
+/// for searchable presentation in lists and palette lookups.
+#[derive(Debug, Clone, Copy)]
+pub struct PaletteCommand {
+    /// The executable command variant.
+    pub cmd: Command,
+    /// The metadata presentation associated with the command.
+    pub item: CommandItem,
+}
+
+/// Returns a static slice of all available command metadata items.
+pub fn get_commands() -> &'static [CommandItem] {
+    static LIST: std::sync::OnceLock<Vec<CommandItem>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        <Command as strum::IntoEnumIterator>::iter()
+            .map(|cmd| cmd.get_metadata())
+            .collect()
+    })
+}

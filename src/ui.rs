@@ -1,0 +1,375 @@
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Style, Stylize},
+    text::Line,
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+};
+use ratatui_image::StatefulImage;
+use std::time::Duration;
+
+use crate::app::{App, PaletteMode, PromptType};
+
+/// Renders the entire view layout: including centered images (via Kitty, Sixel,
+/// or Halfblocks protocol), error details, loading spinners, bottom status HUD,
+/// and interactive command/file palette overlays.
+pub fn ui(frame: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(frame.area());
+
+    // Update protocol if size has changed or update is requested
+    let widget_size = (chunks[0].width, chunks[0].height);
+    if app.needs_update || app.last_widget_size != widget_size {
+        app.last_widget_size = widget_size;
+        app.needs_update = false;
+        app.update_protocol(widget_size.0, widget_size.1);
+    }
+
+    // Render image or placeholders
+    let show_loading = app.is_loading
+        && (app.image_protocol.is_none()
+            || app
+                .loading_start_time
+                .is_some_and(|t| t.elapsed() > Duration::from_millis(150)));
+
+    if show_loading {
+        let loading_paragraph = Paragraph::new("\n\nLoading Image...")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Yellow).bold());
+        frame.render_widget(loading_paragraph, chunks[0]);
+    } else if let Some(ref mut protocol) = app.image_protocol {
+        // Calculate the centered Rect inside chunks[0]
+        let (rect_w, rect_h) = app.rendered_size_cells;
+        let x = chunks[0].x + (chunks[0].width.saturating_sub(rect_w)) / 2;
+        let y = chunks[0].y + (chunks[0].height.saturating_sub(rect_h)) / 2;
+        let centered_rect = Rect::new(x, y, rect_w, rect_h);
+
+        let image_widget = StatefulImage::default();
+        frame.render_stateful_widget(image_widget, centered_rect, protocol);
+    } else if let Some(ref err) = app.error_message {
+        let err_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Error Loading Image ")
+            .style(Style::default().fg(Color::Red));
+        let err_paragraph = Paragraph::new(err.as_str())
+            .block(err_block)
+            .alignment(Alignment::Center);
+        frame.render_widget(err_paragraph, chunks[0]);
+    } else {
+        let loading_paragraph = Paragraph::new("No image loaded.")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(loading_paragraph, chunks[0]);
+    }
+
+    if app.images.is_empty() {
+        let status_block = Block::default()
+            .title(" imv-tui ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+        let inner_rect = status_block.inner(chunks[1]);
+        frame.render_widget(status_block, chunks[1]);
+        let empty_para = Paragraph::new(" No files found. Press 'q' to quit. ")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(empty_para, inner_rect);
+    } else {
+        let mut extra_info = String::new();
+        if app.brightness != 0 {
+            extra_info.push_str(&format!(" | Brightness: {:+}", app.brightness));
+        }
+        if app.contrast != 0.0 {
+            extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.round() as i32));
+        }
+        if app.slideshow_seconds > 0 {
+            extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_seconds));
+        }
+
+        let title_text = format!(" {} {} ", app.current_icon, app.current_filename());
+        let status_block = Block::default()
+            .title(title_text)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+        let inner_rect = status_block.inner(chunks[1]);
+        frame.render_widget(status_block, chunks[1]);
+
+        let status_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(30),
+                Constraint::Min(0),
+                Constraint::Length(22),
+            ])
+            .split(inner_rect);
+
+        let left_text = format!(
+            " [{}/{}] ({}x{}) ",
+            app.current_index + 1,
+            app.images.len(),
+            app.img_width,
+            app.img_height
+        );
+        let left_para = Paragraph::new(left_text)
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(left_para, status_chunks[0]);
+
+        let mid_text = format!(
+            "Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){}",
+            app.scale_mode.name(),
+            app.filter_name(),
+            app.current_zoom_pct.round() as i64,
+            app.pan_offset.0,
+            app.pan_offset.1,
+            extra_info
+        );
+        let mid_para = Paragraph::new(mid_text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(mid_para, status_chunks[1]);
+
+        let right_text = "Press '?' for commands ";
+        let right_para = Paragraph::new(right_text)
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(right_para, status_chunks[2]);
+    }
+
+    // Command / File Palette popup
+    if app.palette_mode != PaletteMode::Closed {
+        if app.palette_mode == PaletteMode::Prompt {
+            let prompt_title = match app.prompt_type {
+                Some(PromptType::GoToImage) => " Go to Image ",
+                Some(PromptType::SetBrightness) => " Set Brightness ",
+                Some(PromptType::SetContrast) => " Set Contrast ",
+                Some(PromptType::SetSlideshow) => " Set Slideshow ",
+                None => " Input ",
+            };
+            let prompt_label = match app.prompt_type {
+                Some(PromptType::GoToImage) => "Enter index (e.g. 40, +10, -10):",
+                Some(PromptType::SetBrightness) => "Enter brightness (e.g. 50, +10, -10):",
+                Some(PromptType::SetContrast) => "Enter contrast % (e.g. 20, +5, -5):",
+                Some(PromptType::SetSlideshow) => {
+                    "Enter slideshow delay in seconds (e.g. 5, +1, -1):"
+                }
+                None => "Enter value:",
+            };
+
+            let lines = vec![
+                Line::from(format!("   {}", prompt_label).gray()),
+                Line::from(vec![
+                    " > ".bold().cyan(),
+                    app.palette_query.as_str().into(),
+                    "▊".cyan(), // cursor block
+                ]),
+            ];
+
+            let w = 45.min(chunks[0].width.saturating_sub(1));
+            let h = 4.min(chunks[0].height.saturating_sub(1));
+
+            if app.palette_height != h {
+                app.palette_height = h;
+                app.needs_clear_once = true;
+            }
+
+            let palette_block = Block::default()
+                .title(prompt_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title_style(Style::default().fg(Color::Yellow).bold());
+
+            let palette_paragraph = Paragraph::new(lines)
+                .block(palette_block)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+            let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+            let y = chunks[0].y.saturating_add(1);
+
+            let popup_area = Rect::new(x, y, w, h);
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(palette_paragraph, popup_area);
+        } else {
+            let title = match app.palette_mode {
+                PaletteMode::File => " File Search ",
+                PaletteMode::Command => " Command Palette ",
+                _ => "",
+            };
+
+            // Determine dynamic visible_count and palette_height
+            let total_items = match app.palette_mode {
+                PaletteMode::File => app.get_filtered_files().len(),
+                PaletteMode::Command => app.get_filtered_commands().len(),
+                _ => 0,
+            };
+            let max_height = (chunks[0].height as f64 * 0.5).round() as u16;
+            let mut palette_h = (total_items as u16 + 4).max(12);
+            palette_h = palette_h.min(max_height);
+
+            if app.palette_height != palette_h {
+                app.palette_height = palette_h;
+                app.needs_clear_once = true;
+            }
+
+            let visible_count = (app.palette_height as usize).saturating_sub(4);
+            let palette_height = app.palette_height;
+
+            let mut lines = vec![
+                Line::from(vec![
+                    " > ".bold().cyan(),
+                    app.palette_query.clone().into(),
+                    "▊".cyan(), // cursor block
+                ]),
+                Line::from("──────────────────────────────────────────────────────────".gray()),
+            ];
+
+            match app.palette_mode {
+                PaletteMode::File => {
+                    let filtered_files = app.get_filtered_files();
+                    if !filtered_files.is_empty() {
+                        app.palette_selected_index =
+                            app.palette_selected_index.min(filtered_files.len() - 1);
+                    } else {
+                        app.palette_selected_index = 0;
+                    }
+
+                    let total_files = filtered_files.len();
+                    let half_visible = visible_count / 2;
+                    let start_idx = if total_files <= visible_count
+                        || app.palette_selected_index < half_visible
+                    {
+                        0
+                    } else if app.palette_selected_index >= total_files.saturating_sub(half_visible)
+                    {
+                        total_files.saturating_sub(visible_count)
+                    } else {
+                        app.palette_selected_index.saturating_sub(half_visible)
+                    };
+
+                    for (i, (_, filename)) in filtered_files
+                        .iter()
+                        .enumerate()
+                        .skip(start_idx)
+                        .take(visible_count)
+                    {
+                        let mut line = Line::from(format!("   {}", filename));
+                        if i == app.palette_selected_index {
+                            line = Line::from(format!(" > {}", filename))
+                                .bold()
+                                .yellow()
+                                .on_blue();
+                        }
+                        lines.push(line);
+                    }
+
+                    if filtered_files.is_empty() {
+                        lines.push(Line::from("   No matches found.".gray().italic()));
+                    }
+                }
+                PaletteMode::Command => {
+                    let filtered_commands = app.get_filtered_commands();
+                    if !filtered_commands.is_empty() {
+                        app.palette_selected_index =
+                            app.palette_selected_index.min(filtered_commands.len() - 1);
+                    } else {
+                        app.palette_selected_index = 0;
+                    }
+
+                    let total_cmds = filtered_commands.len();
+                    let half_visible = visible_count / 2;
+                    let start_idx = if total_cmds <= visible_count
+                        || app.palette_selected_index < half_visible
+                    {
+                        0
+                    } else if app.palette_selected_index >= total_cmds.saturating_sub(half_visible)
+                    {
+                        total_cmds.saturating_sub(visible_count)
+                    } else {
+                        app.palette_selected_index.saturating_sub(half_visible)
+                    };
+
+                    for (i, cmd) in filtered_commands
+                        .iter()
+                        .enumerate()
+                        .skip(start_idx)
+                        .take(visible_count)
+                    {
+                        let mut keys = Vec::new();
+                        let item = cmd.cmd.get_metadata();
+                        if let Some(bindings) = item.shortcuts {
+                            for bind in bindings {
+                                keys.push(bind.format());
+                            }
+                        }
+                        let shortcut_str = keys.join(", ");
+
+                        let mut cmd_line = vec![
+                            if i == app.palette_selected_index {
+                                " > "
+                            } else {
+                                "   "
+                            }
+                            .into(),
+                            cmd.item.name.bold(),
+                        ];
+
+                        if !shortcut_str.is_empty() {
+                            cmd_line.push(" [".into());
+                            cmd_line.push(shortcut_str.cyan());
+                            cmd_line.push("]".into());
+                        }
+
+                        cmd_line.push(" - ".into());
+                        cmd_line.push(cmd.item.description.gray());
+                        let mut line = Line::from(cmd_line);
+                        if i == app.palette_selected_index {
+                            line = line.yellow().on_blue();
+                        }
+                        lines.push(line);
+                    }
+
+                    if filtered_commands.is_empty() {
+                        lines.push(Line::from("   No matches found.".gray().italic()));
+                    }
+                }
+                _ => {}
+            }
+
+            let mut palette_width = app.palette_width;
+            let cap_width = (chunks[0].width as f64 * 0.75).round() as u16;
+            palette_width = palette_width.max(40).min(cap_width);
+
+            if lines.len() > 1 {
+                let inner_w = palette_width.saturating_sub(2) as usize;
+                lines[1] = Line::from("─".repeat(inner_w).gray());
+            }
+
+            let palette_block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title_style(Style::default().fg(Color::Yellow).bold());
+
+            let palette_paragraph = Paragraph::new(lines)
+                .block(palette_block)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+            let w = palette_width.min(chunks[0].width.saturating_sub(1));
+            let h = palette_height.min(chunks[0].height.saturating_sub(1));
+            let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+            let y = chunks[0].y.saturating_add(1);
+
+            let popup_area = Rect::new(x, y, w, h);
+
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(palette_paragraph, popup_area);
+        }
+    }
+}
