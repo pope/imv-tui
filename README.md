@@ -24,35 +24,45 @@ ______________________________________________________________________
 - **Interactive Command Palette & File Search**: Press `:` to trigger the command palette or `f` to search for files, utilizing the high-performance `nucleo` fuzzy matching engine to rank and display the best candidates first.
 - **Dynamic Parameter Value Prompts**: Adjust brightness, contrast, or jump directly to a specific image index (via `Go to Image`, `Set Brightness`, and `Set Contrast` commands in the command palette) using absolute numbers or relative offsets (e.g. `+10` or `-5`).
 - **Slideshow Mode**: Play a slideshow of images with configurable delays, adjustable dynamically via keyboard shortcuts (`t`/`T`), CLI parameters, or from the command palette.
+- **Image Classification & Filtered Views**: Flag images as Picks (⭐), Rejects (❌), or Unflagged (⚪) in memory. Filter the navigation queue and file list dynamically using five view modes (Unflagged + Picks, Unflagged Only, Picks Only, Rejects Only, All Files) to easily sort, select, or hide images.
 - **Graphics & Fallbacks**: Auto-detects terminal capabilities. Uses high-performance Kitty graphics protocol or Sixel if supported, falling back gracefully to ANSI **Half-blocks** on standard terminals.
 
 ______________________________________________________________________
 
 ## Keyboard Shortcuts
 
-| Action                             | Primary Key | Alternative Keys            |
-| :--------------------------------- | :---------- | :-------------------------- |
-| **Quit**                           | `q`         | `Esc`                       |
-| **Next Image**                     | `n`         | `Space` / `]`               |
-| **Previous Image**                 | `p`         | `Backspace` / `[`           |
-| **Zoom In**                        | `i`         | `+` / `=` / Mouse Scroll Up |
-| **Zoom In (predefined levels)**    | `I`         |                             |
-| **Zoom Out**                       | `o`         | `-` / Mouse Scroll Down     |
-| **Zoom Out (predefined levels)**   | `O`         |                             |
-| **Actual Size (100% Zoom)**        | `a`         |                             |
-| **Reset View (Fit Screen)**        | `r`         |                             |
-| **Rotate Clockwise (90°)**         | `e`         | `R` / `>`                   |
-| **Rotate Counter-Clockwise (90°)** | `E`         | `<`                         |
-| **Brightness Increase / Decrease** | `b` / `B`   |                             |
-| **Contrast Increase / Decrease**   | `c` / `C`   |                             |
-| **Slideshow Increase / Decrease**  | `t` / `T`   |                             |
-| **Cycle Image Scaling Filter**     | `S`         |                             |
-| **Cycle Image Scaling Mode**       | `s`         |                             |
-| **Pan Left / Right**               | `h` / `l`   | `Left` / `Right Arrow`      |
-| **Pan Up / Down**                  | `k` / `j`   | `Up` / `Down Arrow`         |
-| **Show Help / Command Palette**    | `?` / `:`   | `/`                         |
-| **File Search**                    | `f`         |                             |
-| **Toggle Thumbnail Display**       | `m`         |                             |
+| Action                              | Primary Key | Alternative Keys            |
+| :---------------------------------- | :---------- | :-------------------------- |
+| **Quit**                            | `q`         | `Esc`                       |
+| **Next Image**                      | `n`         | `Space` / `]`               |
+| **Previous Image**                  | `p`         | `Backspace` / `[`           |
+| **Zoom In**                         | `i`         | `+` / `=` / Mouse Scroll Up |
+| **Zoom In (predefined levels)**     | `I`         |                             |
+| **Zoom Out**                        | `o`         | `-` / Mouse Scroll Down     |
+| **Zoom Out (predefined levels)**    | `O`         |                             |
+| **Actual Size (100% Zoom)**         | `a`         |                             |
+| **Reset View (Fit Screen)**         | `r`         |                             |
+| **Rotate Clockwise (90°)**          | `e`         | `R` / `>`                   |
+| **Rotate Counter-Clockwise (90°)**  | `E`         | `<`                         |
+| **Brightness Increase / Decrease**  | `b` / `B`   |                             |
+| **Contrast Increase / Decrease**    | `c` / `C`   |                             |
+| **Slideshow Increase / Decrease**   | `t` / `T`   |                             |
+| **Cycle Image Scaling Filter**      | `S`         |                             |
+| **Cycle Image Scaling Mode**        | `s`         |                             |
+| **Pan Left / Right**                | `h` / `l`   | `Left` / `Right Arrow`      |
+| **Pan Up / Down**                   | `k` / `j`   | `Up` / `Down Arrow`         |
+| **Show Help / Command Palette**     | `?` / `:`   | `/`                         |
+| **File Search**                     | `f`         |                             |
+| **Toggle Thumbnail Display**        | `m`         |                             |
+| **Mark Image as Pick**              | `z`         |                             |
+| **Mark Image as Reject**            | `x`         |                             |
+| **Unflag Image**                    | `u`         |                             |
+| **Cycle View Filter**               | `v`         |                             |
+| **Jump to View: Unflagged + Picks** | `1`         |                             |
+| **Jump to View: Unflagged Only**    | `2`         |                             |
+| **Jump to View: Picks Only**        | `3`         |                             |
+| **Jump to View: Rejects Only**      | `4`         |                             |
+| **Jump to View: All Files**         | `5`         |                             |
 
 ______________________________________________________________________
 

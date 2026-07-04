@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style, Stylize},
-    text::Line,
+    text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
         ScrollbarState,
@@ -106,7 +106,12 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             ));
         }
 
-        let title_text = format!(" {} {} ", app.current_icon, app.current_filename());
+        let title_text = format!(
+            " {} {} [{}] ",
+            app.current_icon,
+            app.current_filename(),
+            app.view_mode_name()
+        );
         let status_block = Block::default()
             .title(title_text)
             .borders(Borders::ALL)
@@ -116,19 +121,17 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         let inner_rect = status_block.inner(chunks[1]);
         frame.render_widget(status_block, chunks[1]);
 
-        let status_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(30),
-                Constraint::Min(0),
-                Constraint::Length(22),
-            ])
-            .split(inner_rect);
-
+        let flagged_label = app.current_flagged_status_label();
+        let flagged_part = if flagged_label.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flagged_label)
+        };
         let left_text = format!(
-            " [{}/{}] ({}x{}){} ",
-            app.queue.current_index + 1,
-            app.queue.images.len(),
+            " [{}/{}]{} ({}x{}){} ",
+            app.get_visible_position().map(|pos| pos + 1).unwrap_or(0),
+            app.get_visible_count(),
+            flagged_part,
             app.img_width,
             app.img_height,
             if app.show_thumbnail_only {
@@ -137,10 +140,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                 ""
             }
         );
-        let left_para = Paragraph::new(left_text)
-            .alignment(Alignment::Left)
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-        frame.render_widget(left_para, status_chunks[0]);
 
         let mid_text = format!(
             "Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){}",
@@ -151,12 +150,32 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             app.pan_offset.y,
             extra_info
         );
+
+        let right_text = "Press '?' for commands ";
+
+        let left_len = left_text.chars().count() as u16;
+        let right_len = right_text.chars().count() as u16;
+        let side_len = left_len.max(right_len);
+
+        let status_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(side_len),
+                Constraint::Min(0),
+                Constraint::Length(side_len),
+            ])
+            .split(inner_rect);
+
+        let left_para = Paragraph::new(left_text)
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+        frame.render_widget(left_para, status_chunks[0]);
+
         let mid_para = Paragraph::new(mid_text)
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::White).bg(Color::Reset));
         frame.render_widget(mid_para, status_chunks[1]);
 
-        let right_text = "Press '?' for commands ";
         let right_para = Paragraph::new(right_text)
             .alignment(Alignment::Right)
             .style(Style::default().fg(Color::White).bg(Color::Reset));
@@ -296,6 +315,15 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                     " Dimensions: ".bold().cyan(),
                     pixels_str.as_str().into(),
                 ]));
+                let flag_style = match app.current_classification() {
+                    crate::app::Classification::Unflagged => Style::default().fg(Color::Gray),
+                    crate::app::Classification::Pick => Style::default().fg(Color::Green).bold(),
+                    crate::app::Classification::Reject => Style::default().fg(Color::Red).bold(),
+                };
+                lines.push(Line::from(vec![
+                    " Flag State: ".bold().cyan(),
+                    Span::styled(app.current_flagged_status_label(), flag_style),
+                ]));
 
                 let inner_w = w.saturating_sub(2) as usize;
                 lines.push(Line::from("─".repeat(inner_w).gray()));
@@ -431,19 +459,36 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                     scroll_pos = start_idx;
                     total_items = total_files;
 
-                    for (i, (_, filename)) in filtered_files
+                    for (i, item) in filtered_files
                         .iter()
                         .enumerate()
                         .skip(start_idx)
                         .take(visible_count)
                     {
+                        let orig_idx = item.0;
+                        let filename = &item.1;
+                        let class = app
+                            .classifications
+                            .get(orig_idx)
+                            .cloned()
+                            .unwrap_or(crate::app::Classification::Unflagged);
+                        let class_prefix = match class {
+                            crate::app::Classification::Unflagged => "   ",
+                            crate::app::Classification::Pick => "⭐ ",
+                            crate::app::Classification::Reject => "❌ ",
+                        };
                         let line = if i == app.palette_selected_index {
                             Line::from(vec![
                                 " > ".bold().yellow().on_blue(),
+                                class_prefix.bold().yellow().on_blue(),
                                 filename.as_str().bold().yellow().on_blue(),
                             ])
                         } else {
-                            Line::from(vec!["   ".into(), filename.as_str().into()])
+                            Line::from(vec![
+                                "   ".into(),
+                                class_prefix.into(),
+                                filename.as_str().into(),
+                            ])
                         };
                         lines.push(line);
                     }

@@ -43,6 +43,24 @@ pub enum Command {
     CommandPalette,
     /// Open the file fuzzy search palette.
     FileSearch,
+    /// Mark the current image as a Pick.
+    MarkPick,
+    /// Mark the current image as a Reject.
+    MarkReject,
+    /// Remove any pick/reject flags from the current image.
+    Unflag,
+    /// Cycle the display view mode filter.
+    CycleView,
+    /// Set view mode to Unflagged + Picks.
+    SetViewDefault,
+    /// Set view mode to Unflagged.
+    SetViewUnflagged,
+    /// Set view mode to Picks.
+    SetViewPicks,
+    /// Set view mode to Rejects.
+    SetViewRejects,
+    /// Set view mode to All.
+    SetViewAll,
 
     // Non-help/derived commands:
     /// Force nearest-neighbor scaling.
@@ -335,6 +353,60 @@ impl Command {
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('f')]),
             },
+            Self::MarkPick => CommandItem {
+                name: "Mark Pick",
+                description: "Mark the current image as a Pick",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('z')]),
+            },
+            Self::MarkReject => CommandItem {
+                name: "Mark Reject",
+                description: "Mark the current image as a Reject",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('x')]),
+            },
+            Self::Unflag => CommandItem {
+                name: "Unflag Image",
+                description: "Remove any pick/reject flags from the current image",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('u')]),
+            },
+            Self::CycleView => CommandItem {
+                name: "Cycle View Filter",
+                description: "Cycle display view mode (Unflagged + Picks, Unflagged Only, Picks Only, Rejects Only, All)",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('v')]),
+            },
+            Self::SetViewDefault => CommandItem {
+                name: "Set View: Unflagged + Picks",
+                description: "Set display view mode to Unflagged + Picks",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('1')]),
+            },
+            Self::SetViewUnflagged => CommandItem {
+                name: "Set View: Unflagged Only",
+                description: "Set display view mode to Unflagged Only",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('2')]),
+            },
+            Self::SetViewPicks => CommandItem {
+                name: "Set View: Picks Only",
+                description: "Set display view mode to Picks Only",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('3')]),
+            },
+            Self::SetViewRejects => CommandItem {
+                name: "Set View: Rejects Only",
+                description: "Set display view mode to Rejects Only",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('4')]),
+            },
+            Self::SetViewAll => CommandItem {
+                name: "Set View: All Files",
+                description: "Set display view mode to All Files",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('5')]),
+            },
             Self::SlideshowIncrease => CommandItem {
                 name: "Increase Slideshow",
                 description: "Increase slideshow by 1s",
@@ -472,6 +544,15 @@ impl KeyDef {
                 'j' => "j",
                 'k' => "k",
                 'l' => "l",
+                'z' => "z",
+                'x' => "x",
+                'u' => "u",
+                'v' => "v",
+                '1' => "1",
+                '2' => "2",
+                '3' => "3",
+                '4' => "4",
+                '5' => "5",
                 _ => "?",
             },
             Self::Code(code) => match code {

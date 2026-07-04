@@ -51,6 +51,41 @@ impl<T: std::str::FromStr> std::str::FromStr for Adjustment<T> {
     }
 }
 
+/// The classification/flagged state for an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Classification {
+    Unflagged,
+    Pick,
+    Reject,
+}
+
+/// The display filtering view mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ViewMode {
+    /// Show picks and unflagged images (default).
+    Default,
+    /// Show only unflagged images.
+    Unflagged,
+    /// Show only picks.
+    Picks,
+    /// Show only rejects.
+    Rejects,
+    /// Show all files.
+    All,
+}
+
+impl ViewMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Default => "Unflagged + Picks",
+            Self::Unflagged => "Unflagged Only",
+            Self::Picks => "Picks Only",
+            Self::Rejects => "Rejects Only",
+            Self::All => "All Files",
+        }
+    }
+}
+
 /// Encapsulates list of images, starting index, and cached display name lists.
 pub struct ImageQueue {
     /// Loaded list of image sources.
@@ -81,30 +116,6 @@ impl ImageQueue {
             display_names_lowercase,
             current_index,
         })
-    }
-
-    /// Moves the selection to the next image in the queue, wrapping if necessary.
-    pub fn next(&mut self) -> bool {
-        if self.images.is_empty() {
-            return false;
-        }
-        let old = self.current_index;
-        self.current_index = (self.current_index + 1) % self.images.len();
-        old != self.current_index
-    }
-
-    /// Moves the selection to the previous image in the queue, wrapping if necessary.
-    pub fn prev(&mut self) -> bool {
-        if self.images.is_empty() {
-            return false;
-        }
-        let old = self.current_index;
-        if self.current_index == 0 {
-            self.current_index = self.images.len() - 1;
-        } else {
-            self.current_index -= 1;
-        }
-        old != self.current_index
     }
 
     /// Returns true if the image queue contains no images.
@@ -297,6 +308,10 @@ pub struct App {
     pub last_info_toggle: Option<std::time::Instant>,
     /// Disable EXIF thumbnail rendering.
     pub disable_thumbnail: bool,
+    /// Active view filtering mode.
+    pub view_mode: ViewMode,
+    /// Classification states for all loaded image sources, matching the index of queue.images.
+    pub classifications: Vec<Classification>,
 }
 
 impl App {
@@ -427,6 +442,7 @@ impl App {
             }
         });
 
+        let num_images = queue.images.len();
         let mut app = Self {
             queue,
             filtered_files: Vec::new(),
@@ -475,10 +491,166 @@ impl App {
             stats: StatsForNerds::default(),
             last_info_toggle: None,
             disable_thumbnail,
+            view_mode: ViewMode::Default,
+            classifications: vec![Classification::Unflagged; num_images],
         };
 
         app.start_load_image();
         Ok(app)
+    }
+
+    /// Checks if the image at index is visible under the current ViewMode.
+    pub fn is_visible(&self, index: usize) -> bool {
+        let classification = self
+            .classifications
+            .get(index)
+            .cloned()
+            .unwrap_or(Classification::Unflagged);
+        match self.view_mode {
+            ViewMode::Default => {
+                classification == Classification::Pick
+                    || classification == Classification::Unflagged
+            }
+            ViewMode::Unflagged => classification == Classification::Unflagged,
+            ViewMode::Picks => classification == Classification::Pick,
+            ViewMode::Rejects => classification == Classification::Reject,
+            ViewMode::All => true,
+        }
+    }
+
+    /// Returns the total number of visible images under the current view filter.
+    pub fn get_visible_count(&self) -> usize {
+        (0..self.queue.images.len())
+            .filter(|&idx| self.is_visible(idx))
+            .count()
+    }
+
+    /// Returns the 0-based position of the current image within the visible list.
+    pub fn get_visible_position(&self) -> Option<usize> {
+        let mut count = 0;
+        for idx in 0..self.queue.images.len() {
+            if self.is_visible(idx) {
+                if idx == self.queue.current_index {
+                    return Some(count);
+                }
+                count += 1;
+            }
+        }
+        None
+    }
+
+    /// Finds the closest visible index starting at start_idx, checking current index, then scanning forward.
+    pub fn find_closest_visible_index(&self, start_idx: usize) -> Option<usize> {
+        let total = self.queue.images.len();
+        if total == 0 {
+            return None;
+        }
+        for i in 0..total {
+            let idx = (start_idx + i) % total;
+            if self.is_visible(idx) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Updates current_index to the closest visible image, or triggers an empty state if none are visible.
+    pub fn adjust_current_index_for_visibility(&mut self) {
+        if let Some(idx) = self.find_closest_visible_index(self.queue.current_index) {
+            let was_empty =
+                self.error_message.as_deref() == Some("No images match the current view filter");
+            if idx != self.queue.current_index || was_empty {
+                self.queue.current_index = idx;
+                self.start_load_image();
+            } else {
+                // Trigger prefetching update as surrounding visible images might have changed
+                self.trigger_prefetch();
+            }
+        } else {
+            // No visible images matching the filter
+            self.original_image = None;
+            self.thumbnail_image = None;
+            self.image_protocol = None;
+            self.error_message = Some("No images match the current view filter".to_string());
+            self.needs_update = true;
+            self.needs_clear_once = true;
+        }
+    }
+
+    /// Marks the current image as a Pick.
+    pub fn mark_pick(&mut self) {
+        if self.queue.images.is_empty() {
+            return;
+        }
+        let idx = self.queue.current_index;
+        self.classifications[idx] = Classification::Pick;
+        self.adjust_current_index_for_visibility();
+    }
+
+    /// Marks the current image as a Reject.
+    pub fn mark_reject(&mut self) {
+        if self.queue.images.is_empty() {
+            return;
+        }
+        let idx = self.queue.current_index;
+        self.classifications[idx] = Classification::Reject;
+        self.adjust_current_index_for_visibility();
+    }
+
+    /// Removes any pick/reject flags from the current image.
+    pub fn unflag_image(&mut self) {
+        if self.queue.images.is_empty() {
+            return;
+        }
+        let idx = self.queue.current_index;
+        self.classifications[idx] = Classification::Unflagged;
+        self.adjust_current_index_for_visibility();
+    }
+
+    /// Cycles the active view filter mode.
+    pub fn cycle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Default => ViewMode::Unflagged,
+            ViewMode::Unflagged => ViewMode::Picks,
+            ViewMode::Picks => ViewMode::Rejects,
+            ViewMode::Rejects => ViewMode::All,
+            ViewMode::All => ViewMode::Default,
+        };
+        self.adjust_current_index_for_visibility();
+    }
+
+    /// Sets the active view filter mode to a specific value.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+        self.adjust_current_index_for_visibility();
+    }
+
+    /// Returns the name/label of the active view mode.
+    pub fn view_mode_name(&self) -> &'static str {
+        self.view_mode.name()
+    }
+
+    /// Returns the classification of the current image.
+    pub fn current_classification(&self) -> Classification {
+        if self.queue.images.is_empty() {
+            return Classification::Unflagged;
+        }
+        self.classifications
+            .get(self.queue.current_index)
+            .cloned()
+            .unwrap_or(Classification::Unflagged)
+    }
+
+    /// Returns the flagged status text/icon to show in the status/info bar.
+    pub fn current_flagged_status_label(&self) -> &'static str {
+        if self.queue.images.is_empty() || self.get_visible_count() == 0 {
+            return "";
+        }
+        match self.current_classification() {
+            Classification::Unflagged => "⚪ Unflagged",
+            Classification::Pick => "⭐ Pick",
+            Classification::Reject => "❌ Reject",
+        }
     }
 
     /// Returns cached filtered files matching the current search query.
@@ -540,6 +712,7 @@ impl App {
                 .display_names
                 .iter()
                 .enumerate()
+                .filter(|&(idx, _)| self.is_visible(idx))
                 .map(|(idx, name)| (idx, name.clone()))
                 .collect();
         }
@@ -566,6 +739,7 @@ impl App {
             .display_names_lowercase
             .iter()
             .enumerate()
+            .filter(|&(index, _)| self.is_visible(index))
             .map(|(index, name)| FileCandidate {
                 index,
                 name: name.as_str(),
@@ -760,11 +934,20 @@ impl App {
                     }
                 } else {
                     self.palette_mode = PaletteMode::Info;
-                    self.palette_height = 18;
+                    self.palette_height = 19;
                     self.needs_clear_once = true;
                     self.last_info_toggle = Some(std::time::Instant::now());
                 }
             }
+            Command::MarkPick => self.mark_pick(),
+            Command::MarkReject => self.mark_reject(),
+            Command::Unflag => self.unflag_image(),
+            Command::CycleView => self.cycle_view_mode(),
+            Command::SetViewDefault => self.set_view_mode(ViewMode::Default),
+            Command::SetViewUnflagged => self.set_view_mode(ViewMode::Unflagged),
+            Command::SetViewPicks => self.set_view_mode(ViewMode::Picks),
+            Command::SetViewRejects => self.set_view_mode(ViewMode::Rejects),
+            Command::SetViewAll => self.set_view_mode(ViewMode::All),
         }
     }
 
@@ -772,7 +955,7 @@ impl App {
         self.palette_mode = mode;
         self.palette_query.clear();
         self.palette_selected_index = match mode {
-            PaletteMode::File => self.queue.current_index,
+            PaletteMode::File => self.get_visible_position().unwrap_or(0),
             PaletteMode::Command => 0,
             _ => 0,
         };
@@ -816,24 +999,35 @@ impl App {
                 if self.queue.is_empty() {
                     return;
                 }
+                let visible: Vec<usize> = (0..self.queue.images.len())
+                    .filter(|&idx| self.is_visible(idx))
+                    .collect();
+                if visible.is_empty() {
+                    return;
+                }
                 let input = self.palette_query.trim();
                 let Ok(adj) = input.parse::<Adjustment<usize>>() else {
                     return;
                 };
-                let mut new_idx = self.queue.current_index;
+                let current_visible_pos = visible
+                    .iter()
+                    .position(|&idx| idx == self.queue.current_index)
+                    .unwrap_or(0);
+                let mut new_visible_pos = current_visible_pos;
                 match adj {
                     Adjustment::Absolute(val) => {
                         if let Some(val_minus_1) = val.checked_sub(1) {
-                            new_idx = val_minus_1.min(self.queue.images.len() - 1);
+                            new_visible_pos = val_minus_1.min(visible.len() - 1);
                         }
                     }
                     Adjustment::RelativeAdd(val) => {
-                        new_idx = (self.queue.current_index + val).min(self.queue.images.len() - 1);
+                        new_visible_pos = (current_visible_pos + val).min(visible.len() - 1);
                     }
                     Adjustment::RelativeSub(val) => {
-                        new_idx = self.queue.current_index.saturating_sub(val);
+                        new_visible_pos = current_visible_pos.saturating_sub(val);
                     }
                 }
+                let new_idx = visible[new_visible_pos];
                 if new_idx != self.queue.current_index {
                     self.queue.current_index = new_idx;
                     self.start_load_image();
@@ -899,17 +1093,28 @@ impl App {
 
     pub fn get_sliding_window_indices(&self) -> Vec<usize> {
         let n = 2; // Cache size N=2 (caches current + 2 before + 2 after)
-        let total = self.queue.images.len();
+        let visible: Vec<usize> = (0..self.queue.images.len())
+            .filter(|&idx| self.is_visible(idx))
+            .collect();
+        let total = visible.len();
         if total == 0 {
             return Vec::new();
         }
+        let current_pos = visible
+            .iter()
+            .position(|&idx| idx == self.queue.current_index);
+        let current_pos = match current_pos {
+            Some(pos) => pos,
+            None => return Vec::new(),
+        };
+
         let mut indices = Vec::new();
-        indices.push(self.queue.current_index);
+        indices.push(visible[current_pos]);
         for i in 1..=n {
-            let prev = (self.queue.current_index + total - i) % total;
-            let next = (self.queue.current_index + i) % total;
-            indices.push(prev);
-            indices.push(next);
+            let prev = (current_pos + total - i) % total;
+            let next = (current_pos + i) % total;
+            indices.push(visible[prev]);
+            indices.push(visible[next]);
         }
         indices.sort();
         indices.dedup();
@@ -1169,7 +1374,7 @@ impl App {
 
         let new_h = match self.palette_mode {
             PaletteMode::Prompt => 4.min(term_height.saturating_sub(1)),
-            PaletteMode::Info => 18.min(term_height.saturating_sub(1)),
+            PaletteMode::Info => 19.min(term_height.saturating_sub(1)),
             PaletteMode::File | PaletteMode::Command => {
                 let total_items = match self.palette_mode {
                     PaletteMode::File => self.get_filtered_files().len(),
@@ -1696,21 +1901,57 @@ impl App {
     }
 
     pub fn current_filename(&self) -> &str {
-        if self.queue.is_empty() {
+        if self.queue.is_empty() || self.get_visible_count() == 0 {
             return "No file loaded";
         }
         self.queue.get_current_filename()
     }
 
     pub fn next_image(&mut self) {
-        if self.queue.next() {
-            self.start_load_image();
+        let total = self.queue.images.len();
+        if total <= 1 {
+            return;
+        }
+        let start = self.queue.current_index;
+        let mut idx = start;
+        loop {
+            idx = (idx + 1) % total;
+            if self.is_visible(idx) {
+                if idx != start {
+                    self.queue.current_index = idx;
+                    self.start_load_image();
+                }
+                break;
+            }
+            if idx == start {
+                break;
+            }
         }
     }
 
     pub fn prev_image(&mut self) {
-        if self.queue.prev() {
-            self.start_load_image();
+        let total = self.queue.images.len();
+        if total <= 1 {
+            return;
+        }
+        let start = self.queue.current_index;
+        let mut idx = start;
+        loop {
+            if idx == 0 {
+                idx = total - 1;
+            } else {
+                idx -= 1;
+            }
+            if self.is_visible(idx) {
+                if idx != start {
+                    self.queue.current_index = idx;
+                    self.start_load_image();
+                }
+                break;
+            }
+            if idx == start {
+                break;
+            }
         }
     }
 
