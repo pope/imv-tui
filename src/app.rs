@@ -293,6 +293,8 @@ pub struct App {
     pub stats: StatsForNerds,
     /// Last toggle timestamp of the info diagnostics overlay.
     pub last_info_toggle: Option<std::time::Instant>,
+    /// Disable EXIF thumbnail rendering.
+    pub disable_thumbnail: bool,
 }
 
 impl App {
@@ -304,6 +306,7 @@ impl App {
         picker: Picker,
         filter_type: FilterType,
         scale_mode: ScaleMode,
+        disable_thumbnail: bool,
     ) -> Result<Self, String> {
         let queue = ImageQueue::new(images, current_index)?;
 
@@ -365,7 +368,7 @@ impl App {
                     let mut bytes_opt = None;
                     let limit = 256 * 1024; // 256 KB limit to avoid massive full-file reads for metadata/thumbnails
 
-                    if !r.is_prefetch {
+                    if !r.is_prefetch && !disable_thumbnail {
                         let read_res =
                             crate::image_worker::read_source_bytes_limited(&r.source, limit);
                         if let Ok(partial_bytes) = read_res {
@@ -469,6 +472,7 @@ impl App {
             slideshow_last_transition: std::time::Instant::now(),
             stats: StatsForNerds::default(),
             last_info_toggle: None,
+            disable_thumbnail,
         };
 
         app.start_load_image();

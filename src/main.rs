@@ -89,7 +89,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = App::new(images, current_index, picker, initial_filter, scale_mode)?;
+    let mut app = App::new(
+        images,
+        current_index,
+        picker,
+        initial_filter,
+        scale_mode,
+        options.no_thumbnail,
+    )?;
     if let Some(cfg) = slideshow_opt {
         app.slideshow_config = cfg;
         app.slideshow_last_transition = std::time::Instant::now();

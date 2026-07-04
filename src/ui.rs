@@ -307,9 +307,13 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                     "   Load / Decode: ".gray(),
                     format!("{:.2} ms", app.stats.load_duration.as_secs_f64() * 1000.0).bold(),
                 ]));
-                let thumb_load_str = match app.stats.thumbnail_load_duration {
-                    Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
-                    None => "N/A (No EXIF Thumbnail / Large Image)".gray(),
+                let thumb_load_str = if app.disable_thumbnail {
+                    "N/A (Disabled)".gray()
+                } else {
+                    match app.stats.thumbnail_load_duration {
+                        Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
+                        None => "N/A (No EXIF Thumbnail / Large Image)".gray(),
+                    }
                 };
                 lines.push(Line::from(vec![
                     "   Thumbnail Load: ".gray(),

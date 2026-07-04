@@ -17,6 +17,8 @@ pub struct CliOptions {
     pub slideshow: Option<SlideshowConfig>,
     /// If true, validates files by checking their magic bytes instead of extensions.
     pub check_magic: bool,
+    /// If true, disables EXIF thumbnail loading/display entirely.
+    pub no_thumbnail: bool,
 }
 
 /// Reads piped file paths from standard input when stdin is not a terminal,
@@ -106,6 +108,7 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
     let mut scale = ScaleMode::Shrink;
     let mut slideshow = None;
     let mut check_magic = false;
+    let mut no_thumbnail = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -177,6 +180,10 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 check_magic = true;
                 i += 1;
             }
+            "--no-thumbnail" => {
+                no_thumbnail = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -197,6 +204,9 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 );
                 println!(
                     "  -m, --check-magic          Check file magic bytes on startup (slower on network drives)"
+                );
+                println!(
+                    "      --no-thumbnail         Disable low-res EXIF thumbnail placeholder loading"
                 );
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
@@ -225,5 +235,6 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
         scale,
         slideshow,
         check_magic,
+        no_thumbnail,
     })
 }
