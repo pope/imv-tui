@@ -467,13 +467,12 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
     match source {
         ImageSource::Local(path) => {
             use std::io::Read;
-            let mut file = std::fs::File::open(path)
+            let file = std::fs::File::open(path)
                 .map_err(|e| format!("Failed to open file:\n{}\n\nError: {}", path.display(), e))?;
-            let mut buffer = vec![0u8; limit];
-            let bytes_read = file
-                .read(&mut buffer)
+            let mut buffer = Vec::new();
+            file.take(limit as u64)
+                .read_to_end(&mut buffer)
                 .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e))?;
-            buffer.truncate(bytes_read);
             Ok(buffer)
         }
         ImageSource::Cbz {
@@ -485,7 +484,7 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
             let reader = std::io::BufReader::new(file);
             let mut archive = zip::ZipArchive::new(reader)
                 .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
-            let mut zip_entry = archive.by_name(file_in_zip).map_err(|e| {
+            let zip_entry = archive.by_name(file_in_zip).map_err(|e| {
                 format!(
                     "Failed to locate page {} in {}: {}",
                     file_in_zip,
@@ -493,17 +492,19 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
                     e
                 )
             })?;
-            let mut buffer = vec![0u8; limit];
+            let mut buffer = Vec::new();
             use std::io::Read;
-            let bytes_read = zip_entry.read(&mut buffer).map_err(|e| {
-                format!(
-                    "Failed to read page data {} from {}: {}",
-                    file_in_zip,
-                    zip_path.display(),
-                    e
-                )
-            })?;
-            buffer.truncate(bytes_read);
+            zip_entry
+                .take(limit as u64)
+                .read_to_end(&mut buffer)
+                .map_err(|e| {
+                    format!(
+                        "Failed to read page data {} from {}: {}",
+                        file_in_zip,
+                        zip_path.display(),
+                        e
+                    )
+                })?;
             Ok(buffer)
         }
     }
