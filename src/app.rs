@@ -11,8 +11,7 @@ use std::time::Instant;
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::image_worker::{
     Brightness, Contrast, CropBox, FilterType, ImageIntersection, ImageSource, LoaderRequest,
-    LoaderResponse, PanOffset, ResizeRequest, ScaleMode, SlideshowConfig, decode_image_source,
-    process_resize,
+    LoaderResponse, PanOffset, ResizeRequest, ScaleMode, SlideshowConfig, process_resize,
 };
 /// Represents an absolute or relative adjustment to a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +153,10 @@ pub enum PaletteMode {
 pub struct StatsForNerds {
     /// Time taken to load (decode) the photo from disk or zip.
     pub load_duration: std::time::Duration,
+    /// Time taken to extract and decode the thumbnail.
+    pub thumbnail_load_duration: Option<std::time::Duration>,
+    /// Dimensions of the decoded thumbnail placeholder, if any.
+    pub thumbnail_dimensions: Option<(u32, u32)>,
     /// Was it loaded from the prefetch cache.
     pub is_prefetch_cache_hit: bool,
     /// Time taken to resize, apply filters, adjustments, etc.
@@ -189,6 +192,7 @@ pub struct ResizeResponse {
     pub protocol_duration: std::time::Duration,
     pub target_width: u32,
     pub target_height: u32,
+    pub sequence: u64,
 }
 
 /// The central application state controller.
@@ -201,6 +205,10 @@ pub struct App {
     pub filtered_commands: Vec<PaletteCommand>,
     /// Shared reference to the decoded dynamic image.
     pub original_image: Option<Arc<DynamicImage>>,
+    /// Extracted thumbnail placeholder image, if any.
+    pub thumbnail_image: Option<Arc<DynamicImage>>,
+    /// If true, display the low-res thumbnail image placeholder only.
+    pub show_thumbnail_only: bool,
     /// Active render state protocol (Kitty, Sixel, Halfblocks).
     pub image_protocol: Option<StatefulProtocol>,
     /// Target terminal graphics protocol picker.
@@ -313,6 +321,7 @@ impl App {
                 let rendered_cells = latest_req.rendered_size_cells;
                 let target_w = latest_req.target_w;
                 let target_h = latest_req.target_h;
+                let sequence = latest_req.sequence;
                 let (protocol, proc_dur, proto_dur) = process_resize(latest_req, &mut resizer);
                 let _ = protocol_tx.send(ResizeResponse {
                     protocol,
@@ -321,6 +330,7 @@ impl App {
                     protocol_duration: proto_dur,
                     target_width: target_w,
                     target_height: target_h,
+                    sequence,
                 });
             }
         });
@@ -350,7 +360,55 @@ impl App {
 
                 for r in current_requests {
                     let start = std::time::Instant::now();
-                    let res = decode_image_source(r.source);
+
+                    // Try to load limited bytes first and extract thumbnail if this is an active cold load
+                    let mut bytes_opt = None;
+                    let limit = 256 * 1024; // 256 KB limit to avoid massive full-file reads for metadata/thumbnails
+
+                    if !r.is_prefetch {
+                        let read_res =
+                            crate::image_worker::read_source_bytes_limited(&r.source, limit);
+                        if let Ok(partial_bytes) = read_res {
+                            if let Some((thumb_img, real_w, real_h)) =
+                                crate::image_worker::decode_thumbnail_and_dimensions(&partial_bytes)
+                            {
+                                // Send thumbnail placeholder immediately
+                                let thumb_dur = start.elapsed();
+                                let _ = response_tx.send(LoaderResponse {
+                                    idx: r.idx,
+                                    result: Ok((
+                                        thumb_img,
+                                        real_w,
+                                        real_h,
+                                        "\u{F0225}",
+                                        0, // Filled in by final high-res response
+                                    )),
+                                    is_prefetch: r.is_prefetch,
+                                    sequence: r.sequence,
+                                    decode_duration: thumb_dur,
+                                    is_thumbnail: true,
+                                });
+                            }
+                            if partial_bytes.len() < limit {
+                                // If the file was smaller than the limit, we have already loaded it fully
+                                bytes_opt = Some(partial_bytes);
+                            }
+                        }
+                    }
+
+                    // Decode the full resolution image
+                    let final_bytes = if let Some(bytes) = bytes_opt {
+                        Some(bytes)
+                    } else {
+                        crate::image_worker::read_source_bytes(&r.source).ok()
+                    };
+
+                    let res = if let Some(ref bytes) = final_bytes {
+                        crate::image_worker::decode_image_bytes(bytes, &r.source)
+                    } else {
+                        crate::image_worker::decode_image_source(r.source)
+                    };
+
                     let decode_duration = start.elapsed();
                     let _ = response_tx.send(LoaderResponse {
                         idx: r.idx,
@@ -358,6 +416,7 @@ impl App {
                         is_prefetch: r.is_prefetch,
                         sequence: r.sequence,
                         decode_duration,
+                        is_thumbnail: false,
                     });
                 }
             }
@@ -368,6 +427,8 @@ impl App {
             filtered_files: Vec::new(),
             filtered_commands: Vec::new(),
             original_image: None,
+            thumbnail_image: None,
+            show_thumbnail_only: false,
             image_protocol: None,
             picker,
             img_width: 0,
@@ -674,6 +735,13 @@ impl App {
                 self.slideshow_last_transition = std::time::Instant::now();
             }
             Command::SetSlideshow => self.open_prompt(PromptType::SetSlideshow),
+            Command::ToggleThumbnail => {
+                if self.thumbnail_image.is_some() {
+                    self.show_thumbnail_only = !self.show_thumbnail_only;
+                    self.needs_update = true;
+                    self.needs_clear_once = true;
+                }
+            }
             Command::ShowInfo => {
                 if self.palette_mode == PaletteMode::Info {
                     if self.last_info_toggle.is_none()
@@ -686,7 +754,7 @@ impl App {
                     }
                 } else {
                     self.palette_mode = PaletteMode::Info;
-                    self.palette_height = 14;
+                    self.palette_height = 18;
                     self.needs_clear_once = true;
                     self.last_info_toggle = Some(std::time::Instant::now());
                 }
@@ -898,6 +966,10 @@ impl App {
         if let Some(cached_img) = cached {
             self.current_sequence += 1;
             self.original_image = Some(cached_img.image);
+            self.thumbnail_image = None;
+            self.show_thumbnail_only = false;
+            self.stats.thumbnail_load_duration = None;
+            self.stats.thumbnail_dimensions = None;
             self.current_icon = cached_img.icon;
             self.img_width = cached_img.width;
             self.img_height = cached_img.height;
@@ -920,6 +992,10 @@ impl App {
 
         // Cache miss: load as normal via background loader worker
         self.original_image = None;
+        self.thumbnail_image = None;
+        self.show_thumbnail_only = false;
+        self.stats.thumbnail_load_duration = None;
+        self.stats.thumbnail_dimensions = None;
         self.image_protocol = None;
         self.is_loading = true;
         self.loading_start_time = Some(Instant::now());
@@ -939,7 +1015,7 @@ impl App {
 
     pub fn update_channels(&mut self) {
         while let Ok(resp) = self.response_rx.try_recv() {
-            if resp.sequence < self.current_sequence {
+            if resp.sequence < self.current_sequence && !resp.is_prefetch {
                 continue;
             }
 
@@ -947,6 +1023,9 @@ impl App {
                 Ok((img, w, h, icon, disk_size)) => {
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
+                        if resp.is_thumbnail {
+                            continue;
+                        }
                         let window_indices = self.get_sliding_window_indices();
                         if window_indices.contains(&resp.idx) {
                             let mut cache = self.prefetch_cache.lock().unwrap();
@@ -963,24 +1042,48 @@ impl App {
                             );
                         }
                     } else if resp.idx == self.queue.current_index {
-                        self.img_width = w;
-                        self.img_height = h;
-                        self.current_icon = icon;
-                        self.original_image = Some(shared_img);
-                        self.error_message = None;
-                        self.zoom_factor = 1.0;
-                        self.pan_offset = PanOffset::ZERO;
-                        self.brightness = Brightness::ZERO;
-                        self.contrast = Contrast::ZERO;
-                        self.needs_update = true;
-                        self.zoom_needs_initialization = true;
+                        if resp.is_thumbnail {
+                            self.img_width = w;
+                            self.img_height = h;
+                            self.current_icon = icon;
+                            let thumb_w = shared_img.width();
+                            let thumb_h = shared_img.height();
+                            self.original_image = Some(shared_img.clone());
+                            self.thumbnail_image = Some(shared_img);
+                            self.error_message = None;
+                            self.zoom_factor = 1.0;
+                            self.pan_offset = PanOffset::ZERO;
+                            self.brightness = Brightness::ZERO;
+                            self.contrast = Contrast::ZERO;
+                            self.needs_update = true;
+                            self.zoom_needs_initialization = true;
 
-                        // Set stats for cache miss
-                        self.stats.load_duration = resp.decode_duration;
-                        self.stats.is_prefetch_cache_hit = false;
-                        self.stats.disk_size = disk_size;
+                            self.stats.thumbnail_load_duration = Some(resp.decode_duration);
+                            self.stats.thumbnail_dimensions = Some((thumb_w, thumb_h));
+                            self.stats.is_prefetch_cache_hit = false;
+                            self.stats.disk_size = disk_size;
+                        } else {
+                            self.img_width = w;
+                            self.img_height = h;
+                            if self.original_image.is_none() {
+                                self.zoom_factor = 1.0;
+                                self.pan_offset = PanOffset::ZERO;
+                                self.brightness = Brightness::ZERO;
+                                self.contrast = Contrast::ZERO;
+                                self.zoom_needs_initialization = true;
+                            }
+                            self.original_image = Some(shared_img);
+                            self.current_icon = icon;
+                            self.error_message = None;
+                            self.is_loading = false;
+                            self.needs_update = true;
 
-                        self.trigger_prefetch();
+                            self.stats.load_duration = resp.decode_duration;
+                            self.stats.is_prefetch_cache_hit = false;
+                            self.stats.disk_size = disk_size;
+
+                            self.trigger_prefetch();
+                        }
                     }
                 }
                 Err(err) => {
@@ -996,7 +1099,9 @@ impl App {
 
         let mut latest_protocol = None;
         while let Ok(resp) = self.protocol_rx.try_recv() {
-            latest_protocol = Some(resp);
+            if resp.sequence == self.current_sequence {
+                latest_protocol = Some(resp);
+            }
         }
 
         if let Some(resp) = latest_protocol {
@@ -1024,7 +1129,7 @@ impl App {
 
         let new_h = match self.palette_mode {
             PaletteMode::Prompt => 4.min(term_height.saturating_sub(1)),
-            PaletteMode::Info => 14.min(term_height.saturating_sub(1)),
+            PaletteMode::Info => 18.min(term_height.saturating_sub(1)),
             PaletteMode::File | PaletteMode::Command => {
                 let total_items = match self.palette_mode {
                     PaletteMode::File => self.get_filtered_files().len(),
@@ -1063,7 +1168,13 @@ impl App {
         let widget_w_px = widget_w as f64 * cell_w as f64;
         let widget_h_px = widget_h as f64 * cell_h as f64;
 
-        if let Some(ref img) = self.original_image {
+        let active_img = if self.show_thumbnail_only && self.thumbnail_image.is_some() {
+            self.thumbnail_image.as_ref()
+        } else {
+            self.original_image.as_ref()
+        };
+
+        if let Some(img) = active_img {
             let w_orig = self.img_width as f64;
             let h_orig = self.img_height as f64;
 
@@ -1128,6 +1239,7 @@ impl App {
 
             let req = ResizeRequest {
                 img: Arc::clone(img),
+                original_size: (self.img_width, self.img_height),
                 scale,
                 crop: CropBox::new(crop_x1, crop_y1, crop_x2, crop_y2),
                 intersection: ImageIntersection::new(
@@ -1143,6 +1255,7 @@ impl App {
                 brightness: self.brightness,
                 contrast: self.contrast,
                 rendered_size_cells: rendered_cells,
+                sequence: self.current_sequence,
             };
 
             let _ = self.resize_tx.send(req);

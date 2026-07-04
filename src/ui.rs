@@ -34,9 +34,10 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     // Render image or placeholders
     let show_loading = app.is_loading
         && (app.image_protocol.is_none()
-            || app
-                .loading_start_time
-                .is_some_and(|t| t.elapsed() > Duration::from_millis(150)));
+            || (app.thumbnail_image.is_none()
+                && app
+                    .loading_start_time
+                    .is_some_and(|t| t.elapsed() > Duration::from_millis(150))));
 
     if show_loading {
         let loading_paragraph = Paragraph::new("\n\nLoading Image...")
@@ -122,11 +123,16 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             .split(inner_rect);
 
         let left_text = format!(
-            " [{}/{}] ({}x{}) ",
+            " [{}/{}] ({}x{}){} ",
             app.queue.current_index + 1,
             app.queue.images.len(),
             app.img_width,
-            app.img_height
+            app.img_height,
+            if app.show_thumbnail_only {
+                " [THUMB]"
+            } else {
+                ""
+            }
         );
         let left_para = Paragraph::new(left_text)
             .alignment(Alignment::Left)
@@ -300,6 +306,32 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                 lines.push(Line::from(vec![
                     "   Load / Decode: ".gray(),
                     format!("{:.2} ms", app.stats.load_duration.as_secs_f64() * 1000.0).bold(),
+                ]));
+                let thumb_load_str = match app.stats.thumbnail_load_duration {
+                    Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
+                    None => "N/A (No EXIF Thumbnail / Large Image)".gray(),
+                };
+                lines.push(Line::from(vec![
+                    "   Thumbnail Load: ".gray(),
+                    thumb_load_str,
+                ]));
+                lines.push(Line::from(vec![
+                    "   Thumbnail Mode: ".gray(),
+                    if app.show_thumbnail_only {
+                        "Active (Thumbnail Displayed)".green().bold()
+                    } else if app.thumbnail_image.is_some() {
+                        "Inactive (Full Image Displayed)".yellow()
+                    } else {
+                        "N/A".gray()
+                    },
+                ]));
+                let thumb_dim_str = match app.stats.thumbnail_dimensions {
+                    Some((w, h)) => format!("{} x {} px", w, h).bold(),
+                    None => "N/A".gray(),
+                };
+                lines.push(Line::from(vec![
+                    "   Thumbnail Dimensions: ".gray(),
+                    thumb_dim_str,
                 ]));
                 lines.push(Line::from(vec![
                     "   Prefetch Cache Hit: ".gray(),

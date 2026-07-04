@@ -89,6 +89,8 @@ pub enum Command {
     SetSlideshow,
     /// Toggle the image details and statistics info dialog.
     ShowInfo,
+    /// Toggle showing the low-res EXIF thumbnail placeholder only (for testing).
+    ToggleThumbnail,
 }
 
 impl Command {
@@ -357,13 +359,19 @@ impl Command {
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('d')]),
             },
+            Self::ToggleThumbnail => CommandItem {
+                name: "Toggle Thumbnail Mode",
+                description: "Toggle displaying the low-res EXIF thumbnail for testing",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('m')]),
+            },
         }
     }
 }
 
 /// Abstract representation of keyboard keys and mouse actions for bindings.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyDef {
     /// A single character press (e.g. 'q', 'i').
     Char(char),
@@ -549,5 +557,30 @@ pub fn get_commands() -> &'static [PaletteCommand] {
 impl std::fmt::Display for KeyDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.format())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use strum::IntoEnumIterator;
+
+    #[test]
+    fn test_no_shortcut_conflicts() {
+        let mut shortcut_to_cmd = HashMap::new();
+        for cmd in Command::iter() {
+            let metadata = cmd.get_metadata();
+            if let Some(shortcuts) = metadata.shortcuts {
+                for shortcut in shortcuts {
+                    if let Some(existing_cmd) = shortcut_to_cmd.insert(*shortcut, cmd) {
+                        panic!(
+                            "Shortcut {:?} is duplicated! Registered for both {:?} and {:?}",
+                            shortcut, existing_cmd, cmd
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -340,6 +340,9 @@ impl std::str::FromStr for SlideshowConfig {
 pub struct ResizeRequest {
     /// Shared reference to the decoded dynamic image.
     pub img: Arc<DynamicImage>,
+    /// Expected full-resolution dimensions of the image.
+    /// If the actual image buffer dimensions differ, it indicates a thumbnail placeholder.
+    pub original_size: (u32, u32),
     /// Calculated scaling factor.
     pub scale: f64,
     /// Crop box geometry.
@@ -360,6 +363,8 @@ pub struct ResizeRequest {
     pub contrast: Contrast,
     /// Output terminal grid cell dimensions.
     pub rendered_size_cells: (u16, u16),
+    /// Sequence identifier to filter out stale requests.
+    pub sequence: u64,
 }
 
 /// A request sent to the persistent loader thread.
@@ -386,111 +391,25 @@ pub struct LoaderResponse {
     pub sequence: u64,
     /// Time taken to load and decode.
     pub decode_duration: std::time::Duration,
+    /// Whether this response carries a fast-load low-res thumbnail image placeholder.
+    pub is_thumbnail: bool,
 }
 
-/// Decodes an image from local paths or comic book archives.
-/// Employs zune-jpeg for extremely fast decoding of JPEGs.
-pub fn decode_image_source(
-    source: ImageSource,
-) -> Result<(DynamicImage, u32, u32, &'static str, u64), String> {
+/// Reads the source raw bytes from local files or CBZ zip archives.
+pub fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
     match source {
-        ImageSource::Local(path) => {
-            let bytes = std::fs::read(&path)
-                .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e))?;
-            let file_size = bytes.len() as u64;
-
-            let format = image::guess_format(&bytes).ok();
-
-            if let Some(image::ImageFormat::Jpeg) = format {
-                let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-                    .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
-                let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&bytes, options);
-                if let Ok(pixels) = decoder.decode()
-                    && let Some(info) = decoder.info()
-                    && let Some(rgba_img) =
-                        image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
-                {
-                    let cursor_meta = std::io::Cursor::new(&bytes);
-                    let orientation =
-                        match image::ImageReader::new(cursor_meta).with_guessed_format() {
-                            Ok(reader) => match reader.into_decoder() {
-                                Ok(mut dec) => dec
-                                    .orientation()
-                                    .unwrap_or(image::metadata::Orientation::NoTransforms),
-                                Err(_) => image::metadata::Orientation::NoTransforms,
-                            },
-                            Err(_) => image::metadata::Orientation::NoTransforms,
-                        };
-
-                    let mut img = image::DynamicImage::ImageRgba8(rgba_img);
-                    img.apply_orientation(orientation);
-                    let w = img.width();
-                    let h = img.height();
-                    return Ok((img, w, h, "\u{F0225}", file_size));
-                }
-            }
-
-            let cursor = std::io::Cursor::new(&bytes);
-            let reader = image::ImageReader::new(cursor)
-                .with_guessed_format()
-                .map_err(|e| {
-                    format!(
-                        "Failed to parse image from memory:\n{}\nError: {}",
-                        path.display(),
-                        e
-                    )
-                })?;
-
-            let fmt = reader.format();
-            let icon = match fmt {
-                Some(image::ImageFormat::Jpeg) => "\u{F0225}",
-                Some(image::ImageFormat::Png) => "\u{F0E2D}",
-                Some(image::ImageFormat::Gif) => "\u{F0D78}",
-                _ => "\u{F021F}",
-            };
-
-            let mut decoder = reader.into_decoder().map_err(|e| {
-                format!(
-                    "Failed to read metadata:\n{}\n\nError: {}",
-                    path.display(),
-                    e
-                )
-            })?;
-
-            let orientation = decoder
-                .orientation()
-                .unwrap_or(image::metadata::Orientation::NoTransforms);
-            let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
-                format!(
-                    "Failed to decode image:\n{}\n\nError: {}",
-                    path.display(),
-                    e
-                )
-            })?;
-
-            img.apply_orientation(orientation);
-            let rgba_img = img.to_rgba8();
-            let w = rgba_img.width();
-            let h = rgba_img.height();
-            Ok((
-                image::DynamicImage::ImageRgba8(rgba_img),
-                w,
-                h,
-                icon,
-                file_size,
-            ))
-        }
+        ImageSource::Local(path) => std::fs::read(path)
+            .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e)),
         ImageSource::Cbz {
             zip_path,
             file_in_zip,
         } => {
-            let file = std::fs::File::open(&zip_path)
+            let file = std::fs::File::open(zip_path)
                 .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
-            let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
             let reader = std::io::BufReader::new(file);
             let mut archive = zip::ZipArchive::new(reader)
                 .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
-            let mut zip_entry = archive.by_name(&file_in_zip).map_err(|e| {
+            let mut zip_entry = archive.by_name(file_in_zip).map_err(|e| {
                 format!(
                     "Failed to locate page {} in {}: {}",
                     file_in_zip,
@@ -508,76 +427,144 @@ pub fn decode_image_source(
                     e
                 )
             })?;
-
-            let cursor = std::io::Cursor::new(&buffer);
-            let reader = image::ImageReader::new(cursor)
-                .with_guessed_format()
-                .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
-
-            if let Some(image::ImageFormat::Jpeg) = reader.format() {
-                let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-                    .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
-                let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&buffer, options);
-                if let Ok(pixels) = decoder.decode()
-                    && let Some(info) = decoder.info()
-                    && let Some(rgba_img) =
-                        image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
-                {
-                    let cursor_meta = std::io::Cursor::new(&buffer);
-                    let orientation =
-                        match image::ImageReader::new(cursor_meta).with_guessed_format() {
-                            Ok(reader) => match reader.into_decoder() {
-                                Ok(mut dec) => dec
-                                    .orientation()
-                                    .unwrap_or(image::metadata::Orientation::NoTransforms),
-                                Err(_) => image::metadata::Orientation::NoTransforms,
-                            },
-                            Err(_) => image::metadata::Orientation::NoTransforms,
-                        };
-
-                    let mut img = image::DynamicImage::ImageRgba8(rgba_img);
-                    img.apply_orientation(orientation);
-                    let w = img.width();
-                    let h = img.height();
-                    return Ok((img, w, h, "\u{F0225}", file_size));
-                }
-            }
-
-            let cursor = std::io::Cursor::new(&buffer);
-            let reader = image::ImageReader::new(cursor)
-                .with_guessed_format()
-                .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
-
-            let fmt = reader.format();
-            let icon = match fmt {
-                Some(image::ImageFormat::Jpeg) => "\u{F0225}",
-                Some(image::ImageFormat::Png) => "\u{F0E2D}",
-                Some(image::ImageFormat::Gif) => "\u{F0D78}",
-                _ => "\u{F021F}",
-            };
-
-            let mut decoder = reader
-                .into_decoder()
-                .map_err(|e| format!("Failed to decode header for {}: {}", file_in_zip, e))?;
-            let orientation = decoder
-                .orientation()
-                .unwrap_or(image::metadata::Orientation::NoTransforms);
-            let mut img = image::DynamicImage::from_decoder(decoder)
-                .map_err(|e| format!("Failed to decode image data for {}: {}", file_in_zip, e))?;
-            img.apply_orientation(orientation);
-
-            let rgba_img = img.to_rgba8();
-            let w = rgba_img.width();
-            let h = rgba_img.height();
-            Ok((
-                image::DynamicImage::ImageRgba8(rgba_img),
-                w,
-                h,
-                icon,
-                file_size,
-            ))
+            Ok(buffer)
         }
     }
+}
+
+/// Reads only the first `limit` bytes from local files or CBZ archives.
+/// This prevents loading massive files fully into memory when only the EXIF header or thumbnail is needed.
+pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<Vec<u8>, String> {
+    match source {
+        ImageSource::Local(path) => {
+            use std::io::Read;
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| format!("Failed to open file:\n{}\n\nError: {}", path.display(), e))?;
+            let mut buffer = vec![0u8; limit];
+            let bytes_read = file
+                .read(&mut buffer)
+                .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e))?;
+            buffer.truncate(bytes_read);
+            Ok(buffer)
+        }
+        ImageSource::Cbz {
+            zip_path,
+            file_in_zip,
+        } => {
+            let file = std::fs::File::open(zip_path)
+                .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
+            let reader = std::io::BufReader::new(file);
+            let mut archive = zip::ZipArchive::new(reader)
+                .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
+            let mut zip_entry = archive.by_name(file_in_zip).map_err(|e| {
+                format!(
+                    "Failed to locate page {} in {}: {}",
+                    file_in_zip,
+                    zip_path.display(),
+                    e
+                )
+            })?;
+            let mut buffer = vec![0u8; limit];
+            use std::io::Read;
+            let bytes_read = zip_entry.read(&mut buffer).map_err(|e| {
+                format!(
+                    "Failed to read page data {} from {}: {}",
+                    file_in_zip,
+                    zip_path.display(),
+                    e
+                )
+            })?;
+            buffer.truncate(bytes_read);
+            Ok(buffer)
+        }
+    }
+}
+
+/// Decodes an image from already loaded memory bytes.
+pub fn decode_image_bytes(
+    bytes: &[u8],
+    source: &ImageSource,
+) -> Result<(DynamicImage, u32, u32, &'static str, u64), String> {
+    let file_size = bytes.len() as u64;
+    let format = image::guess_format(bytes).ok();
+    let display_name = source.display_name();
+
+    if let Some(image::ImageFormat::Jpeg) = format {
+        let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(bytes, options);
+        if let Ok(pixels) = decoder.decode()
+            && let Some(info) = decoder.info()
+            && let Some(rgba_img) =
+                image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
+        {
+            let cursor_meta = std::io::Cursor::new(bytes);
+            let orientation = match image::ImageReader::new(cursor_meta).with_guessed_format() {
+                Ok(reader) => match reader.into_decoder() {
+                    Ok(mut dec) => dec
+                        .orientation()
+                        .unwrap_or(image::metadata::Orientation::NoTransforms),
+                    Err(_) => image::metadata::Orientation::NoTransforms,
+                },
+                Err(_) => image::metadata::Orientation::NoTransforms,
+            };
+
+            let mut img = image::DynamicImage::ImageRgba8(rgba_img);
+            img.apply_orientation(orientation);
+            let w = img.width();
+            let h = img.height();
+            return Ok((img, w, h, "\u{F0225}", file_size));
+        }
+    }
+
+    let cursor = std::io::Cursor::new(bytes);
+    let reader = image::ImageReader::new(cursor)
+        .with_guessed_format()
+        .map_err(|e| {
+            format!(
+                "Failed to parse image from memory:\n{}\nError: {}",
+                display_name, e
+            )
+        })?;
+
+    let fmt = reader.format();
+    let icon = match fmt {
+        Some(image::ImageFormat::Jpeg) => "\u{F0225}",
+        Some(image::ImageFormat::Png) => "\u{F0E2D}",
+        Some(image::ImageFormat::Gif) => "\u{F0D78}",
+        _ => "\u{F021F}",
+    };
+
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("Failed to read metadata:\n{}\n\nError: {}", display_name, e))?;
+
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("Failed to decode image:\n{}\n\nError: {}", display_name, e))?;
+
+    img.apply_orientation(orientation);
+    let rgba_img = img.to_rgba8();
+    let w = rgba_img.width();
+    let h = rgba_img.height();
+    Ok((
+        image::DynamicImage::ImageRgba8(rgba_img),
+        w,
+        h,
+        icon,
+        file_size,
+    ))
+}
+
+/// Decodes an image from local paths or comic book archives.
+/// Employs zune-jpeg for extremely fast decoding of JPEGs.
+pub fn decode_image_source(
+    source: ImageSource,
+) -> Result<(DynamicImage, u32, u32, &'static str, u64), String> {
+    let bytes = read_source_bytes(&source)?;
+    decode_image_bytes(&bytes, &source)
 }
 
 /// Helper resizing function leveraging fast_image_resize for sub-millisecond execution speeds.
@@ -633,20 +620,51 @@ pub fn process_resize(
     resizer: &mut fir::Resizer,
 ) -> (StatefulProtocol, std::time::Duration, std::time::Duration) {
     let start_process = std::time::Instant::now();
-    let mut canvas = if req.intersection.x1 as i64 == req.crop.x1
-        && req.intersection.x2 as i64 == req.crop.x2
-        && req.intersection.y1 as i64 == req.crop.y1
-        && req.intersection.y2 as i64 == req.crop.y2
+
+    // Map input crop/intersection coordinates from the full image space to the thumbnail space
+    // if the loaded image buffer is a thumbnail placeholder of different dimensions.
+    let (img_to_resize, scale, crop, intersection) =
+        if req.img.width() != req.original_size.0 || req.img.height() != req.original_size.1 {
+            let factor_x = req.img.width() as f64 / req.original_size.0 as f64;
+            let factor_y = req.img.height() as f64 / req.original_size.1 as f64;
+
+            let crop_x1 = (req.crop.x1 as f64 * factor_x).round() as i64;
+            let crop_y1 = (req.crop.y1 as f64 * factor_y).round() as i64;
+            let crop_x2 = (req.crop.x2 as f64 * factor_x).round() as i64;
+            let crop_y2 = (req.crop.y2 as f64 * factor_y).round() as i64;
+            let scaled_crop = CropBox::new(crop_x1, crop_y1, crop_x2, crop_y2);
+
+            let inter_x1 =
+                ((req.intersection.x1 as f64 * factor_x).round() as u32).min(req.img.width());
+            let inter_y1 =
+                ((req.intersection.y1 as f64 * factor_y).round() as u32).min(req.img.height());
+            let inter_x2 =
+                ((req.intersection.x2 as f64 * factor_x).round() as u32).min(req.img.width());
+            let inter_y2 =
+                ((req.intersection.y2 as f64 * factor_y).round() as u32).min(req.img.height());
+            let scaled_inter = ImageIntersection::new(inter_x1, inter_y1, inter_x2, inter_y2);
+
+            let new_scale = req.target_w as f64 / scaled_crop.width().max(1) as f64;
+
+            (Arc::clone(&req.img), new_scale, scaled_crop, scaled_inter)
+        } else {
+            (Arc::clone(&req.img), req.scale, req.crop, req.intersection)
+        };
+
+    let mut canvas = if intersection.x1 as i64 == crop.x1
+        && intersection.x2 as i64 == crop.x2
+        && intersection.y1 as i64 == crop.y1
+        && intersection.y2 as i64 == crop.y2
     {
         let crop_rect = Some((
-            req.intersection.x1 as f64,
-            req.intersection.y1 as f64,
-            req.intersection.width() as f64,
-            req.intersection.height() as f64,
+            intersection.x1 as f64,
+            intersection.y1 as f64,
+            intersection.width() as f64,
+            intersection.height() as f64,
         ));
         match fast_resize(
             resizer,
-            &req.img,
+            &img_to_resize,
             req.target_w,
             req.target_h,
             req.filter_type,
@@ -654,11 +672,11 @@ pub fn process_resize(
         ) {
             Ok(resized) => resized,
             Err(_) => {
-                let cropped_part = req.img.crop_imm(
-                    req.intersection.x1,
-                    req.intersection.y1,
-                    req.intersection.width(),
-                    req.intersection.height(),
+                let cropped_part = img_to_resize.crop_imm(
+                    intersection.x1,
+                    intersection.y1,
+                    intersection.width(),
+                    intersection.height(),
                 );
                 cropped_part.resize(
                     req.target_w,
@@ -670,22 +688,20 @@ pub fn process_resize(
     } else {
         let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
 
-        if !req.intersection.is_empty() {
-            let target_inter_w =
-                ((req.intersection.width() as f64 * req.scale).round() as u32).max(1);
-            let target_inter_h =
-                ((req.intersection.height() as f64 * req.scale).round() as u32).max(1);
+        if !intersection.is_empty() {
+            let target_inter_w = ((intersection.width() as f64 * scale).round() as u32).max(1);
+            let target_inter_h = ((intersection.height() as f64 * scale).round() as u32).max(1);
 
             let crop_rect = Some((
-                req.intersection.x1 as f64,
-                req.intersection.y1 as f64,
-                req.intersection.width() as f64,
-                req.intersection.height() as f64,
+                intersection.x1 as f64,
+                intersection.y1 as f64,
+                intersection.width() as f64,
+                intersection.height() as f64,
             ));
 
             let resized_part = match fast_resize(
                 resizer,
-                &req.img,
+                &img_to_resize,
                 target_inter_w,
                 target_inter_h,
                 req.filter_type,
@@ -693,11 +709,11 @@ pub fn process_resize(
             ) {
                 Ok(resized) => resized,
                 Err(_) => {
-                    let cropped_part = req.img.crop_imm(
-                        req.intersection.x1,
-                        req.intersection.y1,
-                        req.intersection.width(),
-                        req.intersection.height(),
+                    let cropped_part = img_to_resize.crop_imm(
+                        intersection.x1,
+                        intersection.y1,
+                        intersection.width(),
+                        intersection.height(),
                     );
                     cropped_part.resize(
                         target_inter_w,
@@ -707,20 +723,29 @@ pub fn process_resize(
                 }
             };
 
-            let paste_x =
-                ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
-            let paste_y =
-                ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
+            let paste_x = ((intersection.x1 as i64 - crop.x1) as f64 * scale).round() as i64;
+            let paste_y = ((intersection.y1 as i64 - crop.y1) as f64 * scale).round() as i64;
 
             let paste_x =
                 paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;
             let paste_y =
                 paste_y.clamp(0, (req.target_h as i64 - target_inter_h as i64).max(0)) as u32;
 
-            if let Some(rgba_part) = resized_part.as_rgba8() {
-                let _ = screen_canvas.copy_from(rgba_part, paste_x, paste_y);
-            } else {
-                let _ = screen_canvas.copy_from(&resized_part.to_rgba8(), paste_x, paste_y);
+            let copy_w = target_inter_w.min(req.target_w.saturating_sub(paste_x));
+            let copy_h = target_inter_h.min(req.target_h.saturating_sub(paste_y));
+
+            if copy_w > 0 && copy_h > 0 {
+                let part_to_copy = if copy_w < target_inter_w || copy_h < target_inter_h {
+                    resized_part.crop_imm(0, 0, copy_w, copy_h)
+                } else {
+                    resized_part
+                };
+
+                if let Some(rgba_part) = part_to_copy.as_rgba8() {
+                    let _ = screen_canvas.copy_from(rgba_part, paste_x, paste_y);
+                } else {
+                    let _ = screen_canvas.copy_from(&part_to_copy.to_rgba8(), paste_x, paste_y);
+                }
             }
         }
         DynamicImage::ImageRgba8(screen_canvas)
@@ -917,4 +942,110 @@ pub fn collect_sources(paths: &[PathBuf], check_magic: bool) -> Result<Vec<Image
         }
     }
     Ok(sources)
+}
+
+/// Tries to extract the embedded JPEG thumbnail from EXIF APP1 metadata segment.
+pub fn extract_jpeg_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+    let offset = exif
+        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)
+        .and_then(|f| match f.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            _ => None,
+        })? as usize;
+
+    let length = exif
+        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)
+        .and_then(|f| match f.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            _ => None,
+        })? as usize;
+
+    let tiff_start = bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6;
+
+    let end = tiff_start
+        .checked_add(offset)
+        .and_then(|val| val.checked_add(length))?;
+
+    if end <= bytes.len() {
+        Some(bytes[tiff_start + offset..end].to_vec())
+    } else {
+        None
+    }
+}
+
+/// Reads the image dimensions extremely quickly from header headers, and decodes/scales
+/// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
+pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let (raw_w, raw_h) = decoder.dimensions();
+
+    // megapixel threshold: 12 MP
+    if (raw_w as u64 * raw_h as u64) < 12_000_000 {
+        return None;
+    }
+
+    let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
+    let mut thumb_img = image::load_from_memory(&thumb_bytes).ok()?;
+
+    // Apply the exact same orientation transforms to the thumbnail
+    thumb_img.apply_orientation(orientation);
+
+    // Swap dimensions if orientation rotates the image 90 or 270 degrees
+    let swaps = matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    );
+    let (real_w, real_h) = if swaps {
+        (raw_h, raw_w)
+    } else {
+        (raw_w, raw_h)
+    };
+
+    // Crop out any black padding/letterboxing in the thumbnail frame
+    // caused by aspect ratio differences between the thumbnail bounding box and the main image.
+    let ar_main = real_w as f64 / real_h as f64;
+    let thumb_w = thumb_img.width();
+    let thumb_h = thumb_img.height();
+    let ar_thumb = thumb_w as f64 / thumb_h as f64;
+
+    let cropped_thumb = if (ar_main - ar_thumb).abs() > 0.01 {
+        if ar_main > ar_thumb {
+            // Main image is wider than thumbnail box: crop top/bottom black bars
+            let content_h = (thumb_w as f64 / ar_main).round() as u32;
+            let padding_y = (thumb_h.saturating_sub(content_h)) / 2;
+            let content_h = content_h.min(thumb_h.saturating_sub(padding_y));
+            if content_h > 0 {
+                thumb_img.crop_imm(0, padding_y, thumb_w, content_h)
+            } else {
+                thumb_img
+            }
+        } else {
+            // Main image is taller than thumbnail box: crop left/right black bars
+            let content_w = (thumb_h as f64 * ar_main).round() as u32;
+            let padding_x = (thumb_w.saturating_sub(content_w)) / 2;
+            let content_w = content_w.min(thumb_w.saturating_sub(padding_x));
+            if content_w > 0 {
+                thumb_img.crop_imm(padding_x, 0, content_w, thumb_h)
+            } else {
+                thumb_img
+            }
+        }
+    } else {
+        thumb_img
+    };
+
+    // Return the tiny oriented and cropped thumbnail directly without upscaling to avoid massive buffers/CPU overhead
+    Some((cropped_thumb, real_w, real_h))
 }
