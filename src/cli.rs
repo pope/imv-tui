@@ -1,7 +1,7 @@
+use crate::image_worker::{FilterType, ScaleMode, SlideshowConfig};
+use ratatui_image::picker::ProtocolType;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use crate::image_worker::{SlideshowConfig, FilterType, ScaleMode};
-use ratatui_image::picker::ProtocolType;
 
 /// Parsed CLI option arguments.
 pub struct CliOptions {
@@ -84,7 +84,10 @@ fn get_arg(args: &[String], i: &mut usize, flag: &str) -> Result<String, String>
     if *i + 1 < args.len() {
         let val = &args[*i + 1];
         if val.starts_with('-') {
-            return Err(format!("Error: Argument for {} cannot be another option ({})", flag, val));
+            return Err(format!(
+                "Error: Argument for {} cannot be another option ({})",
+                flag, val
+            ));
         }
         let res = val.clone();
         *i += 2;
@@ -165,7 +168,9 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 if let Ok(config) = val.parse::<SlideshowConfig>() {
                     slideshow = Some(config);
                 } else {
-                    return Err("Error: -t / --slideshow requires a positive integer argument".into());
+                    return Err(
+                        "Error: -t / --slideshow requires a positive integer argument".into(),
+                    );
                 }
             }
             "--check-magic" | "-m" => {

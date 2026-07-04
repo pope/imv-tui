@@ -46,6 +46,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     } else if let Some(ref mut protocol) = app.image_protocol {
         // Calculate the centered Rect inside chunks[0]
         let (rect_w, rect_h) = app.rendered_size_cells;
+        let rect_w = rect_w.min(chunks[0].width);
+        let rect_h = rect_h.min(chunks[0].height);
         let x = chunks[0].x + (chunks[0].width.saturating_sub(rect_w)) / 2;
         let y = chunks[0].y + (chunks[0].height.saturating_sub(rect_h)) / 2;
         let centered_rect = Rect::new(x, y, rect_w, rect_h);
@@ -55,6 +57,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     } else if let Some(ref err) = app.error_message {
         let err_block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .title(" Error Loading Image ")
             .style(Style::default().fg(Color::Red));
         let err_paragraph = Paragraph::new(err.as_str())
@@ -87,10 +90,16 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             extra_info.push_str(&format!(" | Brightness: {:+}", app.brightness.value()));
         }
         if app.contrast.value() != 0.0 {
-            extra_info.push_str(&format!(" | Contrast: {:+}%", app.contrast.value().round() as i32));
+            extra_info.push_str(&format!(
+                " | Contrast: {:+}%",
+                app.contrast.value().round() as i32
+            ));
         }
         if app.slideshow_config.is_active() {
-            extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_config.seconds()));
+            extra_info.push_str(&format!(
+                " | Slideshow: {}s",
+                app.slideshow_config.seconds()
+            ));
         }
 
         let title_text = format!(" {} {} ", app.current_icon, app.current_filename());
@@ -175,12 +184,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             ];
 
             let w = 45.min(chunks[0].width.saturating_sub(1));
-            let h = 4.min(chunks[0].height.saturating_sub(1));
-
-            if app.palette_height != h {
-                app.palette_height = h;
-                app.needs_clear_once = true;
-            }
+            let h = app.palette_height.min(chunks[0].height.saturating_sub(1));
 
             let palette_block = Block::default()
                 .title(prompt_title)
@@ -206,28 +210,13 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                 _ => "",
             };
 
-            // Determine dynamic visible_count and palette_height
-            let total_items = match app.palette_mode {
-                PaletteMode::File => app.get_filtered_files().len(),
-                PaletteMode::Command => app.get_filtered_commands().len(),
-                _ => 0,
-            };
-            let max_height = (chunks[0].height as f64 * 0.5).round() as u16;
-            let mut palette_h = (total_items as u16 + 4).max(12);
-            palette_h = palette_h.min(max_height);
-
-            if app.palette_height != palette_h {
-                app.palette_height = palette_h;
-                app.needs_clear_once = true;
-            }
-
             let visible_count = (app.palette_height as usize).saturating_sub(4);
             let palette_height = app.palette_height;
 
             let mut lines = vec![
                 Line::from(vec![
                     " > ".bold().cyan(),
-                    app.palette_query.clone().into(),
+                    app.palette_query.as_str().into(),
                     "▊".cyan(), // cursor block
                 ]),
                 Line::from("──────────────────────────────────────────────────────────".gray()),
@@ -256,13 +245,14 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                         .skip(start_idx)
                         .take(visible_count)
                     {
-                        let mut line = Line::from(format!("   {}", filename));
-                        if i == app.palette_selected_index {
-                            line = Line::from(format!(" > {}", filename))
-                                .bold()
-                                .yellow()
-                                .on_blue();
-                        }
+                        let line = if i == app.palette_selected_index {
+                            Line::from(vec![
+                                " > ".bold().yellow().on_blue(),
+                                filename.as_str().bold().yellow().on_blue(),
+                            ])
+                        } else {
+                            Line::from(vec!["   ".into(), filename.as_str().into()])
+                        };
                         lines.push(line);
                     }
 
@@ -292,15 +282,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                         .skip(start_idx)
                         .take(visible_count)
                     {
-                        let mut keys = Vec::new();
-                        let item = cmd.cmd.get_metadata();
-                        if let Some(bindings) = item.shortcuts {
-                            for bind in bindings {
-                                keys.push(bind.format());
-                            }
-                        }
-                        let shortcut_str = keys.join(", ");
-
                         let mut cmd_line = vec![
                             if i == app.palette_selected_index {
                                 " > "
@@ -311,9 +292,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                             cmd.item.name.bold(),
                         ];
 
-                        if !shortcut_str.is_empty() {
+                        if !cmd.shortcut_str.is_empty() {
                             cmd_line.push(" [".into());
-                            cmd_line.push(shortcut_str.cyan());
+                            cmd_line.push(cmd.shortcut_str.as_str().cyan());
                             cmd_line.push("]".into());
                         }
 

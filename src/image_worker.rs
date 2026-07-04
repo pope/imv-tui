@@ -145,7 +145,11 @@ impl Contrast {
 
     /// Constructor that clamps the value to [-255.0, 255.0].
     pub fn new(val: f32) -> Self {
-        Self(if val.is_nan() { 0.0 } else { val.clamp(-255.0, 255.0) })
+        Self(if val.is_nan() {
+            0.0
+        } else {
+            val.clamp(-255.0, 255.0)
+        })
     }
 
     /// Access the underlying raw f32 value.
@@ -304,7 +308,11 @@ impl SlideshowConfig {
     /// Construct SlideshowConfig from a raw seconds count.
     pub fn new(seconds: u32) -> Self {
         Self {
-            delay: if seconds == 0 { None } else { Some(std::time::Duration::from_secs(seconds as u64)) },
+            delay: if seconds == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(seconds as u64))
+            },
         }
     }
 
@@ -400,15 +408,16 @@ pub fn decode_image_source(
                         image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
                 {
                     let cursor_meta = std::io::Cursor::new(&bytes);
-                    let orientation = match image::ImageReader::new(cursor_meta).with_guessed_format() {
-                        Ok(reader) => match reader.into_decoder() {
-                            Ok(mut dec) => dec
-                                .orientation()
-                                .unwrap_or(image::metadata::Orientation::NoTransforms),
+                    let orientation =
+                        match image::ImageReader::new(cursor_meta).with_guessed_format() {
+                            Ok(reader) => match reader.into_decoder() {
+                                Ok(mut dec) => dec
+                                    .orientation()
+                                    .unwrap_or(image::metadata::Orientation::NoTransforms),
+                                Err(_) => image::metadata::Orientation::NoTransforms,
+                            },
                             Err(_) => image::metadata::Orientation::NoTransforms,
-                        },
-                        Err(_) => image::metadata::Orientation::NoTransforms,
-                    };
+                        };
 
                     let mut img = image::DynamicImage::ImageRgba8(rgba_img);
                     img.apply_orientation(orientation);
@@ -421,7 +430,13 @@ pub fn decode_image_source(
             let cursor = std::io::Cursor::new(&bytes);
             let reader = image::ImageReader::new(cursor)
                 .with_guessed_format()
-                .map_err(|e| format!("Failed to parse image from memory:\n{}\nError: {}", path.display(), e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to parse image from memory:\n{}\nError: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
 
             let fmt = reader.format();
             let icon = match fmt {
@@ -672,8 +687,10 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
                 }
             };
 
-            let paste_x = ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
-            let paste_y = ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
+            let paste_x =
+                ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
+            let paste_y =
+                ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
 
             let paste_x =
                 paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;

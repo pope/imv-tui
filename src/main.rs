@@ -109,6 +109,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.slideshow_last_transition = std::time::Instant::now();
         }
 
+        let term_size = terminal.size().unwrap_or_default();
+        app.update_layout(term_size.height);
+
         if app.needs_clear_once {
             app.needs_clear_once = false;
             terminal.clear()?;

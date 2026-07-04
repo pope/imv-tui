@@ -1,3 +1,4 @@
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use fast_image_resize as fir;
 use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -6,13 +7,12 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
 
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::image_worker::{
-    FilterType, ImageSource, LoaderRequest, LoaderResponse, ResizeRequest, ScaleMode,
-    decode_image_source, process_resize, Brightness, Contrast, PanOffset, CropBox, ImageIntersection,
-    SlideshowConfig,
+    Brightness, Contrast, CropBox, FilterType, ImageIntersection, ImageSource, LoaderRequest,
+    LoaderResponse, PanOffset, ResizeRequest, ScaleMode, SlideshowConfig, decode_image_source,
+    process_resize,
 };
 /// Represents an absolute or relative adjustment to a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,13 +34,19 @@ impl<T: std::str::FromStr> std::str::FromStr for Adjustment<T> {
             return Err("Empty input".to_string());
         }
         if let Some(stripped) = s.strip_prefix('+') {
-            let val = stripped.parse::<T>().map_err(|_| "Invalid positive offset".to_string())?;
+            let val = stripped
+                .parse::<T>()
+                .map_err(|_| "Invalid positive offset".to_string())?;
             Ok(Self::RelativeAdd(val))
         } else if let Some(stripped) = s.strip_prefix('-') {
-            let val = stripped.parse::<T>().map_err(|_| "Invalid negative offset".to_string())?;
+            let val = stripped
+                .parse::<T>()
+                .map_err(|_| "Invalid negative offset".to_string())?;
             Ok(Self::RelativeSub(val))
         } else {
-            let val = s.parse::<T>().map_err(|_| "Invalid absolute value".to_string())?;
+            let val = s
+                .parse::<T>()
+                .map_err(|_| "Invalid absolute value".to_string())?;
             Ok(Self::Absolute(val))
         }
     }
@@ -109,7 +115,10 @@ impl ImageQueue {
 
     /// Returns the filename display name of the currently selected image.
     pub fn get_current_filename(&self) -> &str {
-        self.display_names.get(self.current_index).map(|s| s.as_str()).unwrap_or("")
+        self.display_names
+            .get(self.current_index)
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 }
 
@@ -376,8 +385,9 @@ impl App {
             PaletteMode::File => {
                 self.filtered_files = self.get_filtered_files_uncached();
                 if !self.filtered_files.is_empty() {
-                    self.palette_selected_index =
-                        self.palette_selected_index.min(self.filtered_files.len() - 1);
+                    self.palette_selected_index = self
+                        .palette_selected_index
+                        .min(self.filtered_files.len() - 1);
                 } else {
                     self.palette_selected_index = 0;
                 }
@@ -385,8 +395,9 @@ impl App {
             PaletteMode::Command => {
                 self.filtered_commands = self.get_filtered_commands_uncached();
                 if !self.filtered_commands.is_empty() {
-                    self.palette_selected_index =
-                        self.palette_selected_index.min(self.filtered_commands.len() - 1);
+                    self.palette_selected_index = self
+                        .palette_selected_index
+                        .min(self.filtered_commands.len() - 1);
                 } else {
                     self.palette_selected_index = 0;
                 }
@@ -414,24 +425,24 @@ impl App {
         );
 
         #[derive(Clone)]
-        struct FileCandidate {
+        struct FileCandidate<'a> {
             index: usize,
-            name: String,
+            name: &'a str,
         }
-        impl AsRef<str> for FileCandidate {
+        impl<'a> AsRef<str> for FileCandidate<'a> {
             fn as_ref(&self) -> &str {
-                &self.name
+                self.name
             }
         }
 
-        let candidates: Vec<FileCandidate> = self
+        let candidates: Vec<FileCandidate<'_>> = self
             .queue
             .display_names_lowercase
             .iter()
             .enumerate()
             .map(|(index, name)| FileCandidate {
                 index,
-                name: name.clone(),
+                name: name.as_str(),
             })
             .collect();
 
@@ -441,7 +452,10 @@ impl App {
         matches
             .into_iter()
             .map(|(candidate, _score)| {
-                (candidate.index, self.queue.display_names[candidate.index].clone())
+                (
+                    candidate.index,
+                    self.queue.display_names[candidate.index].clone(),
+                )
             })
             .collect()
     }
@@ -650,86 +664,84 @@ impl App {
     }
 
     pub fn execute_prompt(&mut self, prompt_type: PromptType) {
-        (|| {
-            match prompt_type {
-                PromptType::GoToImage => {
-                    if self.queue.is_empty() {
-                        return;
-                    }
-                    let input = self.palette_query.trim();
-                    let Ok(adj) = input.parse::<Adjustment<usize>>() else {
-                        return;
-                    };
-                    let mut new_idx = self.queue.current_index;
-                    match adj {
-                        Adjustment::Absolute(val) => {
-                            if let Some(val_minus_1) = val.checked_sub(1) {
-                                new_idx = val_minus_1.min(self.queue.images.len() - 1);
-                            }
-                        }
-                        Adjustment::RelativeAdd(val) => {
-                            new_idx = (self.queue.current_index + val).min(self.queue.images.len() - 1);
-                        }
-                        Adjustment::RelativeSub(val) => {
-                            new_idx = self.queue.current_index.saturating_sub(val);
+        (|| match prompt_type {
+            PromptType::GoToImage => {
+                if self.queue.is_empty() {
+                    return;
+                }
+                let input = self.palette_query.trim();
+                let Ok(adj) = input.parse::<Adjustment<usize>>() else {
+                    return;
+                };
+                let mut new_idx = self.queue.current_index;
+                match adj {
+                    Adjustment::Absolute(val) => {
+                        if let Some(val_minus_1) = val.checked_sub(1) {
+                            new_idx = val_minus_1.min(self.queue.images.len() - 1);
                         }
                     }
-                    if new_idx != self.queue.current_index {
-                        self.queue.current_index = new_idx;
-                        self.start_load_image();
+                    Adjustment::RelativeAdd(val) => {
+                        new_idx = (self.queue.current_index + val).min(self.queue.images.len() - 1);
+                    }
+                    Adjustment::RelativeSub(val) => {
+                        new_idx = self.queue.current_index.saturating_sub(val);
                     }
                 }
-                PromptType::SetBrightness => {
-                    if self.original_image.is_none() {
-                        return;
-                    }
-                    let input = self.palette_query.trim();
-                    let Ok(adj) = input.parse::<Adjustment<i32>>() else {
-                        return;
-                    };
-                    let old = self.brightness;
-                    match adj {
-                        Adjustment::Absolute(val) => self.brightness = Brightness::new(val),
-                        Adjustment::RelativeAdd(val) => self.brightness.adjust(val),
-                        Adjustment::RelativeSub(val) => self.brightness.adjust(-val),
-                    }
-                    if old != self.brightness {
-                        self.needs_update = true;
-                    }
+                if new_idx != self.queue.current_index {
+                    self.queue.current_index = new_idx;
+                    self.start_load_image();
                 }
-                PromptType::SetContrast => {
-                    if self.original_image.is_none() {
-                        return;
-                    }
-                    let input = self.palette_query.trim();
-                    let Ok(adj) = input.parse::<Adjustment<f32>>() else {
-                        return;
-                    };
-                    let mut next = self.contrast;
-                    match adj {
-                        Adjustment::Absolute(val) => next = Contrast::new(val),
-                        Adjustment::RelativeAdd(val) => next.adjust(val),
-                        Adjustment::RelativeSub(val) => next.adjust(-val),
-                    }
-                    if self.contrast.update(next.value()) {
-                        self.needs_update = true;
-                    }
+            }
+            PromptType::SetBrightness => {
+                if self.original_image.is_none() {
+                    return;
                 }
-                PromptType::SetSlideshow => {
-                    let input = self.palette_query.trim();
-                    let Ok(adj) = input.parse::<Adjustment<u32>>() else {
-                        return;
-                    };
-                    let mut new_val = self.slideshow_config.seconds();
-                    match adj {
-                        Adjustment::Absolute(val) => new_val = val,
-                        Adjustment::RelativeAdd(val) => new_val = new_val.saturating_add(val),
-                        Adjustment::RelativeSub(val) => new_val = new_val.saturating_sub(val),
-                    }
-                    if new_val != self.slideshow_config.seconds() {
-                        self.slideshow_config = SlideshowConfig::new(new_val);
-                        self.slideshow_last_transition = std::time::Instant::now();
-                    }
+                let input = self.palette_query.trim();
+                let Ok(adj) = input.parse::<Adjustment<i32>>() else {
+                    return;
+                };
+                let old = self.brightness;
+                match adj {
+                    Adjustment::Absolute(val) => self.brightness = Brightness::new(val),
+                    Adjustment::RelativeAdd(val) => self.brightness.adjust(val),
+                    Adjustment::RelativeSub(val) => self.brightness.adjust(-val),
+                }
+                if old != self.brightness {
+                    self.needs_update = true;
+                }
+            }
+            PromptType::SetContrast => {
+                if self.original_image.is_none() {
+                    return;
+                }
+                let input = self.palette_query.trim();
+                let Ok(adj) = input.parse::<Adjustment<f32>>() else {
+                    return;
+                };
+                let mut next = self.contrast;
+                match adj {
+                    Adjustment::Absolute(val) => next = Contrast::new(val),
+                    Adjustment::RelativeAdd(val) => next.adjust(val),
+                    Adjustment::RelativeSub(val) => next.adjust(-val),
+                }
+                if self.contrast.update(next.value()) {
+                    self.needs_update = true;
+                }
+            }
+            PromptType::SetSlideshow => {
+                let input = self.palette_query.trim();
+                let Ok(adj) = input.parse::<Adjustment<u32>>() else {
+                    return;
+                };
+                let mut new_val = self.slideshow_config.seconds();
+                match adj {
+                    Adjustment::Absolute(val) => new_val = val,
+                    Adjustment::RelativeAdd(val) => new_val = new_val.saturating_add(val),
+                    Adjustment::RelativeSub(val) => new_val = new_val.saturating_sub(val),
+                }
+                if new_val != self.slideshow_config.seconds() {
+                    self.slideshow_config = SlideshowConfig::new(new_val);
+                    self.slideshow_last_transition = std::time::Instant::now();
                 }
             }
         })();
@@ -887,7 +899,12 @@ impl App {
             }
         }
 
-        if let Ok((protocol, cells)) = self.protocol_rx.try_recv() {
+        let mut latest_protocol = None;
+        while let Ok((protocol, cells)) = self.protocol_rx.try_recv() {
+            latest_protocol = Some((protocol, cells));
+        }
+
+        if let Some((protocol, cells)) = latest_protocol {
             self.image_protocol = Some(protocol);
             self.rendered_size_cells = cells;
             self.is_loading = false;
@@ -895,6 +912,33 @@ impl App {
                 self.clear_on_protocol_receive = false;
                 self.needs_clear = true;
             }
+        }
+    }
+
+    pub fn update_layout(&mut self, term_height: u16) {
+        if self.palette_mode == PaletteMode::Closed {
+            return;
+        }
+
+        let new_h = match self.palette_mode {
+            PaletteMode::Prompt => 4.min(term_height.saturating_sub(1)),
+            PaletteMode::File | PaletteMode::Command => {
+                let total_items = match self.palette_mode {
+                    PaletteMode::File => self.get_filtered_files().len(),
+                    PaletteMode::Command => self.get_filtered_commands().len(),
+                    _ => 0,
+                };
+                let max_height = (term_height as f64 * 0.5).round() as u16;
+                let mut palette_h = (total_items as u16 + 4).max(12);
+                palette_h = palette_h.min(max_height);
+                palette_h
+            }
+            _ => 0,
+        };
+
+        if self.palette_height != new_h {
+            self.palette_height = new_h;
+            self.needs_clear_once = true;
         }
     }
 
@@ -983,7 +1027,12 @@ impl App {
                 img: Arc::clone(img),
                 scale,
                 crop: CropBox::new(crop_x1, crop_y1, crop_x2, crop_y2),
-                intersection: ImageIntersection::new(inter_x1 as u32, inter_y1 as u32, inter_x2 as u32, inter_y2 as u32),
+                intersection: ImageIntersection::new(
+                    inter_x1 as u32,
+                    inter_y1 as u32,
+                    inter_x2 as u32,
+                    inter_y2 as u32,
+                ),
                 target_w,
                 target_h,
                 filter_type: self.filter_type,
@@ -1491,19 +1540,22 @@ impl App {
                             let palette_h = (max_len as u16 + 4).max(12).min(max_h);
                             let page_size = (palette_h as usize).saturating_sub(4);
 
-                            self.palette_selected_index = (self.palette_selected_index
-                                + page_size)
-                                .min(max_len - 1);
+                            self.palette_selected_index =
+                                (self.palette_selected_index + page_size).min(max_len - 1);
                         }
                     }
                     KeyCode::Char('k')
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
                             && self.palette_selected_index > 0 =>
                     {
                         self.palette_selected_index -= 1;
                     }
                     KeyCode::Char('j')
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
                     {
                         let max_len = match self.palette_mode {
                             PaletteMode::File => self.get_filtered_files().len(),

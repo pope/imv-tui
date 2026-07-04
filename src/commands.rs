@@ -370,7 +370,8 @@ pub enum KeyDef {
     Shift(event::KeyCode),
     ScrollUp,
     ScrollDown,
-}impl KeyDef {
+}
+impl KeyDef {
     pub fn matches(self, event: &event::Event) -> bool {
         match event {
             event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
@@ -383,11 +384,13 @@ pub enum KeyDef {
                             }
                             if c.is_alphabetic() {
                                 if c.is_lowercase() {
-                                    key_char == c && !key_event.modifiers.contains(KeyModifiers::SHIFT)
+                                    key_char == c
+                                        && !key_event.modifiers.contains(KeyModifiers::SHIFT)
                                 } else {
                                     key_char == c
                                         || (key_event.modifiers.contains(KeyModifiers::SHIFT)
-                                            && key_char.to_lowercase().next() == c.to_lowercase().next())
+                                            && key_char.to_lowercase().next()
+                                                == c.to_lowercase().next())
                                 }
                             } else {
                                 key_char == c
@@ -397,7 +400,8 @@ pub enum KeyDef {
                         }
                     }
                     Self::Code(code) => {
-                        key_event.code == code && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        key_event.code == code
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
                     }
                     Self::Ctrl(c) => {
                         if let KeyCode::Char(key_char) = key_event.code {
@@ -505,6 +509,8 @@ pub struct PaletteCommand {
     pub item: CommandItem,
     /// Pre-computed lowercase search text format: "name description".
     pub search_text: String,
+    /// Pre-computed shortcut formatting string.
+    pub shortcut_str: String,
 }
 
 /// Returns a static slice of all available command metadata items.
@@ -515,10 +521,20 @@ pub fn get_commands() -> &'static [PaletteCommand] {
             .map(|cmd| {
                 let item = cmd.get_metadata();
                 let search_text = format!("{} {}", item.name, item.description).to_lowercase();
+
+                let mut keys = Vec::new();
+                if let Some(bindings) = item.shortcuts {
+                    for bind in bindings {
+                        keys.push(bind.format());
+                    }
+                }
+                let shortcut_str = keys.join(", ");
+
                 PaletteCommand {
                     cmd,
                     item,
                     search_text,
+                    shortcut_str,
                 }
             })
             .collect()
