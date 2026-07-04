@@ -378,23 +378,26 @@ pub struct LoaderRequest {
 pub struct LoaderResponse {
     /// File index inside the App source list.
     pub idx: usize,
-    /// The decode result containing the dynamic image, width, height, and icon.
-    pub result: Result<(DynamicImage, u32, u32, &'static str), String>,
+    /// The decode result containing the dynamic image, width, height, icon, and file size.
+    pub result: Result<(DynamicImage, u32, u32, &'static str, u64), String>,
     /// Whether this was a background prefetch request.
     pub is_prefetch: bool,
     /// Navigation sequence identifier of the load request.
     pub sequence: u64,
+    /// Time taken to load and decode.
+    pub decode_duration: std::time::Duration,
 }
 
 /// Decodes an image from local paths or comic book archives.
 /// Employs zune-jpeg for extremely fast decoding of JPEGs.
 pub fn decode_image_source(
     source: ImageSource,
-) -> Result<(DynamicImage, u32, u32, &'static str), String> {
+) -> Result<(DynamicImage, u32, u32, &'static str, u64), String> {
     match source {
         ImageSource::Local(path) => {
             let bytes = std::fs::read(&path)
                 .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e))?;
+            let file_size = bytes.len() as u64;
 
             let format = image::guess_format(&bytes).ok();
 
@@ -423,7 +426,7 @@ pub fn decode_image_source(
                     img.apply_orientation(orientation);
                     let w = img.width();
                     let h = img.height();
-                    return Ok((img, w, h, "\u{F0225}"));
+                    return Ok((img, w, h, "\u{F0225}", file_size));
                 }
             }
 
@@ -469,7 +472,13 @@ pub fn decode_image_source(
             let rgba_img = img.to_rgba8();
             let w = rgba_img.width();
             let h = rgba_img.height();
-            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h, icon))
+            Ok((
+                image::DynamicImage::ImageRgba8(rgba_img),
+                w,
+                h,
+                icon,
+                file_size,
+            ))
         }
         ImageSource::Cbz {
             zip_path,
@@ -477,6 +486,7 @@ pub fn decode_image_source(
         } => {
             let file = std::fs::File::open(&zip_path)
                 .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
+            let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
             let reader = std::io::BufReader::new(file);
             let mut archive = zip::ZipArchive::new(reader)
                 .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
@@ -529,7 +539,7 @@ pub fn decode_image_source(
                     img.apply_orientation(orientation);
                     let w = img.width();
                     let h = img.height();
-                    return Ok((img, w, h, "\u{F0225}"));
+                    return Ok((img, w, h, "\u{F0225}", file_size));
                 }
             }
 
@@ -559,7 +569,13 @@ pub fn decode_image_source(
             let rgba_img = img.to_rgba8();
             let w = rgba_img.width();
             let h = rgba_img.height();
-            Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h, icon))
+            Ok((
+                image::DynamicImage::ImageRgba8(rgba_img),
+                w,
+                h,
+                icon,
+                file_size,
+            ))
         }
     }
 }
@@ -612,7 +628,11 @@ pub fn fast_resize(
 
 /// Processes a scaling and panning request in the background, creating/rendering
 /// the final scaled viewport on a screen-pixel canvas block to support offscreen panning boundaries.
-pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> StatefulProtocol {
+pub fn process_resize(
+    req: ResizeRequest,
+    resizer: &mut fir::Resizer,
+) -> (StatefulProtocol, std::time::Duration, std::time::Duration) {
+    let start_process = std::time::Instant::now();
     let mut canvas = if req.intersection.x1 as i64 == req.crop.x1
         && req.intersection.x2 as i64 == req.crop.x2
         && req.intersection.y1 as i64 == req.crop.y1
@@ -714,8 +734,13 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
             image::imageops::colorops::contrast_in_place(rgba_canvas, req.contrast.value());
         }
     }
+    let process_duration = start_process.elapsed();
 
-    req.picker.new_resize_protocol(canvas)
+    let start_protocol = std::time::Instant::now();
+    let protocol = req.picker.new_resize_protocol(canvas);
+    let protocol_duration = start_protocol.elapsed();
+
+    (protocol, process_duration, protocol_duration)
 }
 
 /// Scans the directory surrounding the initial path, returns sorted paths of

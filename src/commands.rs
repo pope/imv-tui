@@ -87,6 +87,8 @@ pub enum Command {
     SlideshowDecrease,
     /// Set exact slideshow duration in seconds.
     SetSlideshow,
+    /// Toggle the image details and statistics info dialog.
+    ShowInfo,
 }
 
 impl Command {
@@ -348,6 +350,12 @@ impl Command {
                 description: "Set slideshow duration in seconds or offset (e.g. 5, +1, -1)",
                 show_in_palette: true,
                 shortcuts: None,
+            },
+            Self::ShowInfo => CommandItem {
+                name: "Show Image Info",
+                description: "Toggle the image details and statistics info dialog",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('d')]),
             },
         }
     }

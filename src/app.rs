@@ -146,9 +146,50 @@ pub enum PaletteMode {
     File,
     /// Prompt value input box is open.
     Prompt,
+    /// Image metadata and statistics dialog is open.
+    Info,
 }
 
-type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32, &'static str)>>>;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatsForNerds {
+    /// Time taken to load (decode) the photo from disk or zip.
+    pub load_duration: std::time::Duration,
+    /// Was it loaded from the prefetch cache.
+    pub is_prefetch_cache_hit: bool,
+    /// Time taken to resize, apply filters, adjustments, etc.
+    pub process_duration: std::time::Duration,
+    /// Time taken to send it to the pixel handlers (writing to sixel or kitty APIs).
+    pub protocol_duration: std::time::Duration,
+    /// Target width in pixels sent to the graphics protocol.
+    pub protocol_width: u32,
+    /// Target height in pixels sent to the graphics protocol.
+    pub protocol_height: u32,
+    /// Size of the image on disk in bytes.
+    pub disk_size: u64,
+}
+
+/// A cached image and its associated metadata in the prefetch cache.
+#[derive(Clone)]
+pub struct CachedImage {
+    pub image: Arc<DynamicImage>,
+    pub width: u32,
+    pub height: u32,
+    pub icon: &'static str,
+    pub decode_duration: std::time::Duration,
+    pub disk_size: u64,
+}
+
+type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;
+
+/// A response payload sent by the resizing worker thread.
+pub struct ResizeResponse {
+    pub protocol: StatefulProtocol,
+    pub rendered_cells: (u16, u16),
+    pub process_duration: std::time::Duration,
+    pub protocol_duration: std::time::Duration,
+    pub target_width: u32,
+    pub target_height: u32,
+}
 
 /// The central application state controller.
 pub struct App {
@@ -218,7 +259,7 @@ pub struct App {
 
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
-    protocol_rx: mpsc::Receiver<(StatefulProtocol, (u16, u16))>,
+    protocol_rx: mpsc::Receiver<ResizeResponse>,
     /// Loader thread dispatcher channel.
     pub loader_tx: mpsc::Sender<LoaderRequest>,
     response_rx: mpsc::Receiver<LoaderResponse>,
@@ -240,6 +281,10 @@ pub struct App {
     pub slideshow_config: SlideshowConfig,
     /// Last slideshow transition timestamp.
     pub slideshow_last_transition: std::time::Instant,
+    /// Stats for nerds instrumentation.
+    pub stats: StatsForNerds,
+    /// Last toggle timestamp of the info diagnostics overlay.
+    pub last_info_toggle: Option<std::time::Instant>,
 }
 
 impl App {
@@ -255,7 +300,7 @@ impl App {
         let queue = ImageQueue::new(images, current_index)?;
 
         let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
-        let (protocol_tx, protocol_rx) = mpsc::channel::<(StatefulProtocol, (u16, u16))>();
+        let (protocol_tx, protocol_rx) = mpsc::channel::<ResizeResponse>();
 
         // Spawn background resizing worker thread
         std::thread::spawn(move || {
@@ -266,8 +311,17 @@ impl App {
                     latest_req = next_req;
                 }
                 let rendered_cells = latest_req.rendered_size_cells;
-                let protocol = process_resize(latest_req, &mut resizer);
-                let _ = protocol_tx.send((protocol, rendered_cells));
+                let target_w = latest_req.target_w;
+                let target_h = latest_req.target_h;
+                let (protocol, proc_dur, proto_dur) = process_resize(latest_req, &mut resizer);
+                let _ = protocol_tx.send(ResizeResponse {
+                    protocol,
+                    rendered_cells,
+                    process_duration: proc_dur,
+                    protocol_duration: proto_dur,
+                    target_width: target_w,
+                    target_height: target_h,
+                });
             }
         });
 
@@ -295,12 +349,15 @@ impl App {
                 current_requests.sort_by_key(|r| r.is_prefetch);
 
                 for r in current_requests {
+                    let start = std::time::Instant::now();
                     let res = decode_image_source(r.source);
+                    let decode_duration = start.elapsed();
                     let _ = response_tx.send(LoaderResponse {
                         idx: r.idx,
                         result: res,
                         is_prefetch: r.is_prefetch,
                         sequence: r.sequence,
+                        decode_duration,
                     });
                 }
             }
@@ -349,6 +406,8 @@ impl App {
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
             slideshow_config: SlideshowConfig::OFF,
             slideshow_last_transition: std::time::Instant::now(),
+            stats: StatsForNerds::default(),
+            last_info_toggle: None,
         };
 
         app.start_load_image();
@@ -615,6 +674,23 @@ impl App {
                 self.slideshow_last_transition = std::time::Instant::now();
             }
             Command::SetSlideshow => self.open_prompt(PromptType::SetSlideshow),
+            Command::ShowInfo => {
+                if self.palette_mode == PaletteMode::Info {
+                    if self.last_info_toggle.is_none()
+                        || self.last_info_toggle.unwrap().elapsed()
+                            > std::time::Duration::from_millis(200)
+                    {
+                        self.palette_mode = PaletteMode::Closed;
+                        self.needs_clear_once = true;
+                        self.last_info_toggle = Some(std::time::Instant::now());
+                    }
+                } else {
+                    self.palette_mode = PaletteMode::Info;
+                    self.palette_height = 14;
+                    self.needs_clear_once = true;
+                    self.last_info_toggle = Some(std::time::Instant::now());
+                }
+            }
         }
     }
 
@@ -819,12 +895,12 @@ impl App {
             cache.remove(&self.queue.current_index)
         };
 
-        if let Some((img, w, h, icon)) = cached {
+        if let Some(cached_img) = cached {
             self.current_sequence += 1;
-            self.original_image = Some(img);
-            self.current_icon = icon;
-            self.img_width = w;
-            self.img_height = h;
+            self.original_image = Some(cached_img.image);
+            self.current_icon = cached_img.icon;
+            self.img_width = cached_img.width;
+            self.img_height = cached_img.height;
             self.zoom_factor = 1.0;
             self.pan_offset = PanOffset::ZERO;
             self.brightness = Brightness::ZERO;
@@ -832,6 +908,12 @@ impl App {
             self.is_loading = false;
             self.needs_update = true;
             self.zoom_needs_initialization = true;
+
+            // Set stats for cache hit
+            self.stats.load_duration = cached_img.decode_duration;
+            self.stats.is_prefetch_cache_hit = true;
+            self.stats.disk_size = cached_img.disk_size;
+
             self.trigger_prefetch();
             return;
         }
@@ -862,13 +944,23 @@ impl App {
             }
 
             match resp.result {
-                Ok((img, w, h, icon)) => {
+                Ok((img, w, h, icon, disk_size)) => {
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
                         let window_indices = self.get_sliding_window_indices();
                         if window_indices.contains(&resp.idx) {
                             let mut cache = self.prefetch_cache.lock().unwrap();
-                            cache.insert(resp.idx, (shared_img, w, h, icon));
+                            cache.insert(
+                                resp.idx,
+                                CachedImage {
+                                    image: shared_img,
+                                    width: w,
+                                    height: h,
+                                    icon,
+                                    decode_duration: resp.decode_duration,
+                                    disk_size,
+                                },
+                            );
                         }
                     } else if resp.idx == self.queue.current_index {
                         self.img_width = w;
@@ -882,6 +974,12 @@ impl App {
                         self.contrast = Contrast::ZERO;
                         self.needs_update = true;
                         self.zoom_needs_initialization = true;
+
+                        // Set stats for cache miss
+                        self.stats.load_duration = resp.decode_duration;
+                        self.stats.is_prefetch_cache_hit = false;
+                        self.stats.disk_size = disk_size;
+
                         self.trigger_prefetch();
                     }
                 }
@@ -897,18 +995,25 @@ impl App {
         }
 
         let mut latest_protocol = None;
-        while let Ok((protocol, cells)) = self.protocol_rx.try_recv() {
-            latest_protocol = Some((protocol, cells));
+        while let Ok(resp) = self.protocol_rx.try_recv() {
+            latest_protocol = Some(resp);
         }
 
-        if let Some((protocol, cells)) = latest_protocol {
-            self.image_protocol = Some(protocol);
-            self.rendered_size_cells = cells;
+        if let Some(resp) = latest_protocol {
+            self.image_protocol = Some(resp.protocol);
+            self.rendered_size_cells = resp.rendered_cells;
             self.is_loading = false;
             if self.clear_on_protocol_receive {
                 self.clear_on_protocol_receive = false;
                 self.needs_clear = true;
             }
+            if self.palette_mode != PaletteMode::Closed {
+                self.needs_clear_once = true;
+            }
+            self.stats.process_duration = resp.process_duration;
+            self.stats.protocol_duration = resp.protocol_duration;
+            self.stats.protocol_width = resp.target_width;
+            self.stats.protocol_height = resp.target_height;
         }
     }
 
@@ -919,6 +1024,7 @@ impl App {
 
         let new_h = match self.palette_mode {
             PaletteMode::Prompt => 4.min(term_height.saturating_sub(1)),
+            PaletteMode::Info => 14.min(term_height.saturating_sub(1)),
             PaletteMode::File | PaletteMode::Command => {
                 let total_items = match self.palette_mode {
                     PaletteMode::File => self.get_filtered_files().len(),
@@ -1457,7 +1563,37 @@ impl App {
 
     /// Handles a Crossterm input event (keyboard or mouse).
     pub fn handle_event(&mut self, ev: Event, terminal_height: u16) {
-        if self.palette_mode != PaletteMode::Closed {
+        if let (
+            PaletteMode::Info,
+            Event::Key(crossterm::event::KeyEvent {
+                code,
+                kind: KeyEventKind::Press,
+                ..
+            }),
+        ) = (self.palette_mode, &ev)
+        {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.palette_mode = PaletteMode::Closed;
+                    self.needs_clear_once = true;
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    if self.last_info_toggle.is_none()
+                        || self.last_info_toggle.unwrap().elapsed()
+                            > std::time::Duration::from_millis(200)
+                    {
+                        self.palette_mode = PaletteMode::Closed;
+                        self.needs_clear_once = true;
+                        self.last_info_toggle = Some(std::time::Instant::now());
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.palette_mode != PaletteMode::Closed && self.palette_mode != PaletteMode::Info {
             if let Event::Key(key) = ev {
                 if key.kind != KeyEventKind::Press {
                     return;

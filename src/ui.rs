@@ -203,6 +203,155 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             let popup_area = Rect::new(x, y, w, h);
             frame.render_widget(Clear, popup_area);
             frame.render_widget(palette_paragraph, popup_area);
+        } else if app.palette_mode == PaletteMode::Info {
+            let title = " Image Details ";
+            let w = 55.min(chunks[0].width.saturating_sub(1));
+            let h = app.palette_height.min(chunks[0].height.saturating_sub(1));
+
+            let mut lines = Vec::new();
+
+            if app.queue.is_empty() {
+                lines.push(Line::from(" No image details available.".gray().italic()));
+
+                let palette_block = Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title_style(Style::default().fg(Color::Yellow).bold());
+
+                let palette_paragraph = Paragraph::new(lines)
+                    .block(palette_block)
+                    .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+                let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+                let y = chunks[0].y.saturating_add(1);
+
+                let popup_area = Rect::new(x, y, w, h);
+                frame.render_widget(Clear, popup_area);
+                frame.render_widget(palette_paragraph, popup_area);
+            } else {
+                let (filename, dir_str, disk_size_str, mem_size_str) =
+                    match &app.queue.images[app.queue.current_index] {
+                        crate::image_worker::ImageSource::Local(path) => {
+                            let filename = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let dir_str = path
+                                .parent()
+                                .and_then(|p| p.to_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let disk_size_str = format_size(app.stats.disk_size);
+                            let mem_size = app
+                                .original_image
+                                .as_ref()
+                                .map(|img| img.as_bytes().len() as u64)
+                                .unwrap_or(0);
+                            let mem_size_str = format_size(mem_size);
+                            (filename, dir_str, disk_size_str, mem_size_str)
+                        }
+                        crate::image_worker::ImageSource::Cbz {
+                            zip_path,
+                            file_in_zip,
+                        } => {
+                            let filename = file_in_zip.clone();
+                            let dir_str = format!("{} (Archive)", zip_path.display());
+                            let disk_size_str = format_size(app.stats.disk_size);
+                            let mem_size = app
+                                .original_image
+                                .as_ref()
+                                .map(|img| img.as_bytes().len() as u64)
+                                .unwrap_or(0);
+                            let mem_size_str = format_size(mem_size);
+                            (filename, dir_str, disk_size_str, mem_size_str)
+                        }
+                    };
+                let pixels_str = format!("{} x {} px", app.img_width, app.img_height);
+
+                lines.push(Line::from(vec![
+                    " File: ".bold().cyan(),
+                    filename.as_str().into(),
+                ]));
+                lines.push(Line::from(vec![
+                    " Directory: ".bold().cyan(),
+                    dir_str.as_str().into(),
+                ]));
+                lines.push(Line::from(vec![
+                    " Size on Disk: ".bold().cyan(),
+                    disk_size_str.as_str().into(),
+                ]));
+                lines.push(Line::from(vec![
+                    " Dimensions: ".bold().cyan(),
+                    pixels_str.as_str().into(),
+                ]));
+
+                let inner_w = w.saturating_sub(2) as usize;
+                lines.push(Line::from("─".repeat(inner_w).gray()));
+                lines.push(Line::from(" Stats for Nerds:".bold().yellow()));
+
+                let cache_hit_str = if app.stats.is_prefetch_cache_hit {
+                    "Yes (Hit)".green()
+                } else {
+                    "No (Miss)".red()
+                };
+                lines.push(Line::from(vec![
+                    "   Load / Decode: ".gray(),
+                    format!("{:.2} ms", app.stats.load_duration.as_secs_f64() * 1000.0).bold(),
+                ]));
+                lines.push(Line::from(vec![
+                    "   Prefetch Cache Hit: ".gray(),
+                    cache_hit_str,
+                ]));
+                lines.push(Line::from(vec![
+                    "   Uncompressed Mem: ".gray(),
+                    mem_size_str.as_str().bold(),
+                ]));
+                lines.push(Line::from(vec![
+                    "   Resize / Filter: ".gray(),
+                    format!(
+                        "{:.2} ms",
+                        app.stats.process_duration.as_secs_f64() * 1000.0
+                    )
+                    .bold(),
+                ]));
+                lines.push(Line::from(vec![
+                    "   Terminal API Write: ".gray(),
+                    format!(
+                        "{:.2} ms",
+                        app.stats.protocol_duration.as_secs_f64() * 1000.0
+                    )
+                    .bold(),
+                ]));
+                let proto_pixels_str = format!(
+                    "{} x {} px",
+                    app.stats.protocol_width, app.stats.protocol_height
+                );
+                lines.push(Line::from(vec![
+                    "   Protocol Pixels: ".gray(),
+                    proto_pixels_str.as_str().bold(),
+                ]));
+
+                let palette_block = Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title_style(Style::default().fg(Color::Yellow).bold());
+
+                let palette_paragraph = Paragraph::new(lines)
+                    .block(palette_block)
+                    .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+                let x = chunks[0].x + chunks[0].width.saturating_sub(w).saturating_sub(1);
+                let y = chunks[0].y.saturating_add(1);
+
+                let popup_area = Rect::new(x, y, w, h);
+                frame.render_widget(Clear, popup_area);
+                frame.render_widget(palette_paragraph, popup_area);
+            }
         } else {
             let title = match app.palette_mode {
                 PaletteMode::File => " File Search ",
@@ -344,5 +493,15 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(palette_paragraph, popup_area);
         }
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
