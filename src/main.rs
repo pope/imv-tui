@@ -16,7 +16,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
-use crate::app::App;
+use crate::app::{App, PaletteMode};
 use crate::cli::{parse_cli_args, read_piped_stdin};
 use crate::image_worker::{
     ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory,
@@ -95,13 +95,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.slideshow_last_transition = std::time::Instant::now();
     }
 
+    let mut last_loop_tick = std::time::Instant::now();
+
     // Main event loop
     while app.running {
+        let now = std::time::Instant::now();
+        let delta = now.duration_since(last_loop_tick);
+        last_loop_tick = now;
+
+        if app.slideshow_config.is_active() && app.palette_mode != PaletteMode::Closed {
+            app.slideshow_last_transition += delta;
+        }
+
         app.update_channels();
 
         // Automatic slideshow transition
         if app.slideshow_config.is_active()
             && !app.is_loading
+            && app.palette_mode == PaletteMode::Closed
             && app.slideshow_last_transition.elapsed()
                 >= std::time::Duration::from_secs(app.slideshow_config.seconds() as u64)
         {
