@@ -9,18 +9,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::{Picker, ProtocolType};
 
-use crate::app::{App, PaletteMode};
+use crate::app::App;
 use crate::cli::{parse_cli_args, read_piped_stdin};
-use crate::commands::Command;
 use crate::image_worker::{
     FilterType, ImageSource, ScaleMode, collect_sources, is_cbz_or_zip, list_cbz_pages,
     scan_directory,
@@ -179,139 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 events.push(event::read()?);
             }
 
+            let term_size = terminal.size().unwrap_or_default();
             for ev in events {
-                match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if app.palette_mode != PaletteMode::Closed {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.palette_mode = PaletteMode::Closed;
-                                    app.needs_update = true;
-                                    app.needs_clear_once = true;
-                                }
-                                KeyCode::Enter => match app.palette_mode {
-                                    PaletteMode::File => {
-                                        let files = app.get_filtered_files();
-                                        if !files.is_empty()
-                                            && app.palette_selected_index < files.len()
-                                        {
-                                            app.queue.current_index = files[app.palette_selected_index].0;
-                                            app.start_load_image();
-                                        }
-                                        app.palette_mode = PaletteMode::Closed;
-                                        app.needs_update = true;
-                                        app.needs_clear_once = true;
-                                    }
-                                    PaletteMode::Command => {
-                                        let cmds = app.get_filtered_commands();
-                                        if !cmds.is_empty()
-                                            && app.palette_selected_index < cmds.len()
-                                        {
-                                            let cmd = cmds[app.palette_selected_index].cmd;
-                                            app.execute_command(cmd);
-                                        }
-                                        if app.palette_mode == PaletteMode::Command {
-                                            app.palette_mode = PaletteMode::Closed;
-                                            app.needs_update = true;
-                                            app.needs_clear_once = true;
-                                        }
-                                    }
-                                    PaletteMode::Prompt => {
-                                        if let Some(prompt_type) = app.prompt_type {
-                                            app.execute_prompt(prompt_type);
-                                        }
-                                    }
-                                    _ => {}
-                                },
-                                KeyCode::Up if app.palette_selected_index > 0 => {
-                                    app.palette_selected_index -= 1;
-                                }
-                                KeyCode::Down => {
-                                    let max_len = match app.palette_mode {
-                                        PaletteMode::File => app.get_filtered_files().len(),
-                                        PaletteMode::Command => app.get_filtered_commands().len(),
-                                        _ => 0,
-                                    };
-                                    if max_len > 0 && app.palette_selected_index < max_len - 1 {
-                                        app.palette_selected_index += 1;
-                                    }
-                                }
-                                KeyCode::PageUp => {
-                                    let max_len = match app.palette_mode {
-                                        PaletteMode::File => app.get_filtered_files().len(),
-                                        PaletteMode::Command => app.get_filtered_commands().len(),
-                                        _ => 0,
-                                    };
-                                    let term_size = terminal.size().unwrap_or_default();
-                                    let viewport_h = term_size.height.saturating_sub(1);
-                                    let max_h = (viewport_h as f64 * 0.5).round() as u16;
-                                    let palette_h = (max_len as u16 + 4).max(12).min(max_h);
-                                    let page_size = (palette_h as usize).saturating_sub(4);
-
-                                    app.palette_selected_index =
-                                        app.palette_selected_index.saturating_sub(page_size);
-                                }
-                                KeyCode::PageDown => {
-                                    let max_len = match app.palette_mode {
-                                        PaletteMode::File => app.get_filtered_files().len(),
-                                        PaletteMode::Command => app.get_filtered_commands().len(),
-                                        _ => 0,
-                                    };
-                                    if max_len > 0 {
-                                        let term_size = terminal.size().unwrap_or_default();
-                                        let viewport_h = term_size.height.saturating_sub(1);
-                                        let max_h = (viewport_h as f64 * 0.5).round() as u16;
-                                        let palette_h = (max_len as u16 + 4).max(12).min(max_h);
-                                        let page_size = (palette_h as usize).saturating_sub(4);
-
-                                        app.palette_selected_index = (app.palette_selected_index
-                                            + page_size)
-                                            .min(max_len - 1);
-                                    }
-                                }
-                                KeyCode::Char('k')
-                                    if key.modifiers.contains(event::KeyModifiers::CONTROL)
-                                        && app.palette_selected_index > 0 =>
-                                {
-                                    app.palette_selected_index -= 1;
-                                }
-                                KeyCode::Char('j')
-                                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                                {
-                                    let max_len = match app.palette_mode {
-                                        PaletteMode::File => app.get_filtered_files().len(),
-                                        PaletteMode::Command => app.get_filtered_commands().len(),
-                                        _ => 0,
-                                    };
-                                    if max_len > 0 && app.palette_selected_index < max_len - 1 {
-                                        app.palette_selected_index += 1;
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    app.palette_pop_char();
-                                }
-                                KeyCode::Char(c) => {
-                                    app.palette_push_char(c);
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            if let Some(cmd) = Command::from_key(key) {
-                                app.execute_command(cmd);
-                            }
-                        }
-                    }
-                    Event::Mouse(mouse_event) => match mouse_event.kind {
-                        MouseEventKind::ScrollUp => {
-                            app.execute_command(Command::ZoomIn);
-                        }
-                        MouseEventKind::ScrollDown => {
-                            app.execute_command(Command::ZoomOut);
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
+                app.handle_event(ev, term_size.height);
             }
         }
     }
