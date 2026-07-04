@@ -174,11 +174,13 @@ pub struct StatsForNerds {
 /// A cached image and its associated metadata in the prefetch cache.
 #[derive(Clone)]
 pub struct CachedImage {
-    pub image: Arc<DynamicImage>,
+    pub image: Option<Arc<DynamicImage>>,
+    pub thumbnail: Option<Arc<DynamicImage>>,
     pub width: u32,
     pub height: u32,
     pub icon: &'static str,
     pub decode_duration: std::time::Duration,
+    pub thumbnail_decode_duration: std::time::Duration,
     pub disk_size: u64,
 }
 
@@ -368,7 +370,7 @@ impl App {
                     let mut bytes_opt = None;
                     let limit = 256 * 1024; // 256 KB limit to avoid massive full-file reads for metadata/thumbnails
 
-                    if !r.is_prefetch && !disable_thumbnail {
+                    if !disable_thumbnail {
                         let read_res =
                             crate::image_worker::read_source_bytes_limited(&r.source, limit);
                         if let Ok(partial_bytes) = read_res {
@@ -920,25 +922,22 @@ impl App {
         }
 
         let window_indices = self.get_sliding_window_indices();
+        let mut to_prefetch = Vec::new();
 
-        // Prune any cache entries that are not in the sliding window
         {
             let mut cache = self.prefetch_cache.lock().unwrap();
             cache.retain(|idx, _| window_indices.contains(idx));
-        }
-
-        for idx in window_indices {
-            if idx == self.queue.current_index {
-                continue;
-            }
-
-            {
-                let cache = self.prefetch_cache.lock().unwrap();
-                if cache.contains_key(&idx) {
+            for idx in window_indices {
+                if idx == self.queue.current_index {
                     continue;
                 }
+                if !cache.contains_key(&idx) {
+                    to_prefetch.push(idx);
+                }
             }
+        }
 
+        for idx in to_prefetch {
             let source = self.queue.images[idx].clone();
             let _ = self.loader_tx.send(LoaderRequest {
                 idx,
@@ -964,16 +963,30 @@ impl App {
         // Check if the image is in the prefetch cache
         let cached = {
             let mut cache = self.prefetch_cache.lock().unwrap();
-            cache.remove(&self.queue.current_index)
+            if cache
+                .get(&self.queue.current_index)
+                .is_some_and(|c| c.image.is_some())
+            {
+                cache.remove(&self.queue.current_index)
+            } else {
+                None
+            }
         };
 
         if let Some(cached_img) = cached {
             self.current_sequence += 1;
-            self.original_image = Some(cached_img.image);
-            self.thumbnail_image = None;
+            self.original_image = cached_img.image;
+            self.thumbnail_image = cached_img.thumbnail.clone();
             self.show_thumbnail_only = false;
-            self.stats.thumbnail_load_duration = None;
-            self.stats.thumbnail_dimensions = None;
+
+            if let Some(ref thumb) = self.thumbnail_image {
+                self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
+                self.stats.thumbnail_dimensions = Some((thumb.width(), thumb.height()));
+            } else {
+                self.stats.thumbnail_load_duration = None;
+                self.stats.thumbnail_dimensions = None;
+            }
+
             self.current_icon = cached_img.icon;
             self.img_width = cached_img.width;
             self.img_height = cached_img.height;
@@ -1005,6 +1018,12 @@ impl App {
         self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
 
+        self.zoom_factor = 1.0;
+        self.pan_offset = PanOffset::ZERO;
+        self.brightness = Brightness::ZERO;
+        self.contrast = Contrast::ZERO;
+        self.zoom_needs_initialization = true;
+
         let source = self.queue.images[self.queue.current_index].clone();
         let _ = self.loader_tx.send(LoaderRequest {
             idx: self.queue.current_index,
@@ -1027,23 +1046,52 @@ impl App {
                 Ok((img, w, h, icon, disk_size)) => {
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
-                        if resp.is_thumbnail {
-                            continue;
-                        }
                         let window_indices = self.get_sliding_window_indices();
                         if window_indices.contains(&resp.idx) {
                             let mut cache = self.prefetch_cache.lock().unwrap();
-                            cache.insert(
-                                resp.idx,
-                                CachedImage {
-                                    image: shared_img,
-                                    width: w,
-                                    height: h,
-                                    icon,
-                                    decode_duration: resp.decode_duration,
-                                    disk_size,
-                                },
-                            );
+                            if resp.is_thumbnail {
+                                if let Some(cached) = cache.get_mut(&resp.idx) {
+                                    cached.thumbnail = Some(shared_img);
+                                    cached.thumbnail_decode_duration = resp.decode_duration;
+                                } else {
+                                    cache.insert(
+                                        resp.idx,
+                                        CachedImage {
+                                            image: None,
+                                            thumbnail: Some(shared_img),
+                                            width: w,
+                                            height: h,
+                                            icon,
+                                            decode_duration: std::time::Duration::ZERO,
+                                            thumbnail_decode_duration: resp.decode_duration,
+                                            disk_size,
+                                        },
+                                    );
+                                }
+                            } else {
+                                if let Some(cached) = cache.get_mut(&resp.idx) {
+                                    cached.image = Some(shared_img);
+                                    cached.width = w;
+                                    cached.height = h;
+                                    cached.icon = icon;
+                                    cached.decode_duration = resp.decode_duration;
+                                    cached.disk_size = disk_size;
+                                } else {
+                                    cache.insert(
+                                        resp.idx,
+                                        CachedImage {
+                                            image: Some(shared_img),
+                                            thumbnail: None,
+                                            width: w,
+                                            height: h,
+                                            icon,
+                                            decode_duration: resp.decode_duration,
+                                            thumbnail_decode_duration: std::time::Duration::ZERO,
+                                            disk_size,
+                                        },
+                                    );
+                                }
+                            }
                         }
                     } else if resp.idx == self.queue.current_index {
                         if resp.is_thumbnail {
@@ -1055,12 +1103,7 @@ impl App {
                             self.original_image = Some(shared_img.clone());
                             self.thumbnail_image = Some(shared_img);
                             self.error_message = None;
-                            self.zoom_factor = 1.0;
-                            self.pan_offset = PanOffset::ZERO;
-                            self.brightness = Brightness::ZERO;
-                            self.contrast = Contrast::ZERO;
                             self.needs_update = true;
-                            self.zoom_needs_initialization = true;
 
                             self.stats.thumbnail_load_duration = Some(resp.decode_duration);
                             self.stats.thumbnail_dimensions = Some((thumb_w, thumb_h));
@@ -1069,13 +1112,6 @@ impl App {
                         } else {
                             self.img_width = w;
                             self.img_height = h;
-                            if self.original_image.is_none() {
-                                self.zoom_factor = 1.0;
-                                self.pan_offset = PanOffset::ZERO;
-                                self.brightness = Brightness::ZERO;
-                                self.contrast = Contrast::ZERO;
-                                self.zoom_needs_initialization = true;
-                            }
                             self.original_image = Some(shared_img);
                             self.current_icon = icon;
                             self.error_message = None;

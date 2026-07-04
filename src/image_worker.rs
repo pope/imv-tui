@@ -988,11 +988,6 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let (raw_w, raw_h) = decoder.dimensions();
 
-    // megapixel threshold: 12 MP
-    if (raw_w as u64 * raw_h as u64) < 12_000_000 {
-        return None;
-    }
-
     let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
     let mut thumb_img = image::load_from_memory(&thumb_bytes).ok()?;
 

@@ -55,10 +55,18 @@ When panning an image past its boundaries (where parts of the viewport show empt
 - **Sliding Window bounds**: Maintain a sliding window of size $N=2$ (caches the current image + 2 preceding + 2 succeeding images).
 - **Dynamic cache retention**: Prune the prefetch cache using a dynamic range check (`cache.retain(|idx, _| window_indices.contains(idx))`) on every navigation.
 - **Out-of-order check**: Only insert a returned prefetch image into the cache if its index is still within the active window when the loader thread returns it.
+- **Thumbnail pre-caching**: Always load and save both full-resolution image (`image`) and thumbnail placeholder (`thumbnail`) inside `CachedImage` cache entries.
+- **Coalesce Locking**: Lock the prefetch cache mutex exactly once during prefetch triggering to prune, check presence, and collect dispatch lists to minimize synchronization overhead.
 
 ### 5. EXIF & One-Hit Disk Loads
 
 - Use `into_decoder()` to read EXIF tags, then call `apply_orientation()` to align the image coordinates prior to computing any layout boundaries.
 - **Load Once**: Read local file contents into an in-memory buffer (`std::fs::read`) exactly once, and wrap in `std::io::Cursor` for all format and metadata parsing steps to avoid double reads.
+- **EXIF Bounds Safety**: Prevent integer overflows in EXIF metadata indexing (e.g. `tiff_start + offset + length`) by utilizing checked additions (`checked_add`), protecting against slicing/debugging panics from malformed headers.
 - **In-place Adjustments**: Apply color changes on the canvas using `brighten_in_place` and `contrast_in_place` to avoid cloning intermediate buffers.
 - **Zero-copy Zip decoders**: Instantiate CBZ format readers using shared cursor reference `Cursor::new(&buffer)`.
+
+### 6. Pipeline Synchronization & Bounds Safety
+
+- **Sequence Validation**: Use sequence tags (`sequence`) in resize requests and responses to prevent stale resize returns from overwriting the active view protocol during fast navigation. Filter loader thread queues so prefetch responses bypass interactive sequence comparisons.
+- **Pasting Bounds Clamping**: Always clamp/crop drawing segments relative to the target screen canvas to prevent out-of-bounds `copy_from` errors caused by sub-pixel rounding mismatches.

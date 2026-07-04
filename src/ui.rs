@@ -312,7 +312,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                 } else {
                     match app.stats.thumbnail_load_duration {
                         Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
-                        None => "N/A (No EXIF Thumbnail / Large Image)".gray(),
+                        None => "N/A (No EXIF Thumbnail)".gray(),
                     }
                 };
                 lines.push(Line::from(vec![
