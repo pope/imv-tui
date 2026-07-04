@@ -46,6 +46,73 @@ impl<T: std::str::FromStr> std::str::FromStr for Adjustment<T> {
     }
 }
 
+/// Encapsulates list of images, starting index, and cached display name lists.
+pub struct ImageQueue {
+    /// Loaded list of image sources.
+    pub images: Vec<ImageSource>,
+    /// Pre-computed filename cache for standard status display.
+    pub display_names: Vec<String>,
+    /// Lowercase file name cache for case-insensitive matching.
+    pub display_names_lowercase: Vec<String>,
+    /// Current selected index in the images vector.
+    pub current_index: usize,
+}
+
+impl ImageQueue {
+    /// Creates a new ImageQueue, returning an error if the images list is empty.
+    pub fn new(images: Vec<ImageSource>, current_index: usize) -> Result<Self, String> {
+        if images.is_empty() {
+            return Err("No supported images found".to_string());
+        }
+        let display_names: Vec<String> = images.iter().map(|img| img.display_name()).collect();
+        let display_names_lowercase: Vec<String> = display_names
+            .iter()
+            .map(|name| name.to_lowercase())
+            .collect();
+        let current_index = current_index.min(images.len() - 1);
+        Ok(Self {
+            images,
+            display_names,
+            display_names_lowercase,
+            current_index,
+        })
+    }
+
+    /// Moves the selection to the next image in the queue, wrapping if necessary.
+    pub fn next(&mut self) -> bool {
+        if self.images.is_empty() {
+            return false;
+        }
+        let old = self.current_index;
+        self.current_index = (self.current_index + 1) % self.images.len();
+        old != self.current_index
+    }
+
+    /// Moves the selection to the previous image in the queue, wrapping if necessary.
+    pub fn prev(&mut self) -> bool {
+        if self.images.is_empty() {
+            return false;
+        }
+        let old = self.current_index;
+        if self.current_index == 0 {
+            self.current_index = self.images.len() - 1;
+        } else {
+            self.current_index -= 1;
+        }
+        old != self.current_index
+    }
+
+    /// Returns true if the image queue contains no images.
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty()
+    }
+
+    /// Returns the filename display name of the currently selected image.
+    pub fn get_current_filename(&self) -> &str {
+        self.display_names.get(self.current_index).map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
 /// The specific input prompt type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PromptType {
@@ -76,14 +143,12 @@ type PrefetchCache = Arc<Mutex<HashMap<usize, (Arc<DynamicImage>, u32, u32, &'st
 
 /// The central application state controller.
 pub struct App {
-    /// Loaded list of image sources (local files, directories, CBZ pages).
-    pub images: Vec<ImageSource>,
-    /// Pre-computed filename cache for standard status display.
-    pub display_names: Vec<String>,
-    /// Lowercase file name cache for case-insensitive matching.
-    pub display_names_lowercase: Vec<String>,
-    /// Current selected index in the images vector.
-    pub current_index: usize,
+    /// The encapsulated image queue and navigation state.
+    pub queue: ImageQueue,
+    /// Cached filtered files matching current search query.
+    pub filtered_files: Vec<(usize, String)>,
+    /// Cached filtered commands matching current search query.
+    pub filtered_commands: Vec<PaletteCommand>,
     /// Shared reference to the decoded dynamic image.
     pub original_image: Option<Arc<DynamicImage>>,
     /// Active render state protocol (Kitty, Sixel, Halfblocks).
@@ -178,15 +243,7 @@ impl App {
         filter_type: FilterType,
         scale_mode: ScaleMode,
     ) -> Result<Self, String> {
-        if images.is_empty() {
-            return Err("No supported images found".to_string());
-        }
-
-        let display_names: Vec<String> = images.iter().map(|img| img.display_name()).collect();
-        let display_names_lowercase: Vec<String> = display_names
-            .iter()
-            .map(|name| name.to_lowercase())
-            .collect();
+        let queue = ImageQueue::new(images, current_index)?;
 
         let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
         let (protocol_tx, protocol_rx) = mpsc::channel::<(StatefulProtocol, (u16, u16))>();
@@ -194,16 +251,14 @@ impl App {
         // Spawn background resizing worker thread
         std::thread::spawn(move || {
             let mut resizer = fir::Resizer::new();
-            loop {
-                if let Ok(req) = resize_rx.recv() {
-                    let mut latest_req = req;
-                    while let Ok(next_req) = resize_rx.try_recv() {
-                        latest_req = next_req;
-                    }
-                    let rendered_cells = latest_req.rendered_size_cells;
-                    let protocol = process_resize(latest_req, &mut resizer);
-                    let _ = protocol_tx.send((protocol, rendered_cells));
+            while let Ok(req) = resize_rx.recv() {
+                let mut latest_req = req;
+                while let Ok(next_req) = resize_rx.try_recv() {
+                    latest_req = next_req;
                 }
+                let rendered_cells = latest_req.rendered_size_cells;
+                let protocol = process_resize(latest_req, &mut resizer);
+                let _ = protocol_tx.send((protocol, rendered_cells));
             }
         });
 
@@ -212,43 +267,40 @@ impl App {
 
         // Spawn persistent background loader thread
         std::thread::spawn(move || {
-            loop {
-                if let Ok(req) = loader_rx.recv() {
-                    let mut requests = vec![req];
-                    while let Ok(r) = loader_rx.try_recv() {
-                        requests.push(r);
-                    }
+            while let Ok(req) = loader_rx.recv() {
+                let mut requests = vec![req];
+                while let Ok(r) = loader_rx.try_recv() {
+                    requests.push(r);
+                }
 
-                    // Find the highest sequence number
-                    let highest_seq = requests.iter().map(|r| r.sequence).max().unwrap_or(0);
+                // Find the highest sequence number
+                let highest_seq = requests.iter().map(|r| r.sequence).max().unwrap_or(0);
 
-                    // Keep only requests matching the highest sequence
-                    let mut current_requests: Vec<LoaderRequest> = requests
-                        .into_iter()
-                        .filter(|r| r.sequence == highest_seq)
-                        .collect();
+                // Keep only requests matching the highest sequence
+                let mut current_requests: Vec<LoaderRequest> = requests
+                    .into_iter()
+                    .filter(|r| r.sequence == highest_seq)
+                    .collect();
 
-                    // Sort current_requests so that the active load (is_prefetch == false) is processed first
-                    current_requests.sort_by_key(|r| r.is_prefetch);
+                // Sort current_requests so that the active load (is_prefetch == false) is processed first
+                current_requests.sort_by_key(|r| r.is_prefetch);
 
-                    for r in current_requests {
-                        let res = decode_image_source(r.source);
-                        let _ = response_tx.send(LoaderResponse {
-                            idx: r.idx,
-                            result: res,
-                            is_prefetch: r.is_prefetch,
-                            sequence: r.sequence,
-                        });
-                    }
+                for r in current_requests {
+                    let res = decode_image_source(r.source);
+                    let _ = response_tx.send(LoaderResponse {
+                        idx: r.idx,
+                        result: res,
+                        is_prefetch: r.is_prefetch,
+                        sequence: r.sequence,
+                    });
                 }
             }
         });
 
         let mut app = Self {
-            images,
-            display_names,
-            display_names_lowercase,
-            current_index,
+            queue,
+            filtered_files: Vec::new(),
+            filtered_commands: Vec::new(),
             original_image: None,
             image_protocol: None,
             picker,
@@ -294,10 +346,60 @@ impl App {
         Ok(app)
     }
 
-    pub fn get_filtered_files(&mut self) -> Vec<(usize, String)> {
+    /// Returns cached filtered files matching the current search query.
+    pub fn get_filtered_files(&self) -> &[(usize, String)] {
+        &self.filtered_files
+    }
+
+    /// Returns cached filtered commands matching the current search query.
+    pub fn get_filtered_commands(&self) -> &[PaletteCommand] {
+        &self.filtered_commands
+    }
+
+    /// Appends a character to the search query and updates matches cache.
+    pub fn palette_push_char(&mut self, c: char) {
+        self.palette_query.push(c);
+        self.palette_selected_index = 0;
+        self.update_palette_filter();
+    }
+
+    /// Removes the last character from the search query and updates matches cache.
+    pub fn palette_pop_char(&mut self) {
+        self.palette_query.pop();
+        self.palette_selected_index = 0;
+        self.update_palette_filter();
+    }
+
+    /// Re-calculates and caches the matched files or commands based on the query.
+    pub fn update_palette_filter(&mut self) {
+        match self.palette_mode {
+            PaletteMode::File => {
+                self.filtered_files = self.get_filtered_files_uncached();
+                if !self.filtered_files.is_empty() {
+                    self.palette_selected_index =
+                        self.palette_selected_index.min(self.filtered_files.len() - 1);
+                } else {
+                    self.palette_selected_index = 0;
+                }
+            }
+            PaletteMode::Command => {
+                self.filtered_commands = self.get_filtered_commands_uncached();
+                if !self.filtered_commands.is_empty() {
+                    self.palette_selected_index =
+                        self.palette_selected_index.min(self.filtered_commands.len() - 1);
+                } else {
+                    self.palette_selected_index = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn get_filtered_files_uncached(&mut self) -> Vec<(usize, String)> {
         let query = &self.palette_query;
         if query.is_empty() {
             return self
+                .queue
                 .display_names
                 .iter()
                 .enumerate()
@@ -323,6 +425,7 @@ impl App {
         }
 
         let candidates: Vec<FileCandidate> = self
+            .queue
             .display_names_lowercase
             .iter()
             .enumerate()
@@ -338,12 +441,12 @@ impl App {
         matches
             .into_iter()
             .map(|(candidate, _score)| {
-                (candidate.index, self.display_names[candidate.index].clone())
+                (candidate.index, self.queue.display_names[candidate.index].clone())
             })
             .collect()
     }
 
-    pub fn get_filtered_commands(&mut self) -> Vec<PaletteCommand> {
+    fn get_filtered_commands_uncached(&mut self) -> Vec<PaletteCommand> {
         let query = &self.palette_query;
         if query.is_empty() {
             let mut list = Vec::new();
@@ -519,14 +622,16 @@ impl App {
         self.palette_mode = mode;
         self.palette_query.clear();
         self.palette_selected_index = match mode {
-            PaletteMode::File => self.current_index,
+            PaletteMode::File => self.queue.current_index,
             PaletteMode::Command => 0,
             _ => 0,
         };
         self.needs_clear = true;
+        self.update_palette_filter();
 
         let max_text_width = match mode {
             PaletteMode::File => self
+                .queue
                 .display_names
                 .iter()
                 .map(|name| name.len())
@@ -559,29 +664,29 @@ impl App {
         (|| {
             match prompt_type {
                 PromptType::GoToImage => {
-                    if self.images.is_empty() {
+                    if self.queue.is_empty() {
                         return;
                     }
                     let input = self.palette_query.trim();
                     let Ok(adj) = input.parse::<Adjustment<usize>>() else {
                         return;
                     };
-                    let mut new_idx = self.current_index;
+                    let mut new_idx = self.queue.current_index;
                     match adj {
                         Adjustment::Absolute(val) => {
                             if let Some(val_minus_1) = val.checked_sub(1) {
-                                new_idx = val_minus_1.min(self.images.len() - 1);
+                                new_idx = val_minus_1.min(self.queue.images.len() - 1);
                             }
                         }
                         Adjustment::RelativeAdd(val) => {
-                            new_idx = (self.current_index + val).min(self.images.len() - 1);
+                            new_idx = (self.queue.current_index + val).min(self.queue.images.len() - 1);
                         }
                         Adjustment::RelativeSub(val) => {
-                            new_idx = self.current_index.saturating_sub(val);
+                            new_idx = self.queue.current_index.saturating_sub(val);
                         }
                     }
-                    if new_idx != self.current_index {
-                        self.current_index = new_idx;
+                    if new_idx != self.queue.current_index {
+                        self.queue.current_index = new_idx;
                         self.start_load_image();
                     }
                 }
@@ -646,15 +751,15 @@ impl App {
 
     pub fn get_sliding_window_indices(&self) -> Vec<usize> {
         let n = 2; // Cache size N=2 (caches current + 2 before + 2 after)
-        let total = self.images.len();
+        let total = self.queue.images.len();
         if total == 0 {
             return Vec::new();
         }
         let mut indices = Vec::new();
-        indices.push(self.current_index);
+        indices.push(self.queue.current_index);
         for i in 1..=n {
-            let prev = (self.current_index + total - i) % total;
-            let next = (self.current_index + i) % total;
+            let prev = (self.queue.current_index + total - i) % total;
+            let next = (self.queue.current_index + i) % total;
             indices.push(prev);
             indices.push(next);
         }
@@ -664,7 +769,7 @@ impl App {
     }
 
     pub fn trigger_prefetch(&self) {
-        if self.images.len() <= 1 {
+        if self.queue.images.len() <= 1 {
             return;
         }
 
@@ -677,7 +782,7 @@ impl App {
         }
 
         for idx in window_indices {
-            if idx == self.current_index {
+            if idx == self.queue.current_index {
                 continue;
             }
 
@@ -688,7 +793,7 @@ impl App {
                 }
             }
 
-            let source = self.images[idx].clone();
+            let source = self.queue.images[idx].clone();
             let _ = self.loader_tx.send(LoaderRequest {
                 idx,
                 source,
@@ -699,7 +804,7 @@ impl App {
     }
 
     pub fn start_load_image(&mut self) {
-        if self.images.is_empty() {
+        if self.queue.is_empty() {
             self.original_image = None;
             self.image_protocol = None;
             self.error_message = Some("No supported images found".to_string());
@@ -713,7 +818,7 @@ impl App {
         // Check if the image is in the prefetch cache
         let cached = {
             let mut cache = self.prefetch_cache.lock().unwrap();
-            cache.remove(&self.current_index)
+            cache.remove(&self.queue.current_index)
         };
 
         if let Some((img, w, h, icon)) = cached {
@@ -740,9 +845,9 @@ impl App {
         self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
 
-        let source = self.images[self.current_index].clone();
+        let source = self.queue.images[self.queue.current_index].clone();
         let _ = self.loader_tx.send(LoaderRequest {
-            idx: self.current_index,
+            idx: self.queue.current_index,
             source,
             is_prefetch: false,
             sequence: self.current_sequence,
@@ -767,7 +872,7 @@ impl App {
                             let mut cache = self.prefetch_cache.lock().unwrap();
                             cache.insert(resp.idx, (shared_img, w, h, icon));
                         }
-                    } else if resp.idx == self.current_index {
+                    } else if resp.idx == self.queue.current_index {
                         self.img_width = w;
                         self.img_height = h;
                         self.current_icon = icon;
@@ -783,7 +888,7 @@ impl App {
                     }
                 }
                 Err(err) => {
-                    if !resp.is_prefetch && resp.idx == self.current_index {
+                    if !resp.is_prefetch && resp.idx == self.queue.current_index {
                         self.original_image = None;
                         self.image_protocol = None;
                         self.error_message = Some(err);
@@ -1297,29 +1402,21 @@ impl App {
     }
 
     pub fn current_filename(&self) -> &str {
-        if self.images.is_empty() {
+        if self.queue.is_empty() {
             return "No file loaded";
         }
-        &self.display_names[self.current_index]
+        self.queue.get_current_filename()
     }
 
     pub fn next_image(&mut self) {
-        if self.images.is_empty() {
-            return;
+        if self.queue.next() {
+            self.start_load_image();
         }
-        self.current_index = (self.current_index + 1) % self.images.len();
-        self.start_load_image();
     }
 
     pub fn prev_image(&mut self) {
-        if self.images.is_empty() {
-            return;
+        if self.queue.prev() {
+            self.start_load_image();
         }
-        if self.current_index == 0 {
-            self.current_index = self.images.len() - 1;
-        } else {
-            self.current_index -= 1;
-        }
-        self.start_load_image();
     }
 }

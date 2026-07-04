@@ -64,7 +64,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         frame.render_widget(loading_paragraph, chunks[0]);
     }
 
-    if app.images.is_empty() {
+    if app.queue.is_empty() {
         let status_block = Block::default()
             .title(" imv-tui ")
             .borders(Borders::ALL)
@@ -110,8 +110,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
         let left_text = format!(
             " [{}/{}] ({}x{}) ",
-            app.current_index + 1,
-            app.images.len(),
+            app.queue.current_index + 1,
+            app.queue.images.len(),
             app.img_width,
             app.img_height
         );
@@ -232,12 +232,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             match app.palette_mode {
                 PaletteMode::File => {
                     let filtered_files = app.get_filtered_files();
-                    if !filtered_files.is_empty() {
-                        app.palette_selected_index =
-                            app.palette_selected_index.min(filtered_files.len() - 1);
-                    } else {
-                        app.palette_selected_index = 0;
-                    }
 
                     let total_files = filtered_files.len();
                     let half_visible = visible_count / 2;
@@ -274,12 +268,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
                 }
                 PaletteMode::Command => {
                     let filtered_commands = app.get_filtered_commands();
-                    if !filtered_commands.is_empty() {
-                        app.palette_selected_index =
-                            app.palette_selected_index.min(filtered_commands.len() - 1);
-                    } else {
-                        app.palette_selected_index = 0;
-                    }
 
                     let total_cmds = filtered_commands.len();
                     let half_visible = visible_count / 2;

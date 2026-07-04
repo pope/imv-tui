@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if !files.is_empty()
                                             && app.palette_selected_index < files.len()
                                         {
-                                            app.current_index = files[app.palette_selected_index].0;
+                                            app.queue.current_index = files[app.palette_selected_index].0;
                                             app.start_load_image();
                                         }
                                         app.palette_mode = PaletteMode::Closed;
@@ -288,12 +288,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Backspace => {
-                                    app.palette_query.pop();
-                                    app.palette_selected_index = 0;
+                                    app.palette_pop_char();
                                 }
                                 KeyCode::Char(c) => {
-                                    app.palette_query.push(c);
-                                    app.palette_selected_index = 0;
+                                    app.palette_push_char(c);
                                 }
                                 _ => {}
                             }
