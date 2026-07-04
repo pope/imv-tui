@@ -13,6 +13,10 @@ use crate::app::{App, PaletteMode, PromptType};
 /// Renders the entire view layout: including centered images (via Kitty, Sixel,
 /// or Halfblocks protocol), error details, loading spinners, bottom status HUD,
 /// and interactive command/file palette overlays.
+///
+/// NOTE: To preserve the separation of concerns, the rendering function must remain
+/// strictly side-effect free and read-only. No application state adjustments or selection
+/// boundary clamping are performed inside this function.
 pub fn ui(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
