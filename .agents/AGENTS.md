@@ -341,3 +341,73 @@ Storing application logic, UI design, CLI parsing, image workers, and commands i
   - `src/app.rs`: State controller and worker thread management.
   - `src/ui.rs`: Layout and widget rendering views.
 - **Trait Scope Imports**: Ensure trait imports required for generated code (like `strum::IntoEnumIterator` for macro-derived `Command::iter()`) are imported in the scope of files referencing them, rather than relying on global namespace resolution.
+
+______________________________________________________________________
+
+## 18. RAII Terminal Guards & Clean Panics
+
+### The Learning
+
+When building TUI applications, standard crash panics or early returns (`?`) can exit the binary before Crossterm has restored raw terminal settings and left the alternate screen. This leaves the user's shell in a corrupted, unusable state.
+
+### Guidelines for Future Work
+
+- **Terminal Guard**: Implement a RAII `TerminalGuard` that triggers standard terminal restoration inside its `Drop` implementation:
+  ```rust
+  struct TerminalGuard;
+  impl Drop for TerminalGuard {
+      fn drop(&mut self) {
+          let _ = disable_raw_mode();
+          let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+      }
+  }
+  ```
+- **Custom Panic Hooks**: Register a custom panic hook at the entry point to immediately invoke terminal cleanups before displaying the panic stack trace, ensuring the diagnostic details are displayed on the standard scrollback buffer.
+
+______________________________________________________________________
+
+## 19. One-Hit Disk Loading & In-Memory Decoding
+
+### The Learning
+
+Reading images from disk multiple times to separately query file headers, extract EXIF orientation, and decode pixels creates unnecessary disk page faults and file descriptor pressure, especially on slower network drives.
+
+### Guidelines for Future Work
+
+- **Load Once**: Read local file contents into an in-memory buffer (`std::fs::read`) exactly once.
+- **Cursor Delegation**: Use `std::io::Cursor` to wrap the loaded bytes, querying image format, EXIF tags, and passing the cursor to image decoders entirely in-memory.
+- **In-place Transformations**: When scaling or applying filters (like brightness or contrast), use in-place operations (`brighten_in_place` and `contrast_in_place`) on the canvas buffer rather than allocating dynamic copies.
+
+______________________________________________________________________
+
+## 20. Side-Effect Free Rendering Viewports
+
+### The Learning
+
+Mutating application states (such as layout dimensions or screen-clearing triggers) inside the drawing loops of `src/ui.rs` breaks the read-only rendering guarantee, leads to visual lag, and triggers double terminal refreshes.
+
+### Guidelines for Future Work
+
+- **Layout Update Phase**: Introduce a layout pre-calculation phase in the controller (`App::update_layout(term_height)`) to update sizes, check boundaries, and trigger clear signals *before* invoking `terminal.draw`.
+- **Pure Rendering**: Enforce read-only rendering logic inside `src/ui.rs` where layout parameters are purely read from precomputed state variables.
+- **Rect Boundary Clamping**: Always clamp calculated coordinates (`rect_w`, `rect_h`) against viewport dimensions to prevent crashes and coordinate overflows during terminal resizing.
+
+______________________________________________________________________
+
+## 21. Idiomatic Functional Iterators
+
+### The Learning
+
+Nested loops or imperative `for` loops in Rust code can often be refactored into declarative iterator chains that express the logic more clearly, let the compiler optimize bounds checking, and keep allocations minimal.
+
+### Guidelines for Future Work
+
+- **Declarative Expressions**: Prefer iterator chains (`find`, `any`, `filter`, `cloned`, `map`) over imperative search blocks to make code more readable and idiomatic:
+  ```rust
+  Self::iter().find(|cmd| {
+      let def = cmd.get_metadata();
+      let bindings = def.shortcuts.unwrap_or(&[]);
+      bindings.iter().any(|bind| bind.matches(event))
+  })
+  ```
+- **Pre-computed UI Formats**: Pre-calculate static formatted strings (like command shortcuts) once at initialization instead of joining/collecting arrays inside hot rendering loops.
