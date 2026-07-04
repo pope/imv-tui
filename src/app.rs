@@ -51,6 +51,36 @@ impl<T: std::str::FromStr> std::str::FromStr for Adjustment<T> {
     }
 }
 
+/// Individual image adjustments (brightness, contrast, rotation) that are preserved per-file.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImageAdjustments {
+    pub brightness: i32,
+    pub contrast: f32,
+    pub rotation: u32,
+}
+
+impl Default for ImageAdjustments {
+    fn default() -> Self {
+        Self {
+            brightness: 0,
+            contrast: 0.0,
+            rotation: 0,
+        }
+    }
+}
+
+impl ImageAdjustments {
+    /// Applies the rotation setting to the given DynamicImage.
+    pub fn rotate_image(&self, img: &image::DynamicImage) -> image::DynamicImage {
+        match self.rotation {
+            90 => img.rotate90(),
+            180 => img.rotate180(),
+            270 => img.rotate270(),
+            _ => img.clone(),
+        }
+    }
+}
+
 /// The classification/flagged state for an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Classification {
@@ -122,6 +152,13 @@ pub struct ClassificationJsonItem {
     pub archive: Option<String>,
     pub filename: String,
     pub flag: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contrast: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<u32>,
 }
 
 /// Encapsulates list of images, starting index, and cached display name lists.
@@ -350,6 +387,8 @@ pub struct App {
     pub view_mode: ViewMode,
     /// Classification states for all loaded image sources, matching the index of queue.images.
     pub classifications: Vec<Classification>,
+    /// Image adjustments (brightness, contrast, rotation) for each loaded image source.
+    pub adjustments: Vec<ImageAdjustments>,
 }
 
 impl App {
@@ -531,6 +570,7 @@ impl App {
             disable_thumbnail,
             view_mode: ViewMode::Default,
             classifications: vec![Classification::Unflagged; num_images],
+            adjustments: vec![ImageAdjustments::default(); num_images],
         };
 
         app.start_load_image();
@@ -679,12 +719,23 @@ impl App {
             .unwrap_or(Classification::Unflagged)
     }
 
-    /// Imports image classification states from a prefix-prefixed text file or a JSON manifest.
+    fn sync_current_adjustments(&mut self) {
+        if self.queue.images.is_empty() {
+            return;
+        }
+        let idx = self.queue.current_index;
+        if idx < self.adjustments.len() {
+            self.adjustments[idx].brightness = self.brightness.value();
+            self.adjustments[idx].contrast = self.contrast.value();
+        }
+    }
+
+    /// Imports image classification states and adjustments from a text file or a JSON manifest.
     pub fn import_classifications(&mut self, import_path: &std::path::Path) -> Result<(), String> {
         let content = std::fs::read_to_string(import_path)
             .map_err(|e| format!("Failed to read import file: {}", e))?;
 
-        let mut imported: HashMap<String, Classification> = HashMap::new();
+        let mut imported: HashMap<String, (Classification, ImageAdjustments)> = HashMap::new();
 
         if import_path
             .extension()
@@ -698,12 +749,17 @@ impl App {
                     "reject" | "rejected" => Classification::Reject,
                     _ => Classification::Unflagged,
                 };
+                let adj = ImageAdjustments {
+                    brightness: item.brightness.unwrap_or(0),
+                    contrast: item.contrast.unwrap_or(0.0),
+                    rotation: item.rotation.unwrap_or(0),
+                };
                 let key = if let Some(ref archive_path) = item.archive {
                     format!("{}::{}", archive_path, item.filename)
                 } else {
                     item.filename
                 };
-                imported.insert(key, class);
+                imported.insert(key, (class, adj));
             }
         } else {
             for line in content.lines() {
@@ -720,7 +776,7 @@ impl App {
                         "UNFLAGGED" => Classification::Unflagged,
                         _ => continue,
                     };
-                    imported.insert(ident, class);
+                    imported.insert(ident, (class, ImageAdjustments::default()));
                 }
             }
         }
@@ -728,18 +784,22 @@ impl App {
         // Apply imported states to existing files
         for (idx, img) in self.queue.images.iter().enumerate() {
             let ident = img.identifier();
-            if let Some(&class) = imported.get(&ident) {
+            if let Some(&(class, adj)) = imported.get(&ident) {
                 self.classifications[idx] = class;
+                self.adjustments[idx] = adj;
             }
         }
 
         // Adjust selected index for visibility in case files are filtered out
         self.adjust_current_index_for_visibility();
 
+        // Reload current image to apply adjustments immediately
+        self.start_load_image();
+
         Ok(())
     }
 
-    /// Exports image classification states to a prefix-prefixed text file or a JSON manifest.
+    /// Exports image classification states and adjustments to a text file or a JSON manifest.
     pub fn export_classifications(&self, export_path: &std::path::Path) -> Result<(), String> {
         let mut text_lines = Vec::new();
         let mut json_items = Vec::new();
@@ -750,9 +810,17 @@ impl App {
                 .get(idx)
                 .cloned()
                 .unwrap_or(Classification::Unflagged);
-            if class == Classification::Unflagged {
+            let adj = self.adjustments.get(idx).cloned().unwrap_or_default();
+
+            // Only export if image is flagged OR has non-default adjustments
+            if class == Classification::Unflagged
+                && adj.brightness == 0
+                && adj.contrast == 0.0
+                && adj.rotation == 0
+            {
                 continue;
             }
+
             let ident = img.identifier();
 
             let (archive, filename) = match img {
@@ -789,18 +857,41 @@ impl App {
                 Classification::Reject => "rejected",
                 Classification::Unflagged => "unflagged",
             };
+
+            let brightness = if adj.brightness != 0 {
+                Some(adj.brightness)
+            } else {
+                None
+            };
+            let contrast = if adj.contrast != 0.0 {
+                Some(adj.contrast)
+            } else {
+                None
+            };
+            let rotation = if adj.rotation != 0 {
+                Some(adj.rotation)
+            } else {
+                None
+            };
+
             json_items.push(ClassificationJsonItem {
                 archive,
                 filename,
                 flag: flag_str.to_string(),
+                brightness,
+                contrast,
+                rotation,
             });
 
-            let text_state = match class {
-                Classification::Pick => "PICK",
-                Classification::Reject => "REJECT",
-                Classification::Unflagged => "UNFLAGGED",
-            };
-            text_lines.push(format!("{}\t{}", text_state, ident));
+            // For text export: only write if flagged
+            if class != Classification::Unflagged {
+                let text_state = match class {
+                    Classification::Pick => "PICK",
+                    Classification::Reject => "REJECT",
+                    Classification::Unflagged => "UNFLAGGED",
+                };
+                text_lines.push(format!("{}\t{}", text_state, ident));
+            }
         }
 
         if export_path
@@ -1215,6 +1306,7 @@ impl App {
                     Adjustment::RelativeSub(val) => self.brightness.adjust(-val),
                 }
                 if old != self.brightness {
+                    self.sync_current_adjustments();
                     self.needs_update = true;
                 }
             }
@@ -1233,6 +1325,7 @@ impl App {
                     Adjustment::RelativeSub(val) => next.adjust(-val),
                 }
                 if self.contrast.update(next.value()) {
+                    self.sync_current_adjustments();
                     self.needs_update = true;
                 }
             }
@@ -1332,6 +1425,14 @@ impl App {
         self.clear_on_protocol_receive = true;
         self.slideshow_last_transition = std::time::Instant::now();
 
+        let adj = self
+            .adjustments
+            .get(self.queue.current_index)
+            .copied()
+            .unwrap_or_default();
+        self.brightness = Brightness::new(adj.brightness);
+        self.contrast = Contrast::new(adj.contrast);
+
         // Check if the image is in the prefetch cache
         let cached = {
             let mut cache = self.prefetch_cache.lock().unwrap();
@@ -1347,8 +1448,26 @@ impl App {
 
         if let Some(cached_img) = cached {
             self.current_sequence += 1;
-            self.original_image = cached_img.image;
-            self.thumbnail_image = cached_img.thumbnail.clone();
+            self.original_image = cached_img.image.map(|img| {
+                if adj.rotation != 0 {
+                    let rotated = adj.rotate_image(&img);
+                    self.img_width = rotated.width();
+                    self.img_height = rotated.height();
+                    Arc::new(rotated)
+                } else {
+                    self.img_width = cached_img.width;
+                    self.img_height = cached_img.height;
+                    img
+                }
+            });
+
+            self.thumbnail_image = cached_img.thumbnail.map(|thumb| {
+                if adj.rotation != 0 {
+                    Arc::new(adj.rotate_image(&thumb))
+                } else {
+                    thumb
+                }
+            });
             self.show_thumbnail_only = false;
 
             if let Some(ref thumb) = self.thumbnail_image {
@@ -1360,12 +1479,8 @@ impl App {
             }
 
             self.current_icon = cached_img.icon;
-            self.img_width = cached_img.width;
-            self.img_height = cached_img.height;
             self.zoom_factor = 1.0;
             self.pan_offset = PanOffset::ZERO;
-            self.brightness = Brightness::ZERO;
-            self.contrast = Contrast::ZERO;
             self.is_loading = false;
             self.needs_update = true;
             self.zoom_needs_initialization = true;
@@ -1392,8 +1507,6 @@ impl App {
 
         self.zoom_factor = 1.0;
         self.pan_offset = PanOffset::ZERO;
-        self.brightness = Brightness::ZERO;
-        self.contrast = Contrast::ZERO;
         self.zoom_needs_initialization = true;
 
         let source = self.queue.images[self.queue.current_index].clone();
@@ -1466,14 +1579,21 @@ impl App {
                             }
                         }
                     } else if resp.idx == self.queue.current_index {
+                        let adj = self.adjustments.get(resp.idx).copied().unwrap_or_default();
+                        let rotated_img = if adj.rotation != 0 {
+                            Arc::new(adj.rotate_image(&shared_img))
+                        } else {
+                            shared_img
+                        };
+
                         if resp.is_thumbnail {
-                            self.img_width = w;
-                            self.img_height = h;
+                            self.img_width = rotated_img.width();
+                            self.img_height = rotated_img.height();
                             self.current_icon = icon;
-                            let thumb_w = shared_img.width();
-                            let thumb_h = shared_img.height();
-                            self.original_image = Some(shared_img.clone());
-                            self.thumbnail_image = Some(shared_img);
+                            let thumb_w = rotated_img.width();
+                            let thumb_h = rotated_img.height();
+                            self.original_image = Some(rotated_img.clone());
+                            self.thumbnail_image = Some(rotated_img);
                             self.error_message = None;
                             self.needs_update = true;
 
@@ -1482,9 +1602,9 @@ impl App {
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                         } else {
-                            self.img_width = w;
-                            self.img_height = h;
-                            self.original_image = Some(shared_img);
+                            self.img_width = rotated_img.width();
+                            self.img_height = rotated_img.height();
+                            self.original_image = Some(rotated_img);
                             self.current_icon = icon;
                             self.error_message = None;
                             self.is_loading = false;
@@ -1880,6 +2000,7 @@ impl App {
         self.apply_scale_mode();
         self.brightness = Brightness::ZERO;
         self.contrast = Contrast::ZERO;
+        self.sync_current_adjustments();
         self.clear_on_protocol_receive = true;
     }
 
@@ -1939,6 +2060,7 @@ impl App {
         let old = self.brightness;
         self.brightness.adjust(10);
         if old != self.brightness {
+            self.sync_current_adjustments();
             self.needs_update = true;
         }
     }
@@ -1950,6 +2072,7 @@ impl App {
         let old = self.brightness;
         self.brightness.adjust(-10);
         if old != self.brightness {
+            self.sync_current_adjustments();
             self.needs_update = true;
         }
     }
@@ -1961,6 +2084,7 @@ impl App {
         let mut next = self.contrast;
         next.adjust(10.0);
         if self.contrast.update(next.value()) {
+            self.sync_current_adjustments();
             self.needs_update = true;
         }
     }
@@ -1972,6 +2096,7 @@ impl App {
         let mut next = self.contrast;
         next.adjust(-10.0);
         if self.contrast.update(next.value()) {
+            self.sync_current_adjustments();
             self.needs_update = true;
         }
     }
@@ -2044,6 +2169,16 @@ impl App {
             self.img_width = rotated.width();
             self.img_height = rotated.height();
             self.original_image = Some(Arc::new(rotated));
+
+            if let Some(thumb) = self.thumbnail_image.take() {
+                self.thumbnail_image = Some(Arc::new(thumb.rotate90()));
+            }
+
+            let idx = self.queue.current_index;
+            if idx < self.adjustments.len() {
+                self.adjustments[idx].rotation = (self.adjustments[idx].rotation + 90) % 360;
+            }
+
             self.zoom_factor = 1.0;
             self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
@@ -2060,6 +2195,16 @@ impl App {
             self.img_width = rotated.width();
             self.img_height = rotated.height();
             self.original_image = Some(Arc::new(rotated));
+
+            if let Some(thumb) = self.thumbnail_image.take() {
+                self.thumbnail_image = Some(Arc::new(thumb.rotate270()));
+            }
+
+            let idx = self.queue.current_index;
+            if idx < self.adjustments.len() {
+                self.adjustments[idx].rotation = (self.adjustments[idx].rotation + 270) % 360;
+            }
+
             self.zoom_factor = 1.0;
             self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
@@ -2314,6 +2459,17 @@ mod tests {
         app.classifications[1] = Classification::Reject;
         app.classifications[2] = Classification::Pick;
 
+        app.adjustments[0] = ImageAdjustments {
+            brightness: 20,
+            contrast: 15.0,
+            rotation: 90,
+        };
+        app.adjustments[2] = ImageAdjustments {
+            brightness: -30,
+            contrast: 0.0,
+            rotation: 180,
+        };
+
         // Test Export to JSON
         app.export_classifications(&json_path).unwrap();
         assert!(json_path.exists());
@@ -2323,11 +2479,20 @@ mod tests {
         assert_eq!(parsed_json.len(), 3);
         assert_eq!(parsed_json[0].flag, "picked");
         assert_eq!(parsed_json[0].archive, None);
+        assert_eq!(parsed_json[0].brightness, Some(20));
+        assert_eq!(parsed_json[0].contrast, Some(15.0));
+        assert_eq!(parsed_json[0].rotation, Some(90));
         assert_eq!(parsed_json[1].flag, "rejected");
         assert_eq!(parsed_json[1].archive, None);
+        assert_eq!(parsed_json[1].brightness, None);
+        assert_eq!(parsed_json[1].contrast, None);
+        assert_eq!(parsed_json[1].rotation, None);
         assert_eq!(parsed_json[2].flag, "picked");
         assert!(parsed_json[2].archive.is_some());
         assert_eq!(parsed_json[2].filename, "page1.png");
+        assert_eq!(parsed_json[2].brightness, Some(-30));
+        assert_eq!(parsed_json[2].contrast, None);
+        assert_eq!(parsed_json[2].rotation, Some(180));
 
         // Test Export to Text
         app.export_classifications(&txt_path).unwrap();
@@ -2336,24 +2501,36 @@ mod tests {
         // Verify that the tab character is used to separate
         assert!(txt_content.contains("PICK\t"));
         assert!(txt_content.contains("REJECT\t"));
+        // Text format does not contain adjustment parameters
+        assert!(!txt_content.contains("20"));
+        assert!(!txt_content.contains("15"));
 
-        // Clear classifications in app
+        // Clear classifications and adjustments in app
         app.classifications = vec![Classification::Unflagged; 3];
+        app.adjustments = vec![ImageAdjustments::default(); 3];
 
         // Import from JSON
         app.import_classifications(&json_path).unwrap();
         assert_eq!(app.classifications[0], Classification::Pick);
         assert_eq!(app.classifications[1], Classification::Reject);
         assert_eq!(app.classifications[2], Classification::Pick);
+        assert_eq!(app.adjustments[0].brightness, 20);
+        assert_eq!(app.adjustments[0].contrast, 15.0);
+        assert_eq!(app.adjustments[0].rotation, 90);
+        assert_eq!(app.adjustments[2].brightness, -30);
+        assert_eq!(app.adjustments[2].contrast, 0.0);
+        assert_eq!(app.adjustments[2].rotation, 180);
 
-        // Clear classifications again
+        // Clear classifications and adjustments again
         app.classifications = vec![Classification::Unflagged; 3];
+        app.adjustments = vec![ImageAdjustments::default(); 3];
 
         // Import from Text
         app.import_classifications(&txt_path).unwrap();
         assert_eq!(app.classifications[0], Classification::Pick);
         assert_eq!(app.classifications[1], Classification::Reject);
         assert_eq!(app.classifications[2], Classification::Pick);
+        assert_eq!(app.adjustments[0], ImageAdjustments::default());
 
         // Clean up
         let _ = std::fs::remove_file(json_path);
