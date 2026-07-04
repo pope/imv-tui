@@ -90,13 +90,13 @@ pub enum Command {
 }
 
 impl Command {
-    /// Attempts to parse a crossterm key event into a registered Command.
-    pub fn from_key(key: event::KeyEvent) -> Option<Self> {
+    /// Attempts to parse a crossterm event (keyboard or mouse) into a registered Command.
+    pub fn from_event(event: &event::Event) -> Option<Self> {
         for cmd in Self::iter() {
             let def = cmd.get_metadata();
             let bindings = def.shortcuts.unwrap_or(&[]);
             for bind in bindings {
-                if bind.matches(key) {
+                if bind.matches(event) {
                     return Some(cmd);
                 }
             }
@@ -370,46 +370,54 @@ pub enum KeyDef {
     Shift(event::KeyCode),
     ScrollUp,
     ScrollDown,
-}
-
-impl KeyDef {
-    pub fn matches(self, event: event::KeyEvent) -> bool {
-        use event::{KeyCode, KeyModifiers};
-        match self {
-            Self::Char(c) => {
-                if let KeyCode::Char(key_char) = event.code {
-                    if event.modifiers.contains(KeyModifiers::CONTROL) {
-                        return false;
-                    }
-                    if c.is_alphabetic() {
-                        if c.is_lowercase() {
-                            key_char == c && !event.modifiers.contains(KeyModifiers::SHIFT)
+}impl KeyDef {
+    pub fn matches(self, event: &event::Event) -> bool {
+        match event {
+            event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
+                use event::{KeyCode, KeyModifiers};
+                match self {
+                    Self::Char(c) => {
+                        if let KeyCode::Char(key_char) = key_event.code {
+                            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                                return false;
+                            }
+                            if c.is_alphabetic() {
+                                if c.is_lowercase() {
+                                    key_char == c && !key_event.modifiers.contains(KeyModifiers::SHIFT)
+                                } else {
+                                    key_char == c
+                                        || (key_event.modifiers.contains(KeyModifiers::SHIFT)
+                                            && key_char.to_lowercase().next() == c.to_lowercase().next())
+                                }
+                            } else {
+                                key_char == c
+                            }
                         } else {
-                            key_char == c
-                                || (event.modifiers.contains(KeyModifiers::SHIFT)
-                                    && key_char.to_lowercase().next() == c.to_lowercase().next())
+                            false
                         }
-                    } else {
-                        key_char == c
                     }
-                } else {
-                    false
+                    Self::Code(code) => {
+                        key_event.code == code && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    }
+                    Self::Ctrl(c) => {
+                        if let KeyCode::Char(key_char) = key_event.code {
+                            key_char == c && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        } else {
+                            false
+                        }
+                    }
+                    Self::Shift(code) => {
+                        key_event.code == code && key_event.modifiers.contains(KeyModifiers::SHIFT)
+                    }
+                    Self::ScrollUp | Self::ScrollDown => false,
                 }
             }
-            Self::Code(code) => {
-                event.code == code && !event.modifiers.contains(KeyModifiers::CONTROL)
-            }
-            Self::Ctrl(c) => {
-                if let KeyCode::Char(key_char) = event.code {
-                    key_char == c && event.modifiers.contains(KeyModifiers::CONTROL)
-                } else {
-                    false
-                }
-            }
-            Self::Shift(code) => {
-                event.code == code && event.modifiers.contains(KeyModifiers::SHIFT)
-            }
-            Self::ScrollUp | Self::ScrollDown => false,
+            event::Event::Mouse(mouse_event) => match self {
+                Self::ScrollUp => matches!(mouse_event.kind, event::MouseEventKind::ScrollUp),
+                Self::ScrollDown => matches!(mouse_event.kind, event::MouseEventKind::ScrollDown),
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -489,20 +497,36 @@ pub struct CommandItem {
 
 /// A wrapper struct coupling a Command variant with its CommandItem metadata
 /// for searchable presentation in lists and palette lookups.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PaletteCommand {
     /// The executable command variant.
     pub cmd: Command,
     /// The metadata presentation associated with the command.
     pub item: CommandItem,
+    /// Pre-computed lowercase search text format: "name description".
+    pub search_text: String,
 }
 
 /// Returns a static slice of all available command metadata items.
-pub fn get_commands() -> &'static [CommandItem] {
-    static LIST: std::sync::OnceLock<Vec<CommandItem>> = std::sync::OnceLock::new();
+pub fn get_commands() -> &'static [PaletteCommand] {
+    static LIST: std::sync::OnceLock<Vec<PaletteCommand>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         <Command as strum::IntoEnumIterator>::iter()
-            .map(|cmd| cmd.get_metadata())
+            .map(|cmd| {
+                let item = cmd.get_metadata();
+                let search_text = format!("{} {}", item.name, item.description).to_lowercase();
+                PaletteCommand {
+                    cmd,
+                    item,
+                    search_text,
+                }
+            })
             .collect()
     })
+}
+
+impl std::fmt::Display for KeyDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.format())
+    }
 }
