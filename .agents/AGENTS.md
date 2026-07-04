@@ -5,6 +5,7 @@ This workspace contains specialized agent skills under `.agents/skills/` to prov
 - **\[terminal-graphics\](file:///.agents/skills/terminal_graphics/SKILL.md)**: Sixel/Kitty redrawing protocols, selective clearing, double-buffering overlays, and repeat event coalescing.
 - **\[image-processing\](file:///.agents/skills/image_processing/SKILL.md)**: Aspect-ratio crop mapping, zooming beyond 1:1, canvas panning limits, cache prefetching, and one-hit memory decodes.
 - **\[tui-architecture\](file:///.agents/skills/tui_architecture/SKILL.md)**: RAII safety guards, pure rendering viewports, unified input maps, and modular separations.
+- **\[code-review\](file:///.agents/skills/code_review/SKILL.md)**: Core code review framework, validation checklists, async boundaries, and type safety constraints.
 
 Refer to those files when making modifications in those domains.
 
