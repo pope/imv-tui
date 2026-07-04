@@ -90,18 +90,12 @@ pub enum Command {
 }
 
 impl Command {
-    /// Attempts to parse a crossterm event (keyboard or mouse) into a registered Command.
     pub fn from_event(event: &event::Event) -> Option<Self> {
-        for cmd in Self::iter() {
+        Self::iter().find(|cmd| {
             let def = cmd.get_metadata();
             let bindings = def.shortcuts.unwrap_or(&[]);
-            for bind in bindings {
-                if bind.matches(event) {
-                    return Some(cmd);
-                }
-            }
-        }
-        None
+            bindings.iter().any(|bind| bind.matches(event))
+        })
     }
 
     pub fn get_metadata(self) -> CommandItem {
@@ -522,13 +516,16 @@ pub fn get_commands() -> &'static [PaletteCommand] {
                 let item = cmd.get_metadata();
                 let search_text = format!("{} {}", item.name, item.description).to_lowercase();
 
-                let mut keys = Vec::new();
-                if let Some(bindings) = item.shortcuts {
-                    for bind in bindings {
-                        keys.push(bind.format());
-                    }
-                }
-                let shortcut_str = keys.join(", ");
+                let shortcut_str = item
+                    .shortcuts
+                    .map(|bindings| {
+                        bindings
+                            .iter()
+                            .map(|bind| bind.format())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
 
                 PaletteCommand {
                     cmd,

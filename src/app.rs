@@ -463,13 +463,11 @@ impl App {
     fn get_filtered_commands_uncached(&mut self) -> Vec<PaletteCommand> {
         let query = &self.palette_query;
         if query.is_empty() {
-            let mut list = Vec::new();
-            for cmd in get_commands() {
-                if cmd.item.show_in_palette {
-                    list.push(cmd.clone());
-                }
-            }
-            return list;
+            return get_commands()
+                .iter()
+                .filter(|cmd| cmd.item.show_in_palette)
+                .cloned()
+                .collect();
         }
 
         let pattern = nucleo::pattern::Pattern::parse(
@@ -488,12 +486,11 @@ impl App {
             }
         }
 
-        let mut candidates = Vec::new();
-        for cmd in get_commands() {
-            if cmd.item.show_in_palette {
-                candidates.push(CmdCandidate { cmd: cmd.clone() });
-            }
-        }
+        let candidates: Vec<CmdCandidate> = get_commands()
+            .iter()
+            .filter(|cmd| cmd.item.show_in_palette)
+            .map(|cmd| CmdCandidate { cmd: cmd.clone() })
+            .collect();
 
         let mut matches = pattern.match_list(candidates, &mut self.matcher);
         matches.sort_by(|a, b| {

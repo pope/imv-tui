@@ -133,9 +133,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let term_size = terminal.size().unwrap_or_default();
-            for ev in events {
-                app.handle_event(ev, term_size.height);
-            }
+            events
+                .into_iter()
+                .for_each(|ev| app.handle_event(ev, term_size.height));
         }
     }
 
