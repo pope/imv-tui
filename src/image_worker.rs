@@ -385,13 +385,12 @@ pub fn decode_image_source(
 ) -> Result<(DynamicImage, u32, u32, &'static str), String> {
     match source {
         ImageSource::Local(path) => {
-            let format = image::ImageReader::open(&path)
-                .and_then(|r| r.with_guessed_format())
-                .map(|r| r.format());
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e))?;
 
-            if let Ok(Some(image::ImageFormat::Jpeg)) = format
-                && let Ok(bytes) = std::fs::read(&path)
-            {
+            let format = image::guess_format(&bytes).ok();
+
+            if let Some(image::ImageFormat::Jpeg) = format {
                 let options = zune_jpeg::zune_core::options::DecoderOptions::default()
                     .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
                 let mut decoder = zune_jpeg::JpegDecoder::new_with_options(&bytes, options);
@@ -400,9 +399,8 @@ pub fn decode_image_source(
                     && let Some(rgba_img) =
                         image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
                 {
-                    let orientation = match image::ImageReader::open(&path)
-                        .and_then(|r| r.with_guessed_format())
-                    {
+                    let cursor_meta = std::io::Cursor::new(&bytes);
+                    let orientation = match image::ImageReader::new(cursor_meta).with_guessed_format() {
                         Ok(reader) => match reader.into_decoder() {
                             Ok(mut dec) => dec
                                 .orientation()
@@ -420,16 +418,10 @@ pub fn decode_image_source(
                 }
             }
 
-            let reader = image::ImageReader::open(&path)
-                .map_err(|e| format!("Failed to open file:\n{}\n\nError: {}", path.display(), e))?
+            let cursor = std::io::Cursor::new(&bytes);
+            let reader = image::ImageReader::new(cursor)
                 .with_guessed_format()
-                .map_err(|e| {
-                    format!(
-                        "Failed to guess format for:\n{}\n\nError: {}",
-                        path.display(),
-                        e
-                    )
-                })?;
+                .map_err(|e| format!("Failed to parse image from memory:\n{}\nError: {}", path.display(), e))?;
 
             let fmt = reader.format();
             let icon = match fmt {
@@ -492,7 +484,7 @@ pub fn decode_image_source(
                 )
             })?;
 
-            let cursor = std::io::Cursor::new(buffer.clone());
+            let cursor = std::io::Cursor::new(&buffer);
             let reader = image::ImageReader::new(cursor)
                 .with_guessed_format()
                 .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
@@ -506,7 +498,7 @@ pub fn decode_image_source(
                     && let Some(rgba_img) =
                         image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
                 {
-                    let cursor_meta = std::io::Cursor::new(buffer);
+                    let cursor_meta = std::io::Cursor::new(&buffer);
                     let orientation =
                         match image::ImageReader::new(cursor_meta).with_guessed_format() {
                             Ok(reader) => match reader.into_decoder() {
@@ -526,7 +518,7 @@ pub fn decode_image_source(
                 }
             }
 
-            let cursor = std::io::Cursor::new(buffer);
+            let cursor = std::io::Cursor::new(&buffer);
             let reader = image::ImageReader::new(cursor)
                 .with_guessed_format()
                 .map_err(|e| format!("Failed to guess image format for {}: {}", file_in_zip, e))?;
@@ -697,11 +689,13 @@ pub fn process_resize(req: ResizeRequest, resizer: &mut fir::Resizer) -> Statefu
         DynamicImage::ImageRgba8(screen_canvas)
     };
 
-    if req.brightness.value() != 0 {
-        canvas = canvas.brighten(req.brightness.value());
-    }
-    if req.contrast.value() != 0.0 {
-        canvas = canvas.adjust_contrast(req.contrast.value());
+    if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
+        if req.brightness.value() != 0 {
+            image::imageops::colorops::brighten_in_place(rgba_canvas, req.brightness.value());
+        }
+        if req.contrast.value() != 0.0 {
+            image::imageops::colorops::contrast_in_place(rgba_canvas, req.contrast.value());
+        }
     }
 
     req.picker.new_resize_protocol(canvas)
