@@ -1025,8 +1025,10 @@ impl App {
         self.trigger_prefetch();
     }
 
-    pub fn update_channels(&mut self) {
+    pub fn update_channels(&mut self) -> bool {
+        let mut received = false;
         while let Ok(resp) = self.response_rx.try_recv() {
+            received = true;
             if resp.sequence < self.current_sequence && !resp.is_prefetch {
                 continue;
             }
@@ -1145,6 +1147,7 @@ impl App {
         }
 
         if let Some(resp) = latest_protocol {
+            received = true;
             self.image_protocol = Some(resp.protocol);
             self.rendered_size_cells = resp.rendered_cells;
             self.is_loading = false;
@@ -1160,6 +1163,7 @@ impl App {
             self.stats.protocol_width = resp.target_width;
             self.stats.protocol_height = resp.target_height;
         }
+        received
     }
 
     pub fn update_layout(&mut self, term_width: u16, term_height: u16) {

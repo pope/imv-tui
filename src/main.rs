@@ -103,6 +103,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.import_classifications(path).map_err(io::Error::other)?;
     }
 
+    let mut draw_needed = true;
     let mut last_loop_tick = std::time::Instant::now();
 
     // Main event loop
@@ -115,7 +116,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.slideshow_last_transition += delta;
         }
 
-        app.update_channels();
+        if app.update_channels() {
+            draw_needed = true;
+        }
 
         // Automatic slideshow transition
         if app.slideshow_config.is_active()
@@ -126,14 +129,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             app.next_image();
             app.slideshow_last_transition = std::time::Instant::now();
+            draw_needed = true;
         }
 
         let term_size = terminal.size().unwrap_or_default();
+        let widget_w = term_size.width;
+        let widget_h = term_size.height.saturating_sub(3);
+        if app.last_widget_size != (widget_w, widget_h) {
+            draw_needed = true;
+        }
+
         app.update_layout(term_size.width, term_size.height);
 
         if app.needs_clear_once {
             app.needs_clear_once = false;
             terminal.clear()?;
+            draw_needed = true;
         }
 
         if app.needs_clear {
@@ -141,10 +152,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if app.should_clear_on_update() {
                 terminal.clear()?;
             }
+            draw_needed = true;
         }
-        terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(50))? {
+        if draw_needed {
+            draw_needed = false;
+            terminal.draw(|f| ui(f, &mut app))?;
+        }
+
+        if event::poll(Duration::from_millis(33))? {
             let mut events = Vec::new();
             events.push(event::read()?);
             while event::poll(Duration::from_millis(0))? {
@@ -155,6 +171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             events
                 .into_iter()
                 .for_each(|ev| app.handle_event(ev, term_size.height));
+            draw_needed = true;
         }
     }
 
