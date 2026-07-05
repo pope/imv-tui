@@ -60,7 +60,7 @@ impl ScaleMode {
 }
 
 /// Represents an image brightness adjustment value restricted to [-255, 255].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
 #[serde(transparent)]
 pub struct Brightness(i32);
 
@@ -89,6 +89,16 @@ impl Brightness {
     }
 }
 
+impl<'de> Deserialize<'de> for Brightness {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let val = i32::deserialize(deserializer)?;
+        Ok(Self::new(val))
+    }
+}
+
 impl std::str::FromStr for Brightness {
     type Err = std::num::ParseIntError;
 
@@ -99,7 +109,7 @@ impl std::str::FromStr for Brightness {
 }
 
 /// Represents an image contrast adjustment value restricted to [-255.0, 255.0].
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(transparent)]
 pub struct Contrast(f32);
 
@@ -146,6 +156,16 @@ impl Contrast {
 impl PartialEq for Contrast {
     fn eq(&self, other: &Self) -> bool {
         (self.0 - other.0).abs() <= f32::EPSILON
+    }
+}
+
+impl<'de> Deserialize<'de> for Contrast {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let val = f32::deserialize(deserializer)?;
+        Ok(Self::new(val))
     }
 }
 
