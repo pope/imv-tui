@@ -63,6 +63,9 @@
                 lockFile = ./Cargo.lock;
               };
             };
+            default = imv-tui;
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             imv-tui-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
               pname = "imv-tui";
               version = "0.1.0";
@@ -72,7 +75,6 @@
               };
               target = "x86_64-unknown-linux-musl";
             };
-            default = imv-tui;
           };
           devShells.${system}.default = pkgs.mkShell {
             packages = with pkgs; [
@@ -85,7 +87,7 @@
               samply
               self.formatter.${system}
             ];
-            RUSTFLAGS = "-C target-cpu=x86-64-v3";
+            RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-C target-cpu=x86-64-v3";
           };
           formatter.${system} = treefmt-eval.config.build.wrapper;
           checks.${system} = {
