@@ -30,7 +30,7 @@ use crate::imaging::{
     LoaderResponse, PanOffset, ResizeRequest, ScaleMode, process_resize,
 };
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StatsForNerds {
     /// Time taken to load (decode) the photo from disk or zip.
     pub load_duration: std::time::Duration,
@@ -50,6 +50,8 @@ pub struct StatsForNerds {
     pub protocol_height: u32,
     /// Size of the image on disk in bytes.
     pub disk_size: u64,
+    /// Image format of the loaded image.
+    pub format: Option<image::ImageFormat>,
 }
 
 /// A response payload sent by the resizing worker thread.
@@ -254,7 +256,10 @@ impl App {
                                 let _ = response_tx.send(LoaderResponse {
                                     idx: r.idx,
                                     result: Ok((
-                                        thumb_img, real_w, real_h,
+                                        thumb_img,
+                                        real_w,
+                                        real_h,
+                                        Some(image::ImageFormat::Jpeg),
                                         0, // Filled in by final high-res response
                                     )),
                                     is_prefetch: r.is_prefetch,
@@ -1016,6 +1021,7 @@ impl App {
             self.stats.load_duration = cached_img.decode_duration;
             self.stats.is_prefetch_cache_hit = true;
             self.stats.disk_size = cached_img.disk_size;
+            self.stats.format = cached_img.format;
 
             self.trigger_prefetch();
             return;
@@ -1057,7 +1063,7 @@ impl App {
             }
 
             match resp.result {
-                Ok((img, w, h, disk_size)) => {
+                Ok((img, w, h, format, disk_size)) => {
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
                         let window_indices = self.get_sliding_window_indices();
@@ -1075,6 +1081,7 @@ impl App {
                                             thumbnail: Some(shared_img),
                                             width: w,
                                             height: h,
+                                            format,
                                             decode_duration: std::time::Duration::ZERO,
                                             thumbnail_decode_duration: resp.decode_duration,
                                             disk_size,
@@ -1086,6 +1093,7 @@ impl App {
                                     cached.image = Some(shared_img);
                                     cached.width = w;
                                     cached.height = h;
+                                    cached.format = format;
                                     cached.decode_duration = resp.decode_duration;
                                     cached.disk_size = disk_size;
                                 } else {
@@ -1096,6 +1104,7 @@ impl App {
                                             thumbnail: None,
                                             width: w,
                                             height: h,
+                                            format,
                                             decode_duration: resp.decode_duration,
                                             thumbnail_decode_duration: std::time::Duration::ZERO,
                                             disk_size,
@@ -1130,6 +1139,7 @@ impl App {
                             self.stats.thumbnail_dimensions = Some((thumb_w, thumb_h));
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
+                            self.stats.format = format;
                         } else {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();
@@ -1141,6 +1151,7 @@ impl App {
                             self.stats.load_duration = resp.decode_duration;
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
+                            self.stats.format = format;
 
                             self.trigger_prefetch();
                         }
@@ -1201,7 +1212,7 @@ impl App {
 
         let new_h = match self.palette_mode {
             PaletteMode::Prompt => 4.min(term_height.saturating_sub(1)),
-            PaletteMode::Info => 19.min(term_height.saturating_sub(1)),
+            PaletteMode::Info => 22.min(term_height.saturating_sub(1)),
             PaletteMode::File | PaletteMode::Command => {
                 let total_items = match self.palette_mode {
                     PaletteMode::File => self.get_filtered_files().len(),

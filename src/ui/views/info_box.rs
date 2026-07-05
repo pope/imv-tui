@@ -103,6 +103,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             " Directory: ".bold().cyan(),
             dir_str.as_str().into(),
         ]));
+        let mime_str = app
+            .stats
+            .format
+            .map(|fmt| fmt.to_mime_type())
+            .unwrap_or("image/unknown");
+        lines.push(Line::from(vec![
+            " MIME Type: ".bold().cyan(),
+            mime_str.into(),
+        ]));
         lines.push(Line::from(vec![
             " Size on Disk: ".bold().cyan(),
             disk_size_str.as_str().into(),
@@ -122,6 +131,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             " Flag State: ".bold().cyan(),
             Span::styled(flag_label, flag_style),
         ]));
+        lines.push(Line::from(vec![
+            " Brightness: ".bold().cyan(),
+            format!("{:+}", app.brightness.value()).into(),
+        ]));
+        lines.push(Line::from(vec![
+            " Contrast: ".bold().cyan(),
+            format!("{:+}%", app.contrast.value().round() as i32).into(),
+        ]));
+        let rotation = app
+            .adjustments
+            .get(app.queue.current_index)
+            .map(|adj| adj.rotation)
+            .unwrap_or(0);
+        lines.push(Line::from(vec![
+            " Rotation: ".bold().cyan(),
+            format!("{}°", rotation).into(),
+        ]));
 
         let inner_w = w.saturating_sub(2) as usize;
         lines.push(Line::from("─".repeat(inner_w).gray()));
@@ -136,36 +162,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             "   Load / Decode: ".gray(),
             format!("{:.2} ms", app.stats.load_duration.as_secs_f64() * 1000.0).bold(),
         ]));
-        let thumb_load_str = if app.disable_thumbnail {
-            "N/A (Disabled)".gray()
+
+        let thumb_load_line = if app.disable_thumbnail {
+            Line::from(vec!["   Thumbnail Load: ".gray(), "N/A (Disabled)".gray()])
         } else {
-            match app.stats.thumbnail_load_duration {
-                Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
-                None => "N/A (No EXIF Thumbnail)".gray(),
+            match (
+                app.stats.thumbnail_load_duration,
+                app.stats.thumbnail_dimensions,
+            ) {
+                (Some(dur), Some((tw, th))) => Line::from(vec![
+                    "   Thumbnail Load: ".gray(),
+                    format!("{:.2} ms @ {} x {} px", dur.as_secs_f64() * 1000.0, tw, th).bold(),
+                ]),
+                _ => Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()]),
             }
         };
-        lines.push(Line::from(vec![
-            "   Thumbnail Load: ".gray(),
-            thumb_load_str,
-        ]));
-        lines.push(Line::from(vec![
-            "   Thumbnail Mode: ".gray(),
-            if app.show_thumbnail_only {
-                "Active (Thumbnail Displayed)".green().bold()
-            } else if app.thumbnail_image.is_some() {
-                "Inactive (Full Image Displayed)".yellow()
-            } else {
-                "N/A".gray()
-            },
-        ]));
-        let thumb_dim_str = match app.stats.thumbnail_dimensions {
-            Some((w, h)) => format!("{} x {} px", w, h).bold(),
-            None => "N/A".gray(),
-        };
-        lines.push(Line::from(vec![
-            "   Thumbnail Dimensions: ".gray(),
-            thumb_dim_str,
-        ]));
+        lines.push(thumb_load_line);
+
         lines.push(Line::from(vec![
             "   Prefetch Cache Hit: ".gray(),
             cache_hit_str,
@@ -181,6 +194,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.stats.process_duration.as_secs_f64() * 1000.0
             )
             .bold(),
+        ]));
+        lines.push(Line::from(vec![
+            "   Protocol Used: ".gray(),
+            format!("{:?}", app.picker.protocol_type()).bold(),
         ]));
         lines.push(Line::from(vec![
             "   Terminal API Write: ".gray(),

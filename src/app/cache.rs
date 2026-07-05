@@ -9,6 +9,7 @@ pub struct CachedImage {
     pub thumbnail: Option<Arc<DynamicImage>>,
     pub width: u32,
     pub height: u32,
+    pub format: Option<image::ImageFormat>,
     pub decode_duration: std::time::Duration,
     pub thumbnail_decode_duration: std::time::Duration,
     pub disk_size: u64,
