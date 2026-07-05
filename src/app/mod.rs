@@ -1,4 +1,18 @@
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+pub mod adjustments;
+pub mod cache;
+pub mod classifications;
+pub mod events;
+pub mod palette;
+pub mod queue;
+
+pub use adjustments::{Adjustment, ImageAdjustments};
+pub use cache::{CachedImage, PrefetchCache};
+pub use classifications::{
+    Classification, ViewMode, export_to_file, import_from_file, is_image_visible,
+};
+pub use palette::{PaletteMode, PromptType, filter_commands, filter_files};
+pub use queue::ImageQueue;
+
 use fast_image_resize as fir;
 use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -9,231 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::commands::{Command, PaletteCommand, get_commands};
-use crate::image_worker::{
+use crate::imaging::{
     Brightness, Contrast, CropBox, FilterType, ImageIntersection, ImageSource, LoaderRequest,
     LoaderResponse, PanOffset, ResizeRequest, ScaleMode, SlideshowConfig, process_resize,
 };
-/// Represents an absolute or relative adjustment to a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Adjustment<T> {
-    /// An absolute value assignment.
-    Absolute(T),
-    /// A relative addition to the current value.
-    RelativeAdd(T),
-    /// A relative subtraction from the current value.
-    RelativeSub(T),
-}
-
-impl<T: std::str::FromStr> std::str::FromStr for Adjustment<T> {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err("Empty input".to_string());
-        }
-        if let Some(stripped) = s.strip_prefix('+') {
-            let val = stripped
-                .parse::<T>()
-                .map_err(|_| "Invalid positive offset".to_string())?;
-            Ok(Self::RelativeAdd(val))
-        } else if let Some(stripped) = s.strip_prefix('-') {
-            let val = stripped
-                .parse::<T>()
-                .map_err(|_| "Invalid negative offset".to_string())?;
-            Ok(Self::RelativeSub(val))
-        } else {
-            let val = s
-                .parse::<T>()
-                .map_err(|_| "Invalid absolute value".to_string())?;
-            Ok(Self::Absolute(val))
-        }
-    }
-}
-
-/// Individual image adjustments (brightness, contrast, rotation) that are preserved per-file.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ImageAdjustments {
-    pub brightness: i32,
-    pub contrast: f32,
-    pub rotation: u32,
-}
-
-impl Default for ImageAdjustments {
-    fn default() -> Self {
-        Self {
-            brightness: 0,
-            contrast: 0.0,
-            rotation: 0,
-        }
-    }
-}
-
-impl ImageAdjustments {
-    /// Applies the rotation setting to the given DynamicImage.
-    pub fn rotate_image(&self, img: &image::DynamicImage) -> image::DynamicImage {
-        match self.rotation {
-            90 => img.rotate90(),
-            180 => img.rotate180(),
-            270 => img.rotate270(),
-            _ => img.clone(),
-        }
-    }
-}
-
-/// The classification/flagged state for an image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Classification {
-    Unflagged,
-    Pick,
-    Reject,
-}
-
-impl Classification {
-    /// Returns the emoji icon representing the classification.
-    pub fn icon(&self) -> &'static str {
-        match self {
-            Self::Unflagged => "⚪",
-            Self::Pick => "⭐",
-            Self::Reject => "❌",
-        }
-    }
-
-    /// Returns the combined icon and label string (e.g. "⭐ Pick").
-    pub fn display_label(&self) -> &'static str {
-        match self {
-            Self::Unflagged => "⚪ Unflagged",
-            Self::Pick => "⭐ Pick",
-            Self::Reject => "❌ Reject",
-        }
-    }
-
-    /// Returns the short prefix for list views, leaving Unflagged blank for visual cleanliness.
-    pub fn search_prefix(&self) -> &'static str {
-        match self {
-            Self::Unflagged => "   ",
-            Self::Pick => "⭐ ",
-            Self::Reject => "❌ ",
-        }
-    }
-}
-
-/// The display filtering view mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ViewMode {
-    /// Show picks and unflagged images (default).
-    Default,
-    /// Show only unflagged images.
-    Unflagged,
-    /// Show only picks.
-    Picks,
-    /// Show only rejects.
-    Rejects,
-    /// Show all files.
-    All,
-}
-
-impl ViewMode {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Default => "Unflagged + Picks",
-            Self::Unflagged => "Unflagged Only",
-            Self::Picks => "Picks Only",
-            Self::Rejects => "Rejects Only",
-            Self::All => "All Files",
-        }
-    }
-}
-
-/// Helper struct for JSON serialization/deserialization of classifications.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ClassificationJsonItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive: Option<String>,
-    pub filename: String,
-    pub flag: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub brightness: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contrast: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rotation: Option<u32>,
-}
-
-/// Encapsulates list of images, starting index, and cached display name lists.
-pub struct ImageQueue {
-    /// Loaded list of image sources.
-    pub images: Vec<ImageSource>,
-    /// Pre-computed filename cache for standard status display.
-    pub display_names: Vec<String>,
-    /// Lowercase file name cache for case-insensitive matching.
-    pub display_names_lowercase: Vec<String>,
-    /// Current selected index in the images vector.
-    pub current_index: usize,
-}
-
-impl ImageQueue {
-    /// Creates a new ImageQueue, returning an error if the images list is empty.
-    pub fn new(images: Vec<ImageSource>, current_index: usize) -> Result<Self, String> {
-        if images.is_empty() {
-            return Err("No supported images found".to_string());
-        }
-        let display_names: Vec<String> = images.iter().map(|img| img.display_name()).collect();
-        let display_names_lowercase: Vec<String> = display_names
-            .iter()
-            .map(|name| name.to_lowercase())
-            .collect();
-        let current_index = current_index.min(images.len() - 1);
-        Ok(Self {
-            images,
-            display_names,
-            display_names_lowercase,
-            current_index,
-        })
-    }
-
-    /// Returns true if the image queue contains no images.
-    pub fn is_empty(&self) -> bool {
-        self.images.is_empty()
-    }
-
-    /// Returns the filename display name of the currently selected image.
-    pub fn get_current_filename(&self) -> &str {
-        self.display_names
-            .get(self.current_index)
-            .map(|s| s.as_str())
-            .unwrap_or("")
-    }
-}
-
-/// The specific input prompt type.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PromptType {
-    /// Go to specific image index.
-    GoToImage,
-    /// Adjust image brightness.
-    SetBrightness,
-    /// Adjust image contrast.
-    SetContrast,
-    /// Adjust slideshow interval.
-    SetSlideshow,
-}
-
-/// The state of the top overlay search palette or prompt dialog.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PaletteMode {
-    /// Palette/prompt overlay is closed.
-    Closed,
-    /// Searchable commands lookup.
-    Command,
-    /// Fuzzy search files in local queue.
-    File,
-    /// Prompt value input box is open.
-    Prompt,
-    /// Image metadata and statistics dialog is open.
-    Info,
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatsForNerds {
@@ -256,21 +49,6 @@ pub struct StatsForNerds {
     /// Size of the image on disk in bytes.
     pub disk_size: u64,
 }
-
-/// A cached image and its associated metadata in the prefetch cache.
-#[derive(Clone)]
-pub struct CachedImage {
-    pub image: Option<Arc<DynamicImage>>,
-    pub thumbnail: Option<Arc<DynamicImage>>,
-    pub width: u32,
-    pub height: u32,
-    pub icon: &'static str,
-    pub decode_duration: std::time::Duration,
-    pub thumbnail_decode_duration: std::time::Duration,
-    pub disk_size: u64,
-}
-
-type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;
 
 /// A response payload sent by the resizing worker thread.
 pub struct ResizeResponse {
@@ -463,11 +241,10 @@ impl App {
                     let limit = 256 * 1024; // 256 KB limit to avoid massive full-file reads for metadata/thumbnails
 
                     if !disable_thumbnail {
-                        let read_res =
-                            crate::image_worker::read_source_bytes_limited(&r.source, limit);
+                        let read_res = crate::imaging::read_source_bytes_limited(&r.source, limit);
                         if let Ok(partial_bytes) = read_res {
                             if let Some((thumb_img, real_w, real_h)) =
-                                crate::image_worker::decode_thumbnail_and_dimensions(&partial_bytes)
+                                crate::imaging::decode_thumbnail_and_dimensions(&partial_bytes)
                             {
                                 // Send thumbnail placeholder immediately
                                 let thumb_dur = start.elapsed();
@@ -497,13 +274,13 @@ impl App {
                     let final_bytes = if let Some(bytes) = bytes_opt {
                         Some(bytes)
                     } else {
-                        crate::image_worker::read_source_bytes(&r.source).ok()
+                        crate::imaging::read_source_bytes(&r.source).ok()
                     };
 
                     let res = if let Some(ref bytes) = final_bytes {
-                        crate::image_worker::decode_image_bytes(bytes, &r.source)
+                        crate::imaging::decode_image_bytes(bytes, &r.source)
                     } else {
-                        crate::image_worker::decode_image_source(r.source)
+                        crate::imaging::decode_image_source(r.source)
                     };
 
                     let decode_duration = start.elapsed();
@@ -579,21 +356,7 @@ impl App {
 
     /// Checks if the image at index is visible under the current ViewMode.
     pub fn is_visible(&self, index: usize) -> bool {
-        let classification = self
-            .classifications
-            .get(index)
-            .cloned()
-            .unwrap_or(Classification::Unflagged);
-        match self.view_mode {
-            ViewMode::Default => {
-                classification == Classification::Pick
-                    || classification == Classification::Unflagged
-            }
-            ViewMode::Unflagged => classification == Classification::Unflagged,
-            ViewMode::Picks => classification == Classification::Pick,
-            ViewMode::Rejects => classification == Classification::Reject,
-            ViewMode::All => true,
-        }
+        is_image_visible(index, &self.classifications, self.view_mode)
     }
 
     /// Returns the total number of visible images under the current view filter.
@@ -732,54 +495,7 @@ impl App {
 
     /// Imports image classification states and adjustments from a text file or a JSON manifest.
     pub fn import_classifications(&mut self, import_path: &std::path::Path) -> Result<(), String> {
-        let content = std::fs::read_to_string(import_path)
-            .map_err(|e| format!("Failed to read import file: {}", e))?;
-
-        let mut imported: HashMap<String, (Classification, ImageAdjustments)> = HashMap::new();
-
-        if import_path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-        {
-            let parsed: Vec<ClassificationJsonItem> = serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse JSON manifest: {}", e))?;
-            for item in parsed {
-                let class = match item.flag.to_lowercase().as_str() {
-                    "pick" | "picked" => Classification::Pick,
-                    "reject" | "rejected" => Classification::Reject,
-                    _ => Classification::Unflagged,
-                };
-                let adj = ImageAdjustments {
-                    brightness: item.brightness.unwrap_or(0),
-                    contrast: item.contrast.unwrap_or(0.0),
-                    rotation: item.rotation.unwrap_or(0),
-                };
-                let key = if let Some(ref archive_path) = item.archive {
-                    format!("{}::{}", archive_path, item.filename)
-                } else {
-                    item.filename
-                };
-                imported.insert(key, (class, adj));
-            }
-        } else {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let split_res = line.split_once('\t').or_else(|| line.split_once(':'));
-                if let Some((prefix, ident)) = split_res {
-                    let ident = ident.trim().to_string();
-                    let class = match prefix.trim().to_uppercase().as_str() {
-                        "PICK" | "PICKED" => Classification::Pick,
-                        "REJECT" | "REJECTED" => Classification::Reject,
-                        "UNFLAGGED" => Classification::Unflagged,
-                        _ => continue,
-                    };
-                    imported.insert(ident, (class, ImageAdjustments::default()));
-                }
-            }
-        }
+        let imported = import_from_file(import_path)?;
 
         // Apply imported states to existing files
         for (idx, img) in self.queue.images.iter().enumerate() {
@@ -801,114 +517,12 @@ impl App {
 
     /// Exports image classification states and adjustments to a text file or a JSON manifest.
     pub fn export_classifications(&self, export_path: &std::path::Path) -> Result<(), String> {
-        let mut text_lines = Vec::new();
-        let mut json_items = Vec::new();
-
-        for (idx, img) in self.queue.images.iter().enumerate() {
-            let class = self
-                .classifications
-                .get(idx)
-                .cloned()
-                .unwrap_or(Classification::Unflagged);
-            let adj = self.adjustments.get(idx).cloned().unwrap_or_default();
-
-            // Only export if image is flagged OR has non-default adjustments
-            if class == Classification::Unflagged
-                && adj.brightness == 0
-                && adj.contrast == 0.0
-                && adj.rotation == 0
-            {
-                continue;
-            }
-
-            let ident = img.identifier();
-
-            let (archive, filename) = match img {
-                ImageSource::Local(path) => {
-                    let abs = if path.is_absolute() {
-                        path.clone()
-                    } else if let Ok(curr) = std::env::current_dir() {
-                        curr.join(path)
-                    } else {
-                        path.clone()
-                    };
-                    (None, abs.to_string_lossy().into_owned())
-                }
-                ImageSource::Cbz {
-                    zip_path,
-                    file_in_zip,
-                } => {
-                    let abs_zip = if zip_path.is_absolute() {
-                        zip_path.clone()
-                    } else if let Ok(curr) = std::env::current_dir() {
-                        curr.join(zip_path)
-                    } else {
-                        zip_path.clone()
-                    };
-                    (
-                        Some(abs_zip.to_string_lossy().into_owned()),
-                        file_in_zip.clone(),
-                    )
-                }
-            };
-
-            let flag_str = match class {
-                Classification::Pick => "picked",
-                Classification::Reject => "rejected",
-                Classification::Unflagged => "unflagged",
-            };
-
-            let brightness = if adj.brightness != 0 {
-                Some(adj.brightness)
-            } else {
-                None
-            };
-            let contrast = if adj.contrast != 0.0 {
-                Some(adj.contrast)
-            } else {
-                None
-            };
-            let rotation = if adj.rotation != 0 {
-                Some(adj.rotation)
-            } else {
-                None
-            };
-
-            json_items.push(ClassificationJsonItem {
-                archive,
-                filename,
-                flag: flag_str.to_string(),
-                brightness,
-                contrast,
-                rotation,
-            });
-
-            // For text export: only write if flagged
-            if class != Classification::Unflagged {
-                let text_state = match class {
-                    Classification::Pick => "PICK",
-                    Classification::Reject => "REJECT",
-                    Classification::Unflagged => "UNFLAGGED",
-                };
-                text_lines.push(format!("{}\t{}", text_state, ident));
-            }
-        }
-
-        if export_path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-        {
-            let json_str = serde_json::to_string_pretty(&json_items)
-                .map_err(|e| format!("Failed to serialize classifications: {}", e))?;
-            std::fs::write(export_path, json_str)
-                .map_err(|e| format!("Failed to write export JSON file: {}", e))?;
-        } else {
-            let content = text_lines.join("\n");
-            std::fs::write(export_path, content)
-                .map_err(|e| format!("Failed to write export text file: {}", e))?;
-        }
-
-        Ok(())
+        export_to_file(
+            export_path,
+            &self.queue.images,
+            &self.classifications,
+            &self.adjustments,
+        )
     }
 
     /// Returns cached filtered files matching the current search query.
@@ -963,103 +577,20 @@ impl App {
     }
 
     fn get_filtered_files_uncached(&mut self) -> Vec<(usize, String)> {
-        let query = &self.palette_query;
-        if query.is_empty() {
-            return self
-                .queue
-                .display_names
-                .iter()
-                .enumerate()
-                .filter(|&(idx, _)| self.is_visible(idx))
-                .map(|(idx, name)| (idx, name.clone()))
-                .collect();
-        }
-
-        let pattern = nucleo::pattern::Pattern::parse(
-            query,
-            nucleo::pattern::CaseMatching::Ignore,
-            nucleo::pattern::Normalization::Smart,
-        );
-
-        #[derive(Clone)]
-        struct FileCandidate<'a> {
-            index: usize,
-            name: &'a str,
-        }
-        impl<'a> AsRef<str> for FileCandidate<'a> {
-            fn as_ref(&self) -> &str {
-                self.name
-            }
-        }
-
-        let candidates: Vec<FileCandidate<'_>> = self
-            .queue
-            .display_names_lowercase
-            .iter()
-            .enumerate()
-            .filter(|&(index, _)| self.is_visible(index))
-            .map(|(index, name)| FileCandidate {
-                index,
-                name: name.as_str(),
-            })
+        let visibility: Vec<bool> = (0..self.queue.images.len())
+            .map(|idx| self.is_visible(idx))
             .collect();
-
-        let mut matches = pattern.match_list(candidates, &mut self.matcher);
-        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.index.cmp(&b.0.index)));
-
-        matches
-            .into_iter()
-            .map(|(candidate, _score)| {
-                (
-                    candidate.index,
-                    self.queue.display_names[candidate.index].clone(),
-                )
-            })
-            .collect()
+        filter_files(
+            &self.palette_query,
+            &self.queue.display_names,
+            &self.queue.display_names_lowercase,
+            &mut self.matcher,
+            &visibility,
+        )
     }
 
     fn get_filtered_commands_uncached(&mut self) -> Vec<PaletteCommand> {
-        let query = &self.palette_query;
-        if query.is_empty() {
-            return get_commands()
-                .iter()
-                .filter(|cmd| cmd.item.show_in_palette)
-                .cloned()
-                .collect();
-        }
-
-        let pattern = nucleo::pattern::Pattern::parse(
-            query,
-            nucleo::pattern::CaseMatching::Ignore,
-            nucleo::pattern::Normalization::Smart,
-        );
-
-        #[derive(Clone)]
-        struct CmdCandidate {
-            cmd: PaletteCommand,
-        }
-        impl AsRef<str> for CmdCandidate {
-            fn as_ref(&self) -> &str {
-                &self.cmd.search_text
-            }
-        }
-
-        let candidates: Vec<CmdCandidate> = get_commands()
-            .iter()
-            .filter(|cmd| cmd.item.show_in_palette)
-            .map(|cmd| CmdCandidate { cmd: cmd.clone() })
-            .collect();
-
-        let mut matches = pattern.match_list(candidates, &mut self.matcher);
-        matches.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| (a.0.cmd.cmd as usize).cmp(&(b.0.cmd.cmd as usize)))
-        });
-
-        matches
-            .into_iter()
-            .map(|(candidate, _score)| candidate.cmd)
-            .collect()
+        filter_commands(&self.palette_query, &mut self.matcher)
     }
 
     pub fn filter_name(&self) -> &'static str {
@@ -1352,33 +883,11 @@ impl App {
     }
 
     pub fn get_sliding_window_indices(&self) -> Vec<usize> {
-        let n = 2; // Cache size N=2 (caches current + 2 before + 2 after)
-        let visible: Vec<usize> = (0..self.queue.images.len())
-            .filter(|&idx| self.is_visible(idx))
-            .collect();
-        let total = visible.len();
-        if total == 0 {
-            return Vec::new();
-        }
-        let current_pos = visible
-            .iter()
-            .position(|&idx| idx == self.queue.current_index);
-        let current_pos = match current_pos {
-            Some(pos) => pos,
-            None => return Vec::new(),
-        };
-
-        let mut indices = Vec::new();
-        indices.push(visible[current_pos]);
-        for i in 1..=n {
-            let prev = (current_pos + total - i) % total;
-            let next = (current_pos + i) % total;
-            indices.push(visible[prev]);
-            indices.push(visible[next]);
-        }
-        indices.sort();
-        indices.dedup();
-        indices
+        cache::get_sliding_window_indices(
+            self.queue.current_index,
+            self.queue.images.len(),
+            |idx| self.is_visible(idx),
+        )
     }
 
     pub fn trigger_prefetch(&self) {
@@ -1449,8 +958,7 @@ impl App {
         if let Some(cached_img) = cached {
             self.current_sequence += 1;
             self.original_image = cached_img.image.map(|img| {
-                if adj.rotation != 0 {
-                    let rotated = adj.rotate_image(&img);
+                if let Some(rotated) = adj.rotate_image(&img) {
                     self.img_width = rotated.width();
                     self.img_height = rotated.height();
                     Arc::new(rotated)
@@ -1461,13 +969,9 @@ impl App {
                 }
             });
 
-            self.thumbnail_image = cached_img.thumbnail.map(|thumb| {
-                if adj.rotation != 0 {
-                    Arc::new(adj.rotate_image(&thumb))
-                } else {
-                    thumb
-                }
-            });
+            self.thumbnail_image = cached_img
+                .thumbnail
+                .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
             self.show_thumbnail_only = false;
 
             if let Some(ref thumb) = self.thumbnail_image {
@@ -1580,15 +1084,19 @@ impl App {
                         }
                     } else if resp.idx == self.queue.current_index {
                         let adj = self.adjustments.get(resp.idx).copied().unwrap_or_default();
-                        let rotated_img = if adj.rotation != 0 {
-                            Arc::new(adj.rotate_image(&shared_img))
-                        } else {
-                            shared_img
-                        };
+                        let rotated_img = adj
+                            .rotate_image(&shared_img)
+                            .map(Arc::new)
+                            .unwrap_or(shared_img);
 
                         if resp.is_thumbnail {
-                            self.img_width = rotated_img.width();
-                            self.img_height = rotated_img.height();
+                            let (orig_w, orig_h) = if adj.rotation == 90 || adj.rotation == 270 {
+                                (h, w)
+                            } else {
+                                (w, h)
+                            };
+                            self.img_width = orig_w;
+                            self.img_height = orig_h;
                             self.current_icon = icon;
                             let thumb_w = rotated_img.width();
                             let thumb_h = rotated_img.height();
@@ -1654,7 +1162,17 @@ impl App {
         }
     }
 
-    pub fn update_layout(&mut self, term_height: u16) {
+    pub fn update_layout(&mut self, term_width: u16, term_height: u16) {
+        // 1. First, check if the image protocol needs updating based on the main viewport area size
+        let widget_w = term_width;
+        let widget_h = term_height.saturating_sub(3);
+        if self.needs_update || self.last_widget_size != (widget_w, widget_h) {
+            self.last_widget_size = (widget_w, widget_h);
+            self.needs_update = false;
+            self.update_protocol(widget_w, widget_h);
+        }
+
+        // 2. Then, update the overlay palette height if a palette is open
         if self.palette_mode == PaletteMode::Closed {
             return;
         }
@@ -2266,166 +1784,13 @@ impl App {
             }
         }
     }
-
-    /// Handles a Crossterm input event (keyboard or mouse).
-    pub fn handle_event(&mut self, ev: Event, terminal_height: u16) {
-        if let (
-            PaletteMode::Info,
-            Event::Key(crossterm::event::KeyEvent {
-                code,
-                kind: KeyEventKind::Press,
-                ..
-            }),
-        ) = (self.palette_mode, &ev)
-        {
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.palette_mode = PaletteMode::Closed;
-                    self.needs_clear_once = true;
-                    return;
-                }
-                KeyCode::Char('d') => {
-                    if self.last_info_toggle.is_none()
-                        || self.last_info_toggle.unwrap().elapsed()
-                            > std::time::Duration::from_millis(200)
-                    {
-                        self.palette_mode = PaletteMode::Closed;
-                        self.needs_clear_once = true;
-                        self.last_info_toggle = Some(std::time::Instant::now());
-                    }
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        if self.palette_mode != PaletteMode::Closed && self.palette_mode != PaletteMode::Info {
-            if let Event::Key(key) = ev {
-                if key.kind != KeyEventKind::Press {
-                    return;
-                }
-                match key.code {
-                    KeyCode::Esc => {
-                        self.palette_mode = PaletteMode::Closed;
-                        self.needs_update = true;
-                        self.needs_clear_once = true;
-                    }
-                    KeyCode::Enter => match self.palette_mode {
-                        PaletteMode::File => {
-                            let files = self.get_filtered_files();
-                            if !files.is_empty() && self.palette_selected_index < files.len() {
-                                self.queue.current_index = files[self.palette_selected_index].0;
-                                self.start_load_image();
-                            }
-                            self.palette_mode = PaletteMode::Closed;
-                            self.needs_update = true;
-                            self.needs_clear_once = true;
-                        }
-                        PaletteMode::Command => {
-                            let cmds = self.get_filtered_commands();
-                            if !cmds.is_empty() && self.palette_selected_index < cmds.len() {
-                                let cmd = cmds[self.palette_selected_index].cmd;
-                                self.execute_command(cmd);
-                            }
-                            if self.palette_mode == PaletteMode::Command {
-                                self.palette_mode = PaletteMode::Closed;
-                                self.needs_update = true;
-                                self.needs_clear_once = true;
-                            }
-                        }
-                        PaletteMode::Prompt => {
-                            if let Some(prompt_type) = self.prompt_type {
-                                self.execute_prompt(prompt_type);
-                            }
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Up if self.palette_selected_index > 0 => {
-                        self.palette_selected_index -= 1;
-                    }
-                    KeyCode::Down => {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 && self.palette_selected_index < max_len - 1 {
-                            self.palette_selected_index += 1;
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        let viewport_h = terminal_height.saturating_sub(1);
-                        let max_h = (viewport_h as f64 * 0.5).round() as u16;
-                        let palette_h = (max_len as u16 + 4).max(12).min(max_h);
-                        let page_size = (palette_h as usize).saturating_sub(4);
-
-                        self.palette_selected_index =
-                            self.palette_selected_index.saturating_sub(page_size);
-                    }
-                    KeyCode::PageDown => {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 {
-                            let viewport_h = terminal_height.saturating_sub(1);
-                            let max_h = (viewport_h as f64 * 0.5).round() as u16;
-                            let palette_h = (max_len as u16 + 4).max(12).min(max_h);
-                            let page_size = (palette_h as usize).saturating_sub(4);
-
-                            self.palette_selected_index =
-                                (self.palette_selected_index + page_size).min(max_len - 1);
-                        }
-                    }
-                    KeyCode::Char('k')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                            && self.palette_selected_index > 0 =>
-                    {
-                        self.palette_selected_index -= 1;
-                    }
-                    KeyCode::Char('j')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                    {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 && self.palette_selected_index < max_len - 1 {
-                            self.palette_selected_index += 1;
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        self.palette_pop_char();
-                    }
-                    KeyCode::Char(c) => {
-                        self.palette_push_char(c);
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            if let Some(cmd) = Command::from_event(&ev) {
-                self.execute_command(cmd);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_worker::ImageSource;
+    use crate::app::classifications::ClassificationJsonItem;
+    use crate::imaging::ImageSource;
     use ratatui_image::picker::Picker;
     use std::path::PathBuf;
 
@@ -2449,8 +1814,8 @@ mod tests {
             images.clone(),
             0,
             picker,
-            crate::image_worker::FilterType::Nearest,
-            crate::image_worker::ScaleMode::Shrink,
+            crate::imaging::FilterType::Nearest,
+            crate::imaging::ScaleMode::Shrink,
             true,
         )
         .unwrap();

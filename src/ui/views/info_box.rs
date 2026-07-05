@@ -1,0 +1,215 @@
+use crate::app::App;
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Color, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+};
+
+/// Formats raw byte counts to human-readable strings (KB, MB).
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+
+    if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Renders the technical details and EXIF / cache telemetry overlay box.
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    let title = " Image Details ";
+    let w = 55.min(area.width.saturating_sub(1));
+    let h = app.palette_height.min(area.height.saturating_sub(1));
+
+    let mut lines = Vec::new();
+
+    if app.queue.is_empty() {
+        lines.push(Line::from(" No image details available.".gray().italic()));
+
+        let palette_block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+
+        let palette_paragraph = Paragraph::new(lines)
+            .block(palette_block)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+        let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
+        let y = area.y.saturating_add(1);
+
+        let popup_area = Rect::new(x, y, w, h);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(palette_paragraph, popup_area);
+    } else {
+        let (filename, dir_str, disk_size_str, mem_size_str) =
+            match &app.queue.images[app.queue.current_index] {
+                crate::imaging::ImageSource::Local(path) => {
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let dir_str = path
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let disk_size_str = format_size(app.stats.disk_size);
+                    let mem_size = app
+                        .original_image
+                        .as_ref()
+                        .map(|img| img.as_bytes().len() as u64)
+                        .unwrap_or(0);
+                    let mem_size_str = format_size(mem_size);
+                    (filename, dir_str, disk_size_str, mem_size_str)
+                }
+                crate::imaging::ImageSource::Cbz {
+                    zip_path,
+                    file_in_zip,
+                } => {
+                    let filename = file_in_zip.clone();
+                    let dir_str = format!("{} (Archive)", zip_path.display());
+                    let disk_size_str = format_size(app.stats.disk_size);
+                    let mem_size = app
+                        .original_image
+                        .as_ref()
+                        .map(|img| img.as_bytes().len() as u64)
+                        .unwrap_or(0);
+                    let mem_size_str = format_size(mem_size);
+                    (filename, dir_str, disk_size_str, mem_size_str)
+                }
+            };
+        let pixels_str = format!("{} x {} px", app.img_width, app.img_height);
+
+        lines.push(Line::from(vec![
+            " File: ".bold().cyan(),
+            filename.as_str().into(),
+        ]));
+        lines.push(Line::from(vec![
+            " Directory: ".bold().cyan(),
+            dir_str.as_str().into(),
+        ]));
+        lines.push(Line::from(vec![
+            " Size on Disk: ".bold().cyan(),
+            disk_size_str.as_str().into(),
+        ]));
+        lines.push(Line::from(vec![
+            " Dimensions: ".bold().cyan(),
+            pixels_str.as_str().into(),
+        ]));
+        let classification = app.current_classification();
+        let flag_style = match classification {
+            crate::app::Classification::Unflagged => Style::default().fg(Color::Gray),
+            crate::app::Classification::Pick => Style::default().fg(Color::Green).bold(),
+            crate::app::Classification::Reject => Style::default().fg(Color::Red).bold(),
+        };
+        let flag_label = classification.display_label();
+        lines.push(Line::from(vec![
+            " Flag State: ".bold().cyan(),
+            Span::styled(flag_label, flag_style),
+        ]));
+
+        let inner_w = w.saturating_sub(2) as usize;
+        lines.push(Line::from("─".repeat(inner_w).gray()));
+        lines.push(Line::from(" Stats for Nerds:".bold().yellow()));
+
+        let cache_hit_str = if app.stats.is_prefetch_cache_hit {
+            "Yes (Hit)".green()
+        } else {
+            "No (Miss)".red()
+        };
+        lines.push(Line::from(vec![
+            "   Load / Decode: ".gray(),
+            format!("{:.2} ms", app.stats.load_duration.as_secs_f64() * 1000.0).bold(),
+        ]));
+        let thumb_load_str = if app.disable_thumbnail {
+            "N/A (Disabled)".gray()
+        } else {
+            match app.stats.thumbnail_load_duration {
+                Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
+                None => "N/A (No EXIF Thumbnail)".gray(),
+            }
+        };
+        lines.push(Line::from(vec![
+            "   Thumbnail Load: ".gray(),
+            thumb_load_str,
+        ]));
+        lines.push(Line::from(vec![
+            "   Thumbnail Mode: ".gray(),
+            if app.show_thumbnail_only {
+                "Active (Thumbnail Displayed)".green().bold()
+            } else if app.thumbnail_image.is_some() {
+                "Inactive (Full Image Displayed)".yellow()
+            } else {
+                "N/A".gray()
+            },
+        ]));
+        let thumb_dim_str = match app.stats.thumbnail_dimensions {
+            Some((w, h)) => format!("{} x {} px", w, h).bold(),
+            None => "N/A".gray(),
+        };
+        lines.push(Line::from(vec![
+            "   Thumbnail Dimensions: ".gray(),
+            thumb_dim_str,
+        ]));
+        lines.push(Line::from(vec![
+            "   Prefetch Cache Hit: ".gray(),
+            cache_hit_str,
+        ]));
+        lines.push(Line::from(vec![
+            "   Uncompressed Mem: ".gray(),
+            mem_size_str.as_str().bold(),
+        ]));
+        lines.push(Line::from(vec![
+            "   Resize / Filter: ".gray(),
+            format!(
+                "{:.2} ms",
+                app.stats.process_duration.as_secs_f64() * 1000.0
+            )
+            .bold(),
+        ]));
+        lines.push(Line::from(vec![
+            "   Terminal API Write: ".gray(),
+            format!(
+                "{:.2} ms",
+                app.stats.protocol_duration.as_secs_f64() * 1000.0
+            )
+            .bold(),
+        ]));
+        let proto_pixels_str = format!(
+            "{} x {} px",
+            app.stats.protocol_width, app.stats.protocol_height
+        );
+        lines.push(Line::from(vec![
+            "   Protocol Pixels: ".gray(),
+            proto_pixels_str.as_str().bold(),
+        ]));
+
+        let palette_block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+
+        let palette_paragraph = Paragraph::new(lines)
+            .block(palette_block)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+        let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
+        let y = area.y.saturating_add(1);
+
+        let popup_area = Rect::new(x, y, w, h);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(palette_paragraph, popup_area);
+    }
+}

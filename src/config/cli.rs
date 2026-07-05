@@ -1,4 +1,4 @@
-use crate::image_worker::{FilterType, ScaleMode, SlideshowConfig};
+use crate::imaging::{FilterType, ScaleMode, SlideshowConfig};
 use ratatui_image::picker::ProtocolType;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;

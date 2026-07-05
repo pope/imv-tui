@@ -16,7 +16,7 @@ Before approving any changes or reporting back to the user, ensure the following
 - [ ] **No Warnings / Errors**: The workspace must compile 100% warning-free on the stable Rust channel under `cargo clippy`.
 - [ ] **Formatting Invariant**: All Rust source code must be formatted using the workspace auto-formatter (`nix fmt`).
 - [ ] **Successful Release Build**: Validate that `cargo build --release` compiles successfully.
-- [ ] **Strict Separation of Concerns**: No layout mutations or selections are performed in the drawing path (`src/ui.rs`).
+- [ ] **Strict Separation of Concerns**: No layout mutations or selections are performed in the drawing path (`src/ui/`).
 - [ ] **Async Thread I/O Boundaries**:
   - The main UI thread must remain strictly non-blocking.
   - Disk operations (e.g. `std::fs::metadata`, `std::fs::read`), image decoding, scaling, filtering, and protocol serialization must happen on the background loader/worker threads.

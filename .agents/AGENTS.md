@@ -24,8 +24,8 @@ ______________________________________________________________________
 
 3. **No Layout Mutation in Rendering**:
 
-   - The draw phase (`src/ui.rs`) must remain strictly side-effect free.
-   - All selection index updates and layout updates must happen in the state controller (`src/app.rs`) during input event processing.
+   - The draw phase (`src/ui/`) must remain strictly side-effect free.
+   - All selection index updates and layout updates must happen in the state controller (`src/app/`) during input event processing.
 
 4. **Pre-Report Verification Checklist**:
 

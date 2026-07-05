@@ -24,10 +24,10 @@ When building TUI applications, standard crash panics or early returns (`?`) can
 
 ### 2. Pure Rendering Viewports & separation of concerns
 
-Mutating application states (such as layout dimensions or screen-clearing triggers) inside the drawing loops of `src/ui.rs` breaks the read-only rendering guarantee, leads to visual lag, and triggers double terminal refreshes.
+Mutating application states (such as layout dimensions or screen-clearing triggers) inside the drawing loops of `src/ui/` breaks the read-only rendering guarantee, leads to visual lag, and triggers double terminal refreshes.
 
 - **Layout Update Phase**: Introduce a layout pre-calculation phase in the controller (`App::update_layout(term_height)`) to update sizes, check boundaries, and trigger clear signals *before* invoking `terminal.draw`.
-- **Pure Rendering**: Enforce read-only rendering logic inside `src/ui.rs` where layout parameters are purely read from precomputed state variables.
+- **Pure Rendering**: Enforce read-only rendering logic inside `src/ui/` where layout parameters are purely read from precomputed state variables.
 - **Rect Boundary Clamping**: Always clamp calculated coordinates (`rect_w`, `rect_h`) against viewport dimensions to prevent crashes and coordinate overflows during terminal resizing.
 
 ### 3. Compiler-Enforced Unified Keybindings & Command Architecture
@@ -42,8 +42,8 @@ Mutating application states (such as layout dimensions or screen-clearing trigge
 Keep file responsibilities clean and modularized:
 
 - `src/main.rs`: Entry point, raw-mode initialization, panic hooks, and Crossterm event loop.
-- `src/cli.rs`: CLI command line option parsing, argument validation, and stdin path piping.
-- `src/commands.rs`: Mappings of keys, keyboard descriptions, command metadata, and shortcuts.
-- `src/image_worker.rs`: Image source decoders, directory scans, and background resizers.
-- `src/app.rs`: State controller and worker thread management.
-- `src/ui.rs`: Layout and widget rendering views.
+- `src/config/`: CLI command line option parsing (`cli.rs`), raw key defs and shortcut match bindings (`keys.rs`).
+- `src/commands/`: Mappings of keys, keyboard descriptions, command metadata, registry index lists.
+- `src/imaging/`: Image source decoders, directory scans, clamping types, and background resizers.
+- `src/app/`: State controller, sub-states, adjustments, classification databases, events handler, and worker thread managers.
+- `src/ui/`: Layout grids, HUD bars, command search palettes, details tables, prompt widgets.

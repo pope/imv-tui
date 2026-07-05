@@ -1,7 +1,7 @@
 mod app;
-mod cli;
 mod commands;
-mod image_worker;
+mod config;
+mod imaging;
 mod ui;
 
 use std::io;
@@ -17,10 +17,8 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
 use crate::app::{App, Classification, PaletteMode};
-use crate::cli::{parse_cli_args, read_piped_stdin};
-use crate::image_worker::{
-    ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory,
-};
+use crate::config::cli::{parse_cli_args, read_piped_stdin};
+use crate::imaging::{ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory};
 use crate::ui::ui;
 
 struct TerminalGuard;
@@ -131,7 +129,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let term_size = terminal.size().unwrap_or_default();
-        app.update_layout(term_size.height);
+        app.update_layout(term_size.width, term_size.height);
 
         if app.needs_clear_once {
             app.needs_clear_once = false;

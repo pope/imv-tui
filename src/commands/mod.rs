@@ -1,9 +1,27 @@
 use crossterm::event;
-use strum::{EnumIter, IntoEnumIterator};
+use strum::IntoEnumIterator;
+
+pub mod registry;
+
+pub use crate::config::keys::KeyDef;
+pub use registry::{PaletteCommand, get_commands};
+
+/// User-facing metadata for a Command.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandItem {
+    /// Human-readable name of the command.
+    pub name: &'static str,
+    /// Detailed description of what the command does.
+    pub description: &'static str,
+    /// Whether this command should be searchable/listed inside the command palette.
+    pub show_in_palette: bool,
+    /// Configured shortcuts/triggers associated with this command.
+    pub shortcuts: Option<&'static [KeyDef]>,
+}
 
 /// Executable application commands/actions.
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum Command {
     /// Exit the application.
     Quit,
@@ -438,206 +456,6 @@ impl Command {
                 shortcuts: Some(&[KeyDef::Char('m')]),
             },
         }
-    }
-}
-
-/// Abstract representation of keyboard keys and mouse actions for bindings.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyDef {
-    /// A single character press (e.g. 'q', 'i').
-    Char(char),
-    Code(event::KeyCode),
-    Ctrl(char),
-    Shift(event::KeyCode),
-    ScrollUp,
-    ScrollDown,
-}
-impl KeyDef {
-    pub fn matches(self, event: &event::Event) -> bool {
-        match event {
-            event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
-                use event::{KeyCode, KeyModifiers};
-                match self {
-                    Self::Char(c) => {
-                        if let KeyCode::Char(key_char) = key_event.code {
-                            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                return false;
-                            }
-                            if c.is_alphabetic() {
-                                if c.is_lowercase() {
-                                    key_char == c
-                                        && !key_event.modifiers.contains(KeyModifiers::SHIFT)
-                                } else {
-                                    key_char == c
-                                        || (key_event.modifiers.contains(KeyModifiers::SHIFT)
-                                            && key_char.to_lowercase().next()
-                                                == c.to_lowercase().next())
-                                }
-                            } else {
-                                key_char == c
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    Self::Code(code) => {
-                        key_event.code == code
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                    }
-                    Self::Ctrl(c) => {
-                        if let KeyCode::Char(key_char) = key_event.code {
-                            key_char == c && key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        } else {
-                            false
-                        }
-                    }
-                    Self::Shift(code) => {
-                        key_event.code == code && key_event.modifiers.contains(KeyModifiers::SHIFT)
-                    }
-                    Self::ScrollUp | Self::ScrollDown => false,
-                }
-            }
-            event::Event::Mouse(mouse_event) => match self {
-                Self::ScrollUp => matches!(mouse_event.kind, event::MouseEventKind::ScrollUp),
-                Self::ScrollDown => matches!(mouse_event.kind, event::MouseEventKind::ScrollDown),
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    pub fn format(self) -> &'static str {
-        match self {
-            Self::Char(c) => match c {
-                ' ' => "Space",
-                'q' => "q",
-                'n' => "n",
-                'p' => "p",
-                'i' => "i",
-                'o' => "o",
-                'a' => "a",
-                'r' => "r",
-                'b' => "b",
-                'B' => "B",
-                'c' => "c",
-                'C' => "C",
-                'e' => "e",
-                'E' => "E",
-                'R' => "R",
-                'S' => "S",
-                's' => "s",
-                'I' => "I",
-                'O' => "O",
-                'f' => "f",
-                ':' => ":",
-                '?' => "?",
-                '/' => "/",
-                '[' => "[",
-                ']' => "]",
-                '+' => "+",
-                '=' => "=",
-                '-' => "-",
-                '<' => "<",
-                '>' => ">",
-                'h' => "h",
-                'j' => "j",
-                'k' => "k",
-                'l' => "l",
-                'z' => "z",
-                'x' => "x",
-                'u' => "u",
-                'v' => "v",
-                '1' => "1",
-                '2' => "2",
-                '3' => "3",
-                '4' => "4",
-                '5' => "5",
-                _ => "?",
-            },
-            Self::Code(code) => match code {
-                event::KeyCode::Esc => "Esc",
-                event::KeyCode::Backspace => "Backspace",
-                event::KeyCode::Left => "Left",
-                event::KeyCode::Right => "Right",
-                event::KeyCode::Up => "Up",
-                event::KeyCode::Down => "Down",
-                event::KeyCode::Char(' ') => "Space",
-                _ => "Other",
-            },
-            Self::Ctrl(c) => match c {
-                'k' => "Ctrl+k",
-                'j' => "Ctrl+j",
-                _ => "Ctrl+?",
-            },
-            Self::Shift(_) => "Shift+?",
-            Self::ScrollUp => "Scroll Up",
-            Self::ScrollDown => "Scroll Down",
-        }
-    }
-}
-
-/// User-facing metadata for a Command.
-#[derive(Debug, Clone, Copy)]
-pub struct CommandItem {
-    /// Human-readable name of the command.
-    pub name: &'static str,
-    /// Detailed description of what the command does.
-    pub description: &'static str,
-    /// Whether this command should be searchable/listed inside the command palette.
-    pub show_in_palette: bool,
-    /// Configured shortcuts/triggers associated with this command.
-    pub shortcuts: Option<&'static [KeyDef]>,
-}
-
-/// A wrapper struct coupling a Command variant with its CommandItem metadata
-/// for searchable presentation in lists and palette lookups.
-#[derive(Debug, Clone)]
-pub struct PaletteCommand {
-    /// The executable command variant.
-    pub cmd: Command,
-    /// The metadata presentation associated with the command.
-    pub item: CommandItem,
-    /// Pre-computed lowercase search text format: "name description".
-    pub search_text: String,
-    /// Pre-computed shortcut formatting string.
-    pub shortcut_str: String,
-}
-
-/// Returns a static slice of all available command metadata items.
-pub fn get_commands() -> &'static [PaletteCommand] {
-    static LIST: std::sync::OnceLock<Vec<PaletteCommand>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        <Command as strum::IntoEnumIterator>::iter()
-            .map(|cmd| {
-                let item = cmd.get_metadata();
-                let search_text = format!("{} {}", item.name, item.description).to_lowercase();
-
-                let shortcut_str = item
-                    .shortcuts
-                    .map(|bindings| {
-                        bindings
-                            .iter()
-                            .map(|bind| bind.format())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-
-                PaletteCommand {
-                    cmd,
-                    item,
-                    search_text,
-                    shortcut_str,
-                }
-            })
-            .collect()
-    })
-}
-
-impl std::fmt::Display for KeyDef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.format())
     }
 }
 
