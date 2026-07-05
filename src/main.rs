@@ -94,6 +94,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         initial_filter,
         scale_mode,
         options.no_thumbnail,
+        options.infobar,
     )?;
     if let Some(cfg) = slideshow_opt {
         app.slideshow_config = cfg;

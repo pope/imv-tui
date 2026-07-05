@@ -58,6 +58,7 @@ ______________________________________________________________________
 | **Mark Image as Reject**            | `x`         |                             |
 | **Unflag Image**                    | `u`         |                             |
 | **Cycle View Filter**               | `v`         |                             |
+| **Cycle Infobar Position**          | `V`         |                             |
 | **Jump to View: Unflagged + Picks** | `1`         |                             |
 | **Jump to View: Unflagged Only**    | `2`         |                             |
 | **Jump to View: Picks Only**        | `3`         |                             |
@@ -132,6 +133,7 @@ If no path is specified, it scans and opens images from the current directory (`
 - `-t, --slideshow <seconds>`: Start the slideshow with the given delay in seconds.
 - `-m, --check-magic`: Check file magic bytes on startup (slower on network drives).
 - `--no-thumbnail`: Disable low-res EXIF thumbnail placeholder loading entirely.
+- `--infobar <top|bottom|none>`: Set the position of the status infobar (defaults to `bottom`).
 - `-i, --import <file>`: Import image classification/flagged states from a file (.json or prefix text).
 - `-o, --export <file>`: Export image classification/flagged states to a file on exit (.json or prefix text).
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.

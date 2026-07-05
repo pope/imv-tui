@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::config::InfoBarPosition;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -44,7 +45,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
         let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
-        let y = area.y.saturating_add(1);
+        let y = if app.infobar == InfoBarPosition::Top {
+            area.y
+        } else {
+            area.y.saturating_add(1)
+        };
 
         let popup_area = Rect::new(x, y, w, h);
         frame.render_widget(Clear, popup_area);
@@ -206,7 +211,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().fg(Color::White).bg(Color::Reset));
 
         let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
-        let y = area.y.saturating_add(1);
+        let y = if app.infobar == InfoBarPosition::Top {
+            area.y
+        } else {
+            area.y.saturating_add(1)
+        };
 
         let popup_area = Rect::new(x, y, w, h);
         frame.render_widget(Clear, popup_area);

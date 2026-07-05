@@ -1,4 +1,5 @@
-use crate::imaging::{FilterType, ScaleMode, SlideshowConfig};
+use crate::config::{InfoBarPosition, SlideshowConfig};
+use crate::imaging::{FilterType, ScaleMode};
 use ratatui_image::picker::ProtocolType;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ pub struct CliOptions {
     pub import_path: Option<PathBuf>,
     /// Path to a file to export classification states to on exit.
     pub export_path: Option<PathBuf>,
+    /// Position of the info bar (top, bottom, none).
+    pub infobar: InfoBarPosition,
 }
 
 /// Reads piped file paths from standard input when stdin is not a terminal,
@@ -115,6 +118,7 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
     let mut no_thumbnail = false;
     let mut import_path = None;
     let mut export_path = None;
+    let mut infobar = InfoBarPosition::Bottom;
 
     let mut i = 1;
     while i < args.len() {
@@ -190,6 +194,21 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 no_thumbnail = true;
                 i += 1;
             }
+            "--infobar" => {
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                infobar = match val.to_lowercase().as_str() {
+                    "top" => InfoBarPosition::Top,
+                    "bottom" => InfoBarPosition::Bottom,
+                    "none" => InfoBarPosition::None,
+                    other => {
+                        return Err(format!(
+                            "Error: Unknown infobar position '{}'. Choose from: top, bottom, none",
+                            other
+                        ));
+                    }
+                };
+            }
             "--import" | "-i" => {
                 let flag = args[i].clone();
                 let val = get_arg(&args, &mut i, &flag)?;
@@ -230,6 +249,9 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                 println!(
                     "  -o, --export <file>        Export image classification/flagged states to a file on exit (.json or prefix text)"
                 );
+                println!(
+                    "      --infobar <position>   Position of the info bar: top, bottom, none (defaults to bottom)"
+                );
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
             }
@@ -260,5 +282,6 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
         no_thumbnail,
         import_path,
         export_path,
+        infobar,
     })
 }

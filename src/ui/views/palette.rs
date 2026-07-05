@@ -1,4 +1,5 @@
 use crate::app::{App, PaletteMode};
+use crate::config::InfoBarPosition;
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -160,7 +161,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let w = palette_width.min(area.width.saturating_sub(1));
     let h = palette_height.min(area.height.saturating_sub(1));
     let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
-    let y = area.y.saturating_add(1);
+    let y = if app.infobar == InfoBarPosition::Top {
+        area.y
+    } else {
+        area.y.saturating_add(1)
+    };
 
     let popup_area = Rect::new(x, y, w, h);
 

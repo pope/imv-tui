@@ -5,6 +5,8 @@ pub mod events;
 pub mod palette;
 pub mod queue;
 
+use crate::config::{InfoBarPosition, SlideshowConfig};
+
 pub use adjustments::{Adjustment, ImageAdjustments};
 pub use cache::{CachedImage, PrefetchCache};
 pub use classifications::{
@@ -25,7 +27,7 @@ use std::time::Instant;
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
     Brightness, Contrast, CropBox, FilterType, ImageIntersection, ImageSource, LoaderRequest,
-    LoaderResponse, PanOffset, ResizeRequest, ScaleMode, SlideshowConfig, process_resize,
+    LoaderResponse, PanOffset, ResizeRequest, ScaleMode, process_resize,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -167,6 +169,8 @@ pub struct App {
     pub classifications: Vec<Classification>,
     /// Image adjustments (brightness, contrast, rotation) for each loaded image source.
     pub adjustments: Vec<ImageAdjustments>,
+    /// Position of the info bar (top, bottom, none).
+    pub infobar: InfoBarPosition,
 }
 
 impl App {
@@ -179,6 +183,7 @@ impl App {
         filter_type: FilterType,
         scale_mode: ScaleMode,
         disable_thumbnail: bool,
+        infobar: InfoBarPosition,
     ) -> Result<Self, String> {
         let queue = ImageQueue::new(images, current_index)?;
 
@@ -348,6 +353,7 @@ impl App {
             view_mode: ViewMode::Default,
             classifications: vec![Classification::Unflagged; num_images],
             adjustments: vec![ImageAdjustments::default(); num_images],
+            infobar,
         };
 
         app.start_load_image();
@@ -737,6 +743,30 @@ impl App {
             Command::SetViewPicks => self.set_view_mode(ViewMode::Picks),
             Command::SetViewRejects => self.set_view_mode(ViewMode::Rejects),
             Command::SetViewAll => self.set_view_mode(ViewMode::All),
+            Command::SetInfoBarTop => {
+                self.infobar = InfoBarPosition::Top;
+                self.needs_update = true;
+                self.needs_clear = true;
+            }
+            Command::SetInfoBarBottom => {
+                self.infobar = InfoBarPosition::Bottom;
+                self.needs_update = true;
+                self.needs_clear = true;
+            }
+            Command::SetInfoBarNone => {
+                self.infobar = InfoBarPosition::None;
+                self.needs_update = true;
+                self.needs_clear = true;
+            }
+            Command::CycleInfoBar => {
+                self.infobar = match self.infobar {
+                    InfoBarPosition::Bottom => InfoBarPosition::Top,
+                    InfoBarPosition::Top => InfoBarPosition::None,
+                    InfoBarPosition::None => InfoBarPosition::Bottom,
+                };
+                self.needs_update = true;
+                self.needs_clear = true;
+            }
         }
     }
 
@@ -1821,6 +1851,7 @@ mod tests {
             crate::imaging::FilterType::Nearest,
             crate::imaging::ScaleMode::Shrink,
             true,
+            InfoBarPosition::Bottom,
         )
         .unwrap();
 

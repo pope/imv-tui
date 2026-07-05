@@ -127,6 +127,14 @@ pub enum Command {
     ShowInfo,
     /// Toggle showing the low-res EXIF thumbnail placeholder only (for testing).
     ToggleThumbnail,
+    /// Set infobar position to Top.
+    SetInfoBarTop,
+    /// Set infobar position to Bottom.
+    SetInfoBarBottom,
+    /// Set infobar position to None.
+    SetInfoBarNone,
+    /// Cycle infobar position.
+    CycleInfoBar,
 }
 
 impl Command {
@@ -454,6 +462,30 @@ impl Command {
                 description: "Toggle displaying the low-res EXIF thumbnail for testing",
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('m')]),
+            },
+            Self::SetInfoBarTop => CommandItem {
+                name: "Set Infobar Top",
+                description: "Set status infobar position to top",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetInfoBarBottom => CommandItem {
+                name: "Set Infobar Bottom",
+                description: "Set status infobar position to bottom",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::SetInfoBarNone => CommandItem {
+                name: "Set Infobar None",
+                description: "Hide the status infobar",
+                show_in_palette: true,
+                shortcuts: None,
+            },
+            Self::CycleInfoBar => CommandItem {
+                name: "Cycle Infobar Position",
+                description: "Cycle status infobar position (top, bottom, none)",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('V')]),
             },
         }
     }
