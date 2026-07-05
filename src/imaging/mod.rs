@@ -499,10 +499,10 @@ pub fn process_resize(
     };
 
     if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
-        if req.brightness.value() != 0 {
+        if !req.brightness.is_zero() {
             image::imageops::colorops::brighten_in_place(rgba_canvas, req.brightness.value());
         }
-        if req.contrast.value() != 0.0 {
+        if !req.contrast.is_zero() {
             image::imageops::colorops::contrast_in_place(rgba_canvas, req.contrast.value());
         }
     }

@@ -133,16 +133,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         ]));
         lines.push(Line::from(vec![
             " Brightness: ".bold().cyan(),
-            format!("{:+}", app.brightness.value()).into(),
+            format!("{:+}", app.current_brightness().value()).into(),
         ]));
         lines.push(Line::from(vec![
             " Contrast: ".bold().cyan(),
-            format!("{:+}%", app.contrast.value().round() as i32).into(),
+            format!("{:+}%", app.current_contrast().value().round() as i32).into(),
         ]));
         let rotation = app
             .adjustments
             .get(app.queue.current_index)
-            .map(|adj| adj.rotation)
+            .map(|adj| adj.rotation.to_degrees())
             .unwrap_or(0);
         lines.push(Line::from(vec![
             " Rotation: ".bold().cyan(),

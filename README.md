@@ -40,8 +40,9 @@ ______________________________________________________________________
 | **Zoom Out**                        | `o`         | `-` / Mouse Scroll Down     |
 | **Zoom Out (predefined levels)**    | `O`         |                             |
 | **Actual Size (100% Zoom)**         | `a`         |                             |
-| **Reset View (Fit Screen)**         | `r`         |                             |
-| **Rotate Clockwise (90°)**          | `e`         | `R` / `>`                   |
+| **Reset View**                      | `r`         |                             |
+| **Reset Image**                     | `R`         |                             |
+| **Rotate Clockwise (90°)**          | `e`         | `>`                         |
 | **Rotate Counter-Clockwise (90°)**  | `E`         | `<`                         |
 | **Brightness Increase / Decrease**  | `b` / `B`   |                             |
 | **Contrast Increase / Decrease**    | `c` / `C`   |                             |

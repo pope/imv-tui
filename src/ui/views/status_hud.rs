@@ -23,13 +23,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(empty_para, inner_rect);
     } else {
         let mut extra_info = String::new();
-        if app.brightness.value() != 0 {
-            extra_info.push_str(&format!(" | Brightness: {:+}", app.brightness.value()));
+        let curr_brightness = app.current_brightness();
+        if !curr_brightness.is_zero() {
+            extra_info.push_str(&format!(" | Brightness: {:+}", curr_brightness.value()));
         }
-        if app.contrast.value() != 0.0 {
+        let curr_contrast = app.current_contrast();
+        if !curr_contrast.is_zero() {
             extra_info.push_str(&format!(
                 " | Contrast: {:+}%",
-                app.contrast.value().round() as i32
+                curr_contrast.value().round() as i32
             ));
         }
         if app.slideshow_state.is_active() {

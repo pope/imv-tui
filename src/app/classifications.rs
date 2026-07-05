@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::app::adjustments::ImageAdjustments;
 use crate::imaging::ImageSource;
+use crate::imaging::types::{Brightness, Contrast, Rotation};
 
 /// The classification/flagged state for an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,12 +69,12 @@ pub struct ClassificationJsonItem {
     pub filename: String,
     pub flag: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub brightness: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contrast: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rotation: Option<u32>,
+    #[serde(default, skip_serializing_if = "Brightness::is_zero")]
+    pub brightness: Brightness,
+    #[serde(default, skip_serializing_if = "Contrast::is_zero")]
+    pub contrast: Contrast,
+    #[serde(default, skip_serializing_if = "Rotation::is_zero")]
+    pub rotation: Rotation,
 }
 
 pub fn is_image_visible(
@@ -117,9 +118,9 @@ pub fn import_from_file(
                 _ => Classification::Unflagged,
             };
             let adj = ImageAdjustments {
-                brightness: item.brightness.unwrap_or(0),
-                contrast: item.contrast.unwrap_or(0.0),
-                rotation: item.rotation.unwrap_or(0),
+                brightness: item.brightness,
+                contrast: item.contrast,
+                rotation: item.rotation,
             };
             let key = if let Some(ref archive_path) = item.archive {
                 format!("{}::{}", archive_path, item.filename)
@@ -168,11 +169,7 @@ pub fn export_to_file(
         let adj = adjustments.get(idx).cloned().unwrap_or_default();
 
         // Only export if image is flagged OR has non-default adjustments
-        if class == Classification::Unflagged
-            && adj.brightness == 0
-            && adj.contrast == 0.0
-            && adj.rotation == 0
-        {
+        if class == Classification::Unflagged && adj == ImageAdjustments::default() {
             continue;
         }
 
@@ -213,29 +210,13 @@ pub fn export_to_file(
             Classification::Unflagged => "unflagged",
         };
 
-        let brightness = if adj.brightness != 0 {
-            Some(adj.brightness)
-        } else {
-            None
-        };
-        let contrast = if adj.contrast != 0.0 {
-            Some(adj.contrast)
-        } else {
-            None
-        };
-        let rotation = if adj.rotation != 0 {
-            Some(adj.rotation)
-        } else {
-            None
-        };
-
         json_items.push(ClassificationJsonItem {
             archive,
             filename,
             flag: flag_str.to_string(),
-            brightness,
-            contrast,
-            rotation,
+            brightness: adj.brightness,
+            contrast: adj.contrast,
+            rotation: adj.rotation,
         });
 
         // For text export: only write if flagged

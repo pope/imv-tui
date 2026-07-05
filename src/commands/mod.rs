@@ -39,8 +39,10 @@ pub enum Command {
     PredefinedZoomOut,
     /// Scale image to 100% zoom (1:1 actual pixels).
     ActualSize,
-    /// Reset the zoom factor, pan, brightness, and contrast.
+    /// Reset the zoom factor and pan offset.
     ResetView,
+    /// Reset the brightness and contrast adjustments.
+    ResetImage,
     /// Brighten the image (increment).
     IncreaseBrightness,
     /// Contrast the image (increment).
@@ -152,9 +154,15 @@ impl Command {
         match self {
             Self::ResetView => CommandItem {
                 name: "Reset View",
-                description: "Reset View",
+                description: "Reset zoom and pan offset",
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('r')]),
+            },
+            Self::ResetImage => CommandItem {
+                name: "Reset Image",
+                description: "Reset brightness and contrast adjustments",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char('R')]),
             },
             Self::ActualSize => CommandItem {
                 name: "Actual Size",
@@ -166,7 +174,7 @@ impl Command {
                 name: "Rotate Clockwise",
                 description: "Rotate CW 90°",
                 show_in_palette: true,
-                shortcuts: Some(&[KeyDef::Char('e'), KeyDef::Char('R'), KeyDef::Char('>')]),
+                shortcuts: Some(&[KeyDef::Char('e'), KeyDef::Char('>')]),
             },
             Self::RotateCounterClockwise => CommandItem {
                 name: "Rotate Counter-Clockwise",

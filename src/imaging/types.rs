@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// Resizing filter types for scaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterType {
@@ -58,7 +60,8 @@ impl ScaleMode {
 }
 
 /// Represents an image brightness adjustment value restricted to [-255, 255].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Brightness(i32);
 
 impl Brightness {
@@ -73,6 +76,11 @@ impl Brightness {
     /// Access the underlying raw i32 value.
     pub fn value(self) -> i32 {
         self.0
+    }
+
+    /// Returns true if this brightness adjustment is zero.
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
     }
 
     /// Mutably adjust by a delta, clamping internally.
@@ -91,7 +99,8 @@ impl std::str::FromStr for Brightness {
 }
 
 /// Represents an image contrast adjustment value restricted to [-255.0, 255.0].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Contrast(f32);
 
 impl Contrast {
@@ -110,6 +119,11 @@ impl Contrast {
     /// Access the underlying raw f32 value.
     pub fn value(self) -> f32 {
         self.0
+    }
+
+    /// Returns true if this contrast adjustment is zero.
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0.0
     }
 
     /// Mutably adjust by a delta, clamping internally.
@@ -141,6 +155,86 @@ impl std::str::FromStr for Contrast {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let val = s.trim().parse::<f32>()?;
         Ok(Self::new(val))
+    }
+}
+
+/// Represents an image rotation in 90-degree increments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rotation {
+    /// No rotation (0 degrees).
+    #[default]
+    D0,
+    /// 90 degrees clockwise rotation.
+    D90,
+    /// 180 degrees rotation.
+    D180,
+    /// 270 degrees clockwise rotation.
+    D270,
+}
+
+impl Rotation {
+    /// Constructs a `Rotation` from degrees, rounding/modulo to 90 degree increments.
+    pub fn from_degrees(deg: u32) -> Self {
+        match deg % 360 {
+            90 => Self::D90,
+            180 => Self::D180,
+            270 => Self::D270,
+            _ => Self::D0,
+        }
+    }
+
+    /// Converts the `Rotation` into its degree numeric representation.
+    pub fn to_degrees(self) -> u32 {
+        match self {
+            Self::D0 => 0,
+            Self::D90 => 90,
+            Self::D180 => 180,
+            Self::D270 => 270,
+        }
+    }
+
+    /// Returns true if this rotation adjustment is zero degrees.
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Self::D0)
+    }
+
+    /// Returns the rotation resulting from turning clockwise by 90 degrees.
+    pub fn rotate_clockwise(self) -> Self {
+        match self {
+            Self::D0 => Self::D90,
+            Self::D90 => Self::D180,
+            Self::D180 => Self::D270,
+            Self::D270 => Self::D0,
+        }
+    }
+
+    /// Returns the rotation resulting from turning counter-clockwise by 90 degrees.
+    pub fn rotate_counter_clockwise(self) -> Self {
+        match self {
+            Self::D0 => Self::D270,
+            Self::D90 => Self::D0,
+            Self::D180 => Self::D90,
+            Self::D270 => Self::D180,
+        }
+    }
+}
+
+impl Serialize for Rotation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.to_degrees())
+    }
+}
+
+impl<'de> Deserialize<'de> for Rotation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let deg = u32::deserialize(deserializer)?;
+        Ok(Self::from_degrees(deg))
     }
 }
 

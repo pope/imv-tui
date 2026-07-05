@@ -40,31 +40,23 @@ impl<T: FromStr> FromStr for Adjustment<T> {
     }
 }
 
-/// Individual image adjustments (brightness, contrast, rotation) that are preserved per-file.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct ImageAdjustments {
-    pub brightness: i32,
-    pub contrast: f32,
-    pub rotation: u32,
-}
+use crate::imaging::types::{Brightness, Contrast, Rotation};
 
-impl Default for ImageAdjustments {
-    fn default() -> Self {
-        Self {
-            brightness: 0,
-            contrast: 0.0,
-            rotation: 0,
-        }
-    }
+/// Individual image adjustments (brightness, contrast, rotation) that are preserved per-file.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct ImageAdjustments {
+    pub brightness: Brightness,
+    pub contrast: Contrast,
+    pub rotation: Rotation,
 }
 
 impl ImageAdjustments {
     /// Applies the rotation setting to the given DynamicImage. Returns None if no rotation is needed.
     pub fn rotate_image(&self, img: &DynamicImage) -> Option<DynamicImage> {
         match self.rotation {
-            90 => Some(img.rotate90()),
-            180 => Some(img.rotate180()),
-            270 => Some(img.rotate270()),
+            Rotation::D90 => Some(img.rotate90()),
+            Rotation::D180 => Some(img.rotate180()),
+            Rotation::D270 => Some(img.rotate270()),
             _ => None,
         }
     }

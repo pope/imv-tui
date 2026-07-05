@@ -27,7 +27,8 @@ use std::time::Instant;
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
     Brightness, Contrast, CropBox, DecodedImage, FilterType, ImageIntersection, ImageSource,
-    LoaderRequest, LoaderResponse, PanOffset, ResizeRequest, ScaleMode, ZoomFactor, process_resize,
+    LoaderRequest, LoaderResponse, PanOffset, ResizeRequest, Rotation, ScaleMode, ZoomFactor,
+    process_resize,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -148,10 +149,6 @@ pub struct App {
     pub clear_on_protocol_receive: bool,
     /// Flag to force scale mode view recalculation on load.
     pub zoom_needs_initialization: bool,
-    /// Active brightness bias value.
-    pub brightness: Brightness,
-    /// Active contrast bias value.
-    pub contrast: Contrast,
     prefetch_cache: PrefetchCache,
     /// The slideshow state.
     pub slideshow_state: SlideshowState,
@@ -341,8 +338,6 @@ impl App {
             loading_start_time: None,
             clear_on_protocol_receive: false,
             zoom_needs_initialization: false,
-            brightness: Brightness::ZERO,
-            contrast: Contrast::ZERO,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
             slideshow_state: SlideshowState::OFF,
             slideshow_last_transition: std::time::Instant::now(),
@@ -487,17 +482,6 @@ impl App {
             .unwrap_or(Classification::Unflagged)
     }
 
-    fn sync_current_adjustments(&mut self) {
-        if self.queue.images.is_empty() {
-            return;
-        }
-        let idx = self.queue.current_index;
-        if idx < self.adjustments.len() {
-            self.adjustments[idx].brightness = self.brightness.value();
-            self.adjustments[idx].contrast = self.contrast.value();
-        }
-    }
-
     /// Imports image classification states and adjustments from a text file or a JSON manifest.
     pub fn import_classifications(&mut self, import_path: &std::path::Path) -> Result<(), String> {
         let imported = import_from_file(import_path)?;
@@ -629,6 +613,7 @@ impl App {
     pub fn execute_command(&mut self, cmd: Command) {
         match cmd {
             Command::ResetView => self.reset_view(),
+            Command::ResetImage => self.reset_image(),
             Command::ActualSize => self.set_actual_size(),
             Command::RotateClockwise => self.rotate_clockwise(),
             Command::RotateCounterClockwise => self.rotate_counter_clockwise(),
@@ -883,38 +868,48 @@ impl App {
                 if self.original_image.is_none() {
                     return;
                 }
-                let input = self.palette_query.trim();
-                let Ok(adj) = input.parse::<Adjustment<i32>>() else {
-                    return;
-                };
-                let old = self.brightness;
-                match adj {
-                    Adjustment::Absolute(val) => self.brightness = Brightness::new(val),
-                    Adjustment::RelativeAdd(val) => self.brightness.adjust(val),
-                    Adjustment::RelativeSub(val) => self.brightness.adjust(-val),
-                }
-                if old != self.brightness {
-                    self.sync_current_adjustments();
-                    self.needs_update = true;
+                let idx = self.queue.current_index;
+                if idx < self.adjustments.len() {
+                    let input = self.palette_query.trim();
+                    let Ok(adj) = input.parse::<Adjustment<i32>>() else {
+                        return;
+                    };
+                    let old = self.adjustments[idx].brightness;
+                    match adj {
+                        Adjustment::Absolute(val) => {
+                            self.adjustments[idx].brightness = Brightness::new(val)
+                        }
+                        Adjustment::RelativeAdd(val) => {
+                            self.adjustments[idx].brightness.adjust(val)
+                        }
+                        Adjustment::RelativeSub(val) => {
+                            self.adjustments[idx].brightness.adjust(-val)
+                        }
+                    }
+                    if old != self.adjustments[idx].brightness {
+                        self.needs_update = true;
+                    }
                 }
             }
             PromptType::SetContrast => {
                 if self.original_image.is_none() {
                     return;
                 }
-                let input = self.palette_query.trim();
-                let Ok(adj) = input.parse::<Adjustment<f32>>() else {
-                    return;
-                };
-                let mut next = self.contrast;
-                match adj {
-                    Adjustment::Absolute(val) => next = Contrast::new(val),
-                    Adjustment::RelativeAdd(val) => next.adjust(val),
-                    Adjustment::RelativeSub(val) => next.adjust(-val),
-                }
-                if self.contrast.update(next.value()) {
-                    self.sync_current_adjustments();
-                    self.needs_update = true;
+                let idx = self.queue.current_index;
+                if idx < self.adjustments.len() {
+                    let input = self.palette_query.trim();
+                    let Ok(adj) = input.parse::<Adjustment<f32>>() else {
+                        return;
+                    };
+                    let mut next = self.adjustments[idx].contrast;
+                    match adj {
+                        Adjustment::Absolute(val) => next = Contrast::new(val),
+                        Adjustment::RelativeAdd(val) => next.adjust(val),
+                        Adjustment::RelativeSub(val) => next.adjust(-val),
+                    }
+                    if self.adjustments[idx].contrast.update(next.value()) {
+                        self.needs_update = true;
+                    }
                 }
             }
             PromptType::SetSlideshow => {
@@ -996,8 +991,6 @@ impl App {
             .get(self.queue.current_index)
             .copied()
             .unwrap_or_default();
-        self.brightness = Brightness::new(adj.brightness);
-        self.contrast = Contrast::new(adj.contrast);
 
         // Check if the image is in the prefetch cache
         let cached = {
@@ -1154,7 +1147,9 @@ impl App {
                             .unwrap_or(shared_img);
 
                         if resp.is_thumbnail {
-                            let (orig_w, orig_h) = if adj.rotation == 90 || adj.rotation == 270 {
+                            let (orig_w, orig_h) = if adj.rotation == Rotation::D90
+                                || adj.rotation == Rotation::D270
+                            {
                                 (h, w)
                             } else {
                                 (w, h)
@@ -1368,8 +1363,8 @@ impl App {
                 target_h,
                 filter_type: self.filter_type,
                 picker: self.picker.clone(),
-                brightness: self.brightness,
-                contrast: self.contrast,
+                brightness: self.current_brightness(),
+                contrast: self.current_contrast(),
                 rendered_size_cells: rendered_cells,
                 sequence: self.current_sequence,
             };
@@ -1402,6 +1397,26 @@ impl App {
         let s_w = widget_w_px / self.img_width as f64;
         let s_h = widget_h_px / self.img_height as f64;
         s_w.min(s_h)
+    }
+
+    pub fn current_brightness(&self) -> Brightness {
+        if self.queue.images.is_empty() {
+            return Brightness::ZERO;
+        }
+        self.adjustments
+            .get(self.queue.current_index)
+            .map(|adj| adj.brightness)
+            .unwrap_or(Brightness::ZERO)
+    }
+
+    pub fn current_contrast(&self) -> Contrast {
+        if self.queue.images.is_empty() {
+            return Contrast::ZERO;
+        }
+        self.adjustments
+            .get(self.queue.current_index)
+            .map(|adj| adj.contrast)
+            .unwrap_or(Contrast::ZERO)
     }
 
     pub fn should_clear_on_update(&self) -> bool {
@@ -1582,10 +1597,20 @@ impl App {
             return;
         }
         self.apply_scale_mode();
-        self.brightness = Brightness::ZERO;
-        self.contrast = Contrast::ZERO;
-        self.sync_current_adjustments();
         self.clear_on_protocol_receive = true;
+    }
+
+    pub fn reset_image(&mut self) {
+        if self.queue.images.is_empty() {
+            return;
+        }
+        let idx = self.queue.current_index;
+        if idx < self.adjustments.len() {
+            self.adjustments[idx].rotation = Rotation::D0;
+            self.adjustments[idx].brightness = Brightness::ZERO;
+            self.adjustments[idx].contrast = Contrast::ZERO;
+        }
+        self.start_load_image();
     }
 
     pub fn apply_scale_mode(&mut self) {
@@ -1641,11 +1666,13 @@ impl App {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        let old = self.brightness;
-        self.brightness.adjust(10);
-        if old != self.brightness {
-            self.sync_current_adjustments();
-            self.needs_update = true;
+        let idx = self.queue.current_index;
+        if idx < self.adjustments.len() {
+            let old = self.adjustments[idx].brightness;
+            self.adjustments[idx].brightness.adjust(10);
+            if old != self.adjustments[idx].brightness {
+                self.needs_update = true;
+            }
         }
     }
 
@@ -1653,11 +1680,13 @@ impl App {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        let old = self.brightness;
-        self.brightness.adjust(-10);
-        if old != self.brightness {
-            self.sync_current_adjustments();
-            self.needs_update = true;
+        let idx = self.queue.current_index;
+        if idx < self.adjustments.len() {
+            let old = self.adjustments[idx].brightness;
+            self.adjustments[idx].brightness.adjust(-10);
+            if old != self.adjustments[idx].brightness {
+                self.needs_update = true;
+            }
         }
     }
 
@@ -1665,11 +1694,13 @@ impl App {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        let mut next = self.contrast;
-        next.adjust(10.0);
-        if self.contrast.update(next.value()) {
-            self.sync_current_adjustments();
-            self.needs_update = true;
+        let idx = self.queue.current_index;
+        if idx < self.adjustments.len() {
+            let mut next = self.adjustments[idx].contrast;
+            next.adjust(10.0);
+            if self.adjustments[idx].contrast.update(next.value()) {
+                self.needs_update = true;
+            }
         }
     }
 
@@ -1677,11 +1708,13 @@ impl App {
         if self.original_image.is_none() || self.is_loading {
             return;
         }
-        let mut next = self.contrast;
-        next.adjust(-10.0);
-        if self.contrast.update(next.value()) {
-            self.sync_current_adjustments();
-            self.needs_update = true;
+        let idx = self.queue.current_index;
+        if idx < self.adjustments.len() {
+            let mut next = self.adjustments[idx].contrast;
+            next.adjust(-10.0);
+            if self.adjustments[idx].contrast.update(next.value()) {
+                self.needs_update = true;
+            }
         }
     }
 
@@ -1768,7 +1801,7 @@ impl App {
 
             let idx = self.queue.current_index;
             if idx < self.adjustments.len() {
-                self.adjustments[idx].rotation = (self.adjustments[idx].rotation + 90) % 360;
+                self.adjustments[idx].rotation = self.adjustments[idx].rotation.rotate_clockwise();
             }
 
             self.zoom_factor = ZoomFactor::DEFAULT;
@@ -1794,7 +1827,8 @@ impl App {
 
             let idx = self.queue.current_index;
             if idx < self.adjustments.len() {
-                self.adjustments[idx].rotation = (self.adjustments[idx].rotation + 270) % 360;
+                self.adjustments[idx].rotation =
+                    self.adjustments[idx].rotation.rotate_counter_clockwise();
             }
 
             self.zoom_factor = ZoomFactor::DEFAULT;
@@ -1900,14 +1934,14 @@ mod tests {
         app.classifications[2] = Classification::Pick;
 
         app.adjustments[0] = ImageAdjustments {
-            brightness: 20,
-            contrast: 15.0,
-            rotation: 90,
+            brightness: Brightness::new(20),
+            contrast: Contrast::new(15.0),
+            rotation: Rotation::D90,
         };
         app.adjustments[2] = ImageAdjustments {
-            brightness: -30,
-            contrast: 0.0,
-            rotation: 180,
+            brightness: Brightness::new(-30),
+            contrast: Contrast::ZERO,
+            rotation: Rotation::D180,
         };
 
         // Test Export to JSON
@@ -1919,20 +1953,20 @@ mod tests {
         assert_eq!(parsed_json.len(), 3);
         assert_eq!(parsed_json[0].flag, "picked");
         assert_eq!(parsed_json[0].archive, None);
-        assert_eq!(parsed_json[0].brightness, Some(20));
-        assert_eq!(parsed_json[0].contrast, Some(15.0));
-        assert_eq!(parsed_json[0].rotation, Some(90));
+        assert_eq!(parsed_json[0].brightness, Brightness::new(20));
+        assert_eq!(parsed_json[0].contrast, Contrast::new(15.0));
+        assert_eq!(parsed_json[0].rotation, Rotation::D90);
         assert_eq!(parsed_json[1].flag, "rejected");
         assert_eq!(parsed_json[1].archive, None);
-        assert_eq!(parsed_json[1].brightness, None);
-        assert_eq!(parsed_json[1].contrast, None);
-        assert_eq!(parsed_json[1].rotation, None);
+        assert_eq!(parsed_json[1].brightness, Brightness::ZERO);
+        assert_eq!(parsed_json[1].contrast, Contrast::ZERO);
+        assert_eq!(parsed_json[1].rotation, Rotation::D0);
         assert_eq!(parsed_json[2].flag, "picked");
         assert!(parsed_json[2].archive.is_some());
         assert_eq!(parsed_json[2].filename, "page1.png");
-        assert_eq!(parsed_json[2].brightness, Some(-30));
-        assert_eq!(parsed_json[2].contrast, None);
-        assert_eq!(parsed_json[2].rotation, Some(180));
+        assert_eq!(parsed_json[2].brightness, Brightness::new(-30));
+        assert_eq!(parsed_json[2].contrast, Contrast::ZERO);
+        assert_eq!(parsed_json[2].rotation, Rotation::D180);
 
         // Test Export to Text
         app.export_classifications(&txt_path).unwrap();
@@ -1954,12 +1988,12 @@ mod tests {
         assert_eq!(app.classifications[0], Classification::Pick);
         assert_eq!(app.classifications[1], Classification::Reject);
         assert_eq!(app.classifications[2], Classification::Pick);
-        assert_eq!(app.adjustments[0].brightness, 20);
-        assert_eq!(app.adjustments[0].contrast, 15.0);
-        assert_eq!(app.adjustments[0].rotation, 90);
-        assert_eq!(app.adjustments[2].brightness, -30);
-        assert_eq!(app.adjustments[2].contrast, 0.0);
-        assert_eq!(app.adjustments[2].rotation, 180);
+        assert_eq!(app.adjustments[0].brightness, Brightness::new(20));
+        assert_eq!(app.adjustments[0].contrast, Contrast::new(15.0));
+        assert_eq!(app.adjustments[0].rotation, Rotation::D90);
+        assert_eq!(app.adjustments[2].brightness, Brightness::new(-30));
+        assert_eq!(app.adjustments[2].contrast, Contrast::ZERO);
+        assert_eq!(app.adjustments[2].rotation, Rotation::D180);
 
         // Clear classifications and adjustments again
         app.classifications = vec![Classification::Unflagged; 3];
