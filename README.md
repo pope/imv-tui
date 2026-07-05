@@ -14,7 +14,6 @@ ______________________________________________________________________
 - **Manga/Comic CBZ & ZIP Support**: Open and flip through compressed `.cbz` and `.zip` archives directly. Pages are sorted alphabetically and loaded asynchronously.
 - **Image Manipulation Adjustments**: Adjust brightness and contrast in real-time. Operations are processed asynchronously on background threads for fluid performance.
 - **Header-Based Magic Byte Verification**: Intelligently identifies images and zip files by reading their headers, allowing images with missing or incorrect file extensions to load perfectly.
-- **Decoded Format Nerd Font Icons**: Intelligently parses magic bytes and matches the decoded format with clean Material Nerd Font icons in the status bar (e.g., JPEG, PNG, GIF) to easily spot files with incorrect extensions.
 - **Three-Section Info Bar**: Formats status metadata at the bottom of the screen into three cleanly aligned sections: image sequence & dimensions on the left, scaling/panning parameters centered in the middle, and command palette discovery shortcut on the right.
 - **Smart Aspect-Ratio Padding Compression**: When zoomed out, images sit centered with empty border spaces (padding). As you zoom in, the borders automatically shrink and disappear, scaling the image to fully cover the terminal space.
 - **Pixel-Perfect Deep Zooming**: Supports zooming beyond a 1:1 pixel scale (up to 10000%) with clean Nearest Neighbor scaling—perfect for inspection and pixel-art view.

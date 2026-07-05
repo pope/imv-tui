@@ -122,8 +122,8 @@ pub struct LoaderRequest {
 pub struct LoaderResponse {
     /// File index inside the App source list.
     pub idx: usize,
-    /// The decode result containing the dynamic image, width, height, icon, and file size.
-    pub result: Result<(DynamicImage, u32, u32, &'static str, u64), String>,
+    /// The decode result containing the dynamic image, width, height, and file size.
+    pub result: Result<(DynamicImage, u32, u32, u64), String>,
     /// Whether this was a background prefetch request.
     pub is_prefetch: bool,
     /// Navigation sequence identifier of the load request.
@@ -224,7 +224,7 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
 pub fn decode_image_bytes(
     bytes: &[u8],
     source: &ImageSource,
-) -> Result<(DynamicImage, u32, u32, &'static str, u64), String> {
+) -> Result<(DynamicImage, u32, u32, u64), String> {
     let file_size = bytes.len() as u64;
     let format = image::guess_format(bytes).ok();
     let display_name = source.display_name();
@@ -253,7 +253,7 @@ pub fn decode_image_bytes(
             img.apply_orientation(orientation);
             let w = img.width();
             let h = img.height();
-            return Ok((img, w, h, "\u{F0225}", file_size));
+            return Ok((img, w, h, file_size));
         }
     }
 
@@ -266,14 +266,6 @@ pub fn decode_image_bytes(
                 display_name, e
             )
         })?;
-
-    let fmt = reader.format();
-    let icon = match fmt {
-        Some(image::ImageFormat::Jpeg) => "\u{F0225}",
-        Some(image::ImageFormat::Png) => "\u{F0E2D}",
-        Some(image::ImageFormat::Gif) => "\u{F0D78}",
-        _ => "\u{F021F}",
-    };
 
     let mut decoder = reader
         .into_decoder()
@@ -289,20 +281,12 @@ pub fn decode_image_bytes(
     let rgba_img = img.to_rgba8();
     let w = rgba_img.width();
     let h = rgba_img.height();
-    Ok((
-        image::DynamicImage::ImageRgba8(rgba_img),
-        w,
-        h,
-        icon,
-        file_size,
-    ))
+    Ok((image::DynamicImage::ImageRgba8(rgba_img), w, h, file_size))
 }
 
 /// Decodes an image from local paths or comic book archives.
 /// Employs zune-jpeg for extremely fast decoding of JPEGs.
-pub fn decode_image_source(
-    source: ImageSource,
-) -> Result<(DynamicImage, u32, u32, &'static str, u64), String> {
+pub fn decode_image_source(source: ImageSource) -> Result<(DynamicImage, u32, u32, u64), String> {
     let bytes = read_source_bytes(&source)?;
     decode_image_bytes(&bytes, &source)
 }

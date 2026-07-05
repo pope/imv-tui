@@ -130,8 +130,6 @@ pub struct App {
     pub scale_mode: ScaleMode,
     /// The fuzzy matching search engine instance.
     pub matcher: nucleo::Matcher,
-    /// Nerd font decoration icon matching the file extension.
-    pub current_icon: &'static str,
 
     // Thread communication channels
     resize_tx: mpsc::Sender<ResizeRequest>,
@@ -256,10 +254,7 @@ impl App {
                                 let _ = response_tx.send(LoaderResponse {
                                     idx: r.idx,
                                     result: Ok((
-                                        thumb_img,
-                                        real_w,
-                                        real_h,
-                                        "\u{F0225}",
+                                        thumb_img, real_w, real_h,
                                         0, // Filled in by final high-res response
                                     )),
                                     is_prefetch: r.is_prefetch,
@@ -332,7 +327,6 @@ impl App {
             filter_type,
             scale_mode,
             matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT),
-            current_icon: "\u{F021F}",
             resize_tx,
             protocol_rx,
             loader_tx,
@@ -1012,7 +1006,6 @@ impl App {
                 self.stats.thumbnail_dimensions = None;
             }
 
-            self.current_icon = cached_img.icon;
             self.zoom_factor = 1.0;
             self.pan_offset = PanOffset::ZERO;
             self.is_loading = false;
@@ -1064,7 +1057,7 @@ impl App {
             }
 
             match resp.result {
-                Ok((img, w, h, icon, disk_size)) => {
+                Ok((img, w, h, disk_size)) => {
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
                         let window_indices = self.get_sliding_window_indices();
@@ -1082,7 +1075,6 @@ impl App {
                                             thumbnail: Some(shared_img),
                                             width: w,
                                             height: h,
-                                            icon,
                                             decode_duration: std::time::Duration::ZERO,
                                             thumbnail_decode_duration: resp.decode_duration,
                                             disk_size,
@@ -1094,7 +1086,6 @@ impl App {
                                     cached.image = Some(shared_img);
                                     cached.width = w;
                                     cached.height = h;
-                                    cached.icon = icon;
                                     cached.decode_duration = resp.decode_duration;
                                     cached.disk_size = disk_size;
                                 } else {
@@ -1105,7 +1096,6 @@ impl App {
                                             thumbnail: None,
                                             width: w,
                                             height: h,
-                                            icon,
                                             decode_duration: resp.decode_duration,
                                             thumbnail_decode_duration: std::time::Duration::ZERO,
                                             disk_size,
@@ -1129,7 +1119,6 @@ impl App {
                             };
                             self.img_width = orig_w;
                             self.img_height = orig_h;
-                            self.current_icon = icon;
                             let thumb_w = rotated_img.width();
                             let thumb_h = rotated_img.height();
                             self.original_image = Some(rotated_img.clone());
@@ -1145,7 +1134,6 @@ impl App {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();
                             self.original_image = Some(rotated_img);
-                            self.current_icon = icon;
                             self.error_message = None;
                             self.is_loading = false;
                             self.needs_update = true;
