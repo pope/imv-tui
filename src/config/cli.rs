@@ -106,9 +106,16 @@ fn get_arg(args: &[String], i: &mut usize, flag: &str) -> Result<String, String>
     }
 }
 
-/// Parses the command-line options from environment arguments.
 pub fn parse_cli_args() -> Result<CliOptions, String> {
-    let args: Vec<String> = std::env::args().collect();
+    parse_cli_args_from(std::env::args())
+}
+
+/// Parses the command-line options from any string argument iterator.
+pub fn parse_cli_args_from<I>(args_iter: I) -> Result<CliOptions, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args_iter.into_iter().collect();
     let mut initial_path: Option<PathBuf> = None;
     let mut filter = FilterType::Nearest;
     let mut protocol = None;
@@ -118,6 +125,7 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
     let mut no_thumbnail = false;
     let mut import_path = None;
     let mut export_path = None;
+    let mut sync_path = None;
     let mut infobar = InfoBarPosition::Bottom;
 
     let mut i = 1;
@@ -209,6 +217,11 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                     }
                 };
             }
+            "--sync" | "-r" => {
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                sync_path = Some(PathBuf::from(val));
+            }
             "--import" | "-i" => {
                 let flag = args[i].clone();
                 let val = get_arg(&args, &mut i, &flag)?;
@@ -250,6 +263,9 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
                     "  -o, --export <file>        Export image classification/flagged states to a file on exit (.json or prefix text)"
                 );
                 println!(
+                    "  -r, --sync <file>          Sync image classification/flagged states with a file (imports on startup, exports on exit)"
+                );
+                println!(
                     "      --infobar <position>   Position of the info bar: top, bottom, none (defaults to bottom)"
                 );
                 println!("  -h, --help                 Show this help menu");
@@ -271,6 +287,17 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
             }
         }
     }
+    if sync_path.is_some() && (import_path.is_some() || export_path.is_some()) {
+        return Err(
+            "Error: Option --sync (-r) cannot be used together with --import (-i) or --export (-o)"
+                .to_string(),
+        );
+    }
+
+    if let Some(path) = sync_path {
+        import_path = Some(path.clone());
+        export_path = Some(path);
+    }
 
     Ok(CliOptions {
         initial_path,
@@ -284,4 +311,42 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
         export_path,
         infobar,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_exclusion() {
+        // sync and import together should fail
+        let args1 = vec![
+            "imv-tui".to_string(),
+            "-r".to_string(),
+            "sync.json".to_string(),
+            "-i".to_string(),
+            "import.json".to_string(),
+        ];
+        assert!(parse_cli_args_from(args1).is_err());
+
+        // sync and export together should fail
+        let args2 = vec![
+            "imv-tui".to_string(),
+            "--sync".to_string(),
+            "sync.json".to_string(),
+            "-o".to_string(),
+            "export.json".to_string(),
+        ];
+        assert!(parse_cli_args_from(args2).is_err());
+
+        // sync alone should succeed
+        let args3 = vec![
+            "imv-tui".to_string(),
+            "-r".to_string(),
+            "sync.json".to_string(),
+        ];
+        let opts = parse_cli_args_from(args3).unwrap();
+        assert_eq!(opts.import_path, Some(PathBuf::from("sync.json")));
+        assert_eq!(opts.export_path, Some(PathBuf::from("sync.json")));
+    }
 }

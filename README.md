@@ -137,6 +137,7 @@ If no path is specified, it scans and opens images from the current directory (`
 - `--infobar <top|bottom|none>`: Set the position of the status infobar (defaults to `bottom`).
 - `-i, --import <file>`: Import image classification/flagged states from a file (.json or prefix text).
 - `-o, --export <file>`: Export image classification/flagged states to a file on exit (.json or prefix text).
+- `-r, --sync <file>`: Sync image classification/flagged states with a file (imports on startup if it exists, and exports on exit). Cannot be used together with `-i` or `-o`.
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
 
 ______________________________________________________________________

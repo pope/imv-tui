@@ -101,7 +101,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.slideshow_last_transition = std::time::Instant::now();
     }
     if let Some(ref path) = options.import_path {
-        app.import_classifications(path).map_err(io::Error::other)?;
+        let is_sync = options.export_path.as_ref() == Some(path);
+        if !is_sync || path.exists() {
+            app.import_classifications(path).map_err(io::Error::other)?;
+        }
     }
 
     let mut draw_needed = true;
