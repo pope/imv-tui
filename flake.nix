@@ -85,6 +85,7 @@
               samply
               self.formatter.${system}
             ];
+            RUSTFLAGS = "-C target-cpu=x86-64-v3";
           };
           formatter.${system} = treefmt-eval.config.build.wrapper;
           checks.${system} = {
