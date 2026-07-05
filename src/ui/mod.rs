@@ -61,5 +61,36 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             }
             _ => {}
         }
+    } else if app.slideshow_state.is_paused() {
+        use ratatui::style::{Color, Style, Stylize};
+        use ratatui::text::Line;
+        use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+
+        let w = 34.min(viewport_area.width.saturating_sub(1));
+        let h = 3.min(viewport_area.height.saturating_sub(1));
+
+        let block = Block::default()
+            .title(" Slideshow Paused ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(Color::Yellow).bold());
+
+        let lines = vec![Line::from("   Press Space to resume.".bold().white())];
+
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().fg(Color::White).bg(Color::Reset));
+
+        let x = viewport_area.x + viewport_area.width.saturating_sub(w).saturating_sub(1);
+        let y = if app.infobar == InfoBarPosition::Top {
+            viewport_area.y
+        } else {
+            viewport_area.y.saturating_add(1)
+        };
+
+        let popup_area = ratatui::layout::Rect::new(x, y, w, h);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(paragraph, popup_area);
     }
 }

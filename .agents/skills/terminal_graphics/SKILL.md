@@ -32,6 +32,7 @@ Terminal image rendering libraries (like `ratatui-image`) display graphics using
 - **Image Redraw covers Text**: Triggering `update_protocol()` while a text dialog is open causes the graphic layer to cover the text grid. Because of `ratatui`'s double buffering, only the text cells that *changed* will be redrawn on top of the image.
 - **Erase Text in Kitty/WezTerm**: Dismissing/closing a text dialog does not automatically clear the characters (spaces) in double buffered Kitty-protocol terminals. To cleanly wipe these character cells, set an unconditional `needs_clear_once = true` flag when closing an overlay.
 - **No Updates on Typing/Navigation**: Do not set `needs_update = true` or call `update_protocol()` for keystrokes, character entry, or row selection inside dialog inputs.
+- **No Unnecessary Resizes on State/Toggle Events**: Toggling states (like pausing/playing slideshows) must not set `needs_update = true` or trigger `update_protocol()` unless layout dimensions, active filters, zoom, or contrast values have actually changed. Resizing causes a new graphic payload to transmit, which draws over/hides the overlay dialog on Kitty terminals.
 
 ### 4. Input Event Coalescing/Debouncing (Keyboard Repeats)
 
@@ -47,3 +48,5 @@ if event::poll(Duration::from_millis(50))? {
     // Process all events and update offsets before running update_protocol().
 }
 ```
+
+- **TUI Redraw Feedback Loop Prevention**: Terminal emulators (like Kitty or Sixel-capable ones) write response/query sequences back to stdin when rendering graphics. To avoid triggering infinite drawing feedback loops and high CPU usage, only set `draw_needed = true` inside the event loop on meaningful user interactions (`Event::Key`, `Event::Mouse`, `Event::Paste`) or screen changes (`Event::Resize`), filtering out protocol responses.

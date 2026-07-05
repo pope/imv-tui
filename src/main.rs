@@ -96,8 +96,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         options.no_thumbnail,
         options.infobar,
     )?;
-    if let Some(cfg) = slideshow_opt {
-        app.slideshow_config = cfg;
+    if let Some(state) = slideshow_opt {
+        app.slideshow_state = state;
         app.slideshow_last_transition = std::time::Instant::now();
     }
     if let Some(ref path) = options.import_path {
@@ -113,7 +113,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let delta = now.duration_since(last_loop_tick);
         last_loop_tick = now;
 
-        if app.slideshow_config.is_active() && app.palette_mode != PaletteMode::Closed {
+        if app.slideshow_state.is_active()
+            && (app.palette_mode != PaletteMode::Closed || app.slideshow_state.is_paused())
+        {
             app.slideshow_last_transition += delta;
         }
 
@@ -122,11 +124,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Automatic slideshow transition
-        if app.slideshow_config.is_active()
+        if app.slideshow_state.is_playing()
             && !app.is_loading
             && app.palette_mode == PaletteMode::Closed
             && app.slideshow_last_transition.elapsed()
-                >= std::time::Duration::from_secs(app.slideshow_config.seconds() as u64)
+                >= std::time::Duration::from_secs(app.slideshow_state.seconds() as u64)
         {
             app.next_image();
             app.slideshow_last_transition = std::time::Instant::now();
@@ -169,10 +171,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let term_size = terminal.size().unwrap_or_default();
-            events
-                .into_iter()
-                .for_each(|ev| app.handle_event(ev, term_size.height));
-            draw_needed = true;
+            // Only redraw on actual user inputs or window changes. Non-user events (like Kitty/Sixel
+            // graphics query response escape sequences written to stdin) are processed but ignored
+            // for redrawing to prevent infinite drawing feedback loops and high CPU usage.
+            let mut meaningful = false;
+            for ev in events {
+                meaningful |= matches!(
+                    ev,
+                    event::Event::Key(_)
+                        | event::Event::Resize(_, _)
+                        | event::Event::Mouse(_)
+                        | event::Event::Paste(_)
+                );
+                app.handle_event(ev, term_size.height);
+            }
+            if meaningful {
+                draw_needed = true;
+            }
         }
     }
 

@@ -8,40 +8,67 @@ pub enum InfoBarPosition {
     None,
 }
 
-/// Represents the slideshow transition delay duration.
+/// Represents the slideshow transition delay state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SlideshowConfig {
-    /// Optional slideshow transition delay. None represents slideshow mode is off.
-    pub delay: Option<std::time::Duration>,
+pub enum SlideshowState {
+    #[default]
+    Stopped,
+    Playing {
+        delay: std::time::Duration,
+    },
+    Paused {
+        delay: std::time::Duration,
+    },
 }
 
-impl SlideshowConfig {
+impl SlideshowState {
     /// Slideshow is off.
-    pub const OFF: Self = Self { delay: None };
+    pub const OFF: Self = Self::Stopped;
 
-    /// Construct SlideshowConfig from a raw seconds count.
+    /// Construct SlideshowState from a raw seconds count.
     pub fn new(seconds: u32) -> Self {
-        Self {
-            delay: if seconds == 0 {
-                None
-            } else {
-                Some(std::time::Duration::from_secs(seconds as u64))
-            },
+        if seconds == 0 {
+            Self::Stopped
+        } else {
+            Self::Playing {
+                delay: std::time::Duration::from_secs(seconds as u64),
+            }
+        }
+    }
+
+    /// Access optional slideshow transition delay.
+    pub fn delay(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Stopped => None,
+            Self::Playing { delay } | Self::Paused { delay } => Some(delay),
         }
     }
 
     /// Access raw seconds value (0 if off).
     pub fn seconds(self) -> u32 {
-        self.delay.map(|d| d.as_secs() as u32).unwrap_or(0)
+        self.delay().map(|d| d.as_secs() as u32).unwrap_or(0)
     }
 
-    /// If true, slideshow mode is active.
+    /// If true, slideshow mode is active (either playing or paused).
     pub fn is_active(self) -> bool {
-        self.delay.is_some()
+        match self {
+            Self::Stopped => false,
+            Self::Playing { .. } | Self::Paused { .. } => true,
+        }
+    }
+
+    /// If true, slideshow is playing.
+    pub fn is_playing(self) -> bool {
+        matches!(self, Self::Playing { .. })
+    }
+
+    /// If true, slideshow is paused.
+    pub fn is_paused(self) -> bool {
+        matches!(self, Self::Paused { .. })
     }
 }
 
-impl std::str::FromStr for SlideshowConfig {
+impl std::str::FromStr for SlideshowState {
     type Err = std::num::ParseIntError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {

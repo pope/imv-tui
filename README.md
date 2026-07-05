@@ -33,8 +33,8 @@ ______________________________________________________________________
 | Action                              | Primary Key | Alternative Keys            |
 | :---------------------------------- | :---------- | :-------------------------- |
 | **Quit**                            | `q`         | `Esc`                       |
-| **Next Image**                      | `n`         | `Space` / `]`               |
-| **Previous Image**                  | `p`         | `Backspace` / `[`           |
+| **Next Image**                      | `n`         | `]`                         |
+| **Previous Image**                  | `p`         | `[`                         |
 | **Zoom In**                         | `i`         | `+` / `=` / Mouse Scroll Up |
 | **Zoom In (predefined levels)**     | `I`         |                             |
 | **Zoom Out**                        | `o`         | `-` / Mouse Scroll Down     |
@@ -46,6 +46,7 @@ ______________________________________________________________________
 | **Brightness Increase / Decrease**  | `b` / `B`   |                             |
 | **Contrast Increase / Decrease**    | `c` / `C`   |                             |
 | **Slideshow Increase / Decrease**   | `t` / `T`   |                             |
+| **Toggle Slideshow Pause**          | `Space`     |                             |
 | **Cycle Image Scaling Filter**      | `S`         |                             |
 | **Cycle Image Scaling Mode**        | `s`         |                             |
 | **Pan Left / Right**                | `h` / `l`   | `Left` / `Right Arrow`      |

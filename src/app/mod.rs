@@ -5,7 +5,7 @@ pub mod events;
 pub mod palette;
 pub mod queue;
 
-use crate::config::{InfoBarPosition, SlideshowConfig};
+use crate::config::{InfoBarPosition, SlideshowState};
 
 pub use adjustments::{Adjustment, ImageAdjustments};
 pub use cache::{CachedImage, PrefetchCache};
@@ -153,8 +153,8 @@ pub struct App {
     /// Active contrast bias value.
     pub contrast: Contrast,
     prefetch_cache: PrefetchCache,
-    /// The slideshow transition configuration delay.
-    pub slideshow_config: SlideshowConfig,
+    /// The slideshow state.
+    pub slideshow_state: SlideshowState,
     /// Last slideshow transition timestamp.
     pub slideshow_last_transition: std::time::Instant,
     /// Stats for nerds instrumentation.
@@ -344,7 +344,7 @@ impl App {
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
             prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
-            slideshow_config: SlideshowConfig::OFF,
+            slideshow_state: SlideshowState::OFF,
             slideshow_last_transition: std::time::Instant::now(),
             stats: StatsForNerds::default(),
             last_info_toggle: None,
@@ -699,13 +699,33 @@ impl App {
             Command::CommandPalette => self.open_palette(PaletteMode::Command),
             Command::FileSearch => self.open_palette(PaletteMode::File),
             Command::SlideshowIncrease => {
-                let current_sec = self.slideshow_config.seconds();
-                self.slideshow_config = SlideshowConfig::new(current_sec.saturating_add(1).max(1));
+                let current_sec = self.slideshow_state.seconds();
+                let new_delay =
+                    std::time::Duration::from_secs(current_sec.saturating_add(1).max(1) as u64);
+                self.slideshow_state = match self.slideshow_state {
+                    SlideshowState::Playing { .. } => SlideshowState::Playing { delay: new_delay },
+                    SlideshowState::Paused { .. } => SlideshowState::Paused { delay: new_delay },
+                    SlideshowState::Stopped => SlideshowState::Playing { delay: new_delay },
+                };
                 self.slideshow_last_transition = std::time::Instant::now();
             }
             Command::SlideshowDecrease => {
-                let current_sec = self.slideshow_config.seconds();
-                self.slideshow_config = SlideshowConfig::new(current_sec.saturating_sub(1));
+                let current_sec = self.slideshow_state.seconds();
+                let next_sec = current_sec.saturating_sub(1);
+                self.slideshow_state = if next_sec == 0 {
+                    SlideshowState::Stopped
+                } else {
+                    let new_delay = std::time::Duration::from_secs(next_sec as u64);
+                    match self.slideshow_state {
+                        SlideshowState::Playing { .. } => {
+                            SlideshowState::Playing { delay: new_delay }
+                        }
+                        SlideshowState::Paused { .. } => {
+                            SlideshowState::Paused { delay: new_delay }
+                        }
+                        SlideshowState::Stopped => SlideshowState::Stopped,
+                    }
+                };
                 self.slideshow_last_transition = std::time::Instant::now();
             }
             Command::SetSlideshow => self.open_prompt(PromptType::SetSlideshow),
@@ -765,6 +785,14 @@ impl App {
                 };
                 self.needs_update = true;
                 self.needs_clear = true;
+            }
+            Command::ToggleSlideshowPause => {
+                self.slideshow_state = match self.slideshow_state {
+                    SlideshowState::Playing { delay } => SlideshowState::Paused { delay },
+                    SlideshowState::Paused { delay } => SlideshowState::Playing { delay },
+                    SlideshowState::Stopped => SlideshowState::Stopped,
+                };
+                self.needs_clear_once = true;
             }
         }
     }
@@ -894,14 +922,14 @@ impl App {
                 let Ok(adj) = input.parse::<Adjustment<u32>>() else {
                     return;
                 };
-                let mut new_val = self.slideshow_config.seconds();
+                let mut new_val = self.slideshow_state.seconds();
                 match adj {
                     Adjustment::Absolute(val) => new_val = val,
                     Adjustment::RelativeAdd(val) => new_val = new_val.saturating_add(val),
                     Adjustment::RelativeSub(val) => new_val = new_val.saturating_sub(val),
                 }
-                if new_val != self.slideshow_config.seconds() {
-                    self.slideshow_config = SlideshowConfig::new(new_val);
+                if new_val != self.slideshow_state.seconds() {
+                    self.slideshow_state = SlideshowState::new(new_val);
                     self.slideshow_last_transition = std::time::Instant::now();
                 }
             }

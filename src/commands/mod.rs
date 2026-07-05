@@ -135,6 +135,8 @@ pub enum Command {
     SetInfoBarNone,
     /// Cycle infobar position.
     CycleInfoBar,
+    /// Toggle pause/resume of the slideshow transition.
+    ToggleSlideshowPause,
 }
 
 impl Command {
@@ -176,17 +178,13 @@ impl Command {
                 name: "Next Image",
                 description: "Next image",
                 show_in_palette: true,
-                shortcuts: Some(&[KeyDef::Char('n'), KeyDef::Char(' '), KeyDef::Char(']')]),
+                shortcuts: Some(&[KeyDef::Char('n'), KeyDef::Char(']')]),
             },
             Self::PreviousImage => CommandItem {
                 name: "Previous Image",
                 description: "Previous image",
                 show_in_palette: true,
-                shortcuts: Some(&[
-                    KeyDef::Char('p'),
-                    KeyDef::Code(event::KeyCode::Backspace),
-                    KeyDef::Char('['),
-                ]),
+                shortcuts: Some(&[KeyDef::Char('p'), KeyDef::Char('[')]),
             },
             Self::ZoomIn => CommandItem {
                 name: "Zoom In",
@@ -486,6 +484,12 @@ impl Command {
                 description: "Cycle status infobar position (top, bottom, none)",
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('V')]),
+            },
+            Self::ToggleSlideshowPause => CommandItem {
+                name: "Toggle Slideshow Pause",
+                description: "Pause or resume the slideshow transition",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Char(' ')]),
             },
         }
     }

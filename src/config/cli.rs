@@ -1,4 +1,4 @@
-use crate::config::{InfoBarPosition, SlideshowConfig};
+use crate::config::{InfoBarPosition, SlideshowState};
 use crate::imaging::{FilterType, ScaleMode};
 use ratatui_image::picker::ProtocolType;
 use std::io::{self, IsTerminal};
@@ -15,7 +15,7 @@ pub struct CliOptions {
     /// Image scale mode: none, actual, shrink, full, crop.
     pub scale: ScaleMode,
     /// Delay duration in seconds for slideshow transitions.
-    pub slideshow: Option<SlideshowConfig>,
+    pub slideshow: Option<SlideshowState>,
     /// If true, validates files by checking their magic bytes instead of extensions.
     pub check_magic: bool,
     /// If true, disables EXIF thumbnail loading/display entirely.
@@ -178,7 +178,7 @@ pub fn parse_cli_args() -> Result<CliOptions, String> {
             "--slideshow" | "-t" => {
                 let flag = args[i].clone();
                 let val = get_arg(&args, &mut i, &flag)?;
-                if let Ok(config) = val.parse::<SlideshowConfig>() {
+                if let Ok(config) = val.parse::<SlideshowState>() {
                     slideshow = Some(config);
                 } else {
                     return Err(

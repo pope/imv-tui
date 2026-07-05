@@ -32,11 +32,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.contrast.value().round() as i32
             ));
         }
-        if app.slideshow_config.is_active() {
-            extra_info.push_str(&format!(
-                " | Slideshow: {}s",
-                app.slideshow_config.seconds()
-            ));
+        if app.slideshow_state.is_active() {
+            if app.slideshow_state.is_paused() {
+                extra_info.push_str(&format!(
+                    " | Slideshow: Paused ({}s)",
+                    app.slideshow_state.seconds()
+                ));
+            } else {
+                extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_state.seconds()));
+            }
         }
 
         let classification = app.current_classification();
