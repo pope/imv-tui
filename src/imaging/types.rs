@@ -6,15 +6,15 @@ pub enum FilterType {
     /// Nearest neighbor.
     Nearest,
     /// Linear interpolation.
-    Triangle,
+    Linear,
     /// Cubic spline filter.
-    CatmullRom,
+    Cubic,
     /// Mitchell Netravali.
     Mitchell,
     /// Gaussian filter.
     Gaussian,
     /// Lanczos windowed sinc.
-    Lanczos3,
+    Lanczos,
     /// Hamming filter.
     Hamming,
 }
@@ -24,11 +24,11 @@ impl FilterType {
     pub fn to_image_filter(self) -> image::imageops::FilterType {
         match self {
             FilterType::Nearest => image::imageops::FilterType::Nearest,
-            FilterType::Triangle => image::imageops::FilterType::Triangle,
-            FilterType::CatmullRom => image::imageops::FilterType::CatmullRom,
+            FilterType::Linear => image::imageops::FilterType::Triangle,
+            FilterType::Cubic => image::imageops::FilterType::CatmullRom,
             FilterType::Mitchell => image::imageops::FilterType::CatmullRom,
             FilterType::Gaussian => image::imageops::FilterType::Gaussian,
-            FilterType::Lanczos3 => image::imageops::FilterType::Lanczos3,
+            FilterType::Lanczos => image::imageops::FilterType::Lanczos3,
             FilterType::Hamming => image::imageops::FilterType::Triangle,
         }
     }
@@ -53,7 +53,7 @@ impl ScaleMode {
         match self {
             ScaleMode::None => "None",
             ScaleMode::Shrink => "Shrink",
-            ScaleMode::Full => "Full",
+            ScaleMode::Full => "Fit",
             ScaleMode::Crop => "Crop",
         }
     }

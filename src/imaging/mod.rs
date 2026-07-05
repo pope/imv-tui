@@ -327,11 +327,11 @@ pub fn fast_resize(
 
     let resize_alg = match filter_type {
         FilterType::Nearest => fir::ResizeAlg::Nearest,
-        FilterType::Triangle => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
-        FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
+        FilterType::Linear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
+        FilterType::Cubic => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
         FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Mitchell),
         FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Gaussian),
-        FilterType::Lanczos3 => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+        FilterType::Lanczos => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
         FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
     };
 

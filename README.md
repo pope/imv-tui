@@ -16,7 +16,7 @@ ______________________________________________________________________
 - **Header-Based Magic Byte Verification**: Intelligently identifies images and zip files by reading their headers, allowing images with missing or incorrect file extensions to load perfectly.
 - **Three-Section Info Bar**: Formats status metadata at the bottom of the screen into three cleanly aligned sections: image sequence & dimensions on the left, scaling/panning parameters centered in the middle, and command palette discovery shortcut on the right.
 - **Smart Aspect-Ratio Padding Compression**: When zoomed out, images sit centered with empty border spaces (padding). As you zoom in, the borders automatically shrink and disappear, scaling the image to fully cover the terminal space.
-- **Pixel-Perfect Deep Zooming**: Supports zooming beyond a 1:1 pixel scale (up to 10000%) with clean Nearest Neighbor scaling—perfect for inspection and pixel-art view.
+- **Pixel-Perfect Deep Zooming**: Supports zooming beyond a 1:1 pixel scale (up to 100000%) with clean Nearest Neighbor scaling—perfect for inspection and pixel-art view.
 - **Predefined Level Jumps**: Instantly snap zoom levels using `I` and `O` through a calculated sequence of target scales: Shrink to Fit, Fit View, Crop to Fill, 1:1, 2:1, and 4:1.
 - **In-Memory Rotation**: Rotate vertical or misaligned images clockwise and counter-clockwise in-memory (does not modify files on disk).
 - **Centering Layout**: Fits and centers images horizontally and vertically when they are smaller than the terminal size.
@@ -48,15 +48,16 @@ ______________________________________________________________________
 | **Contrast Increase / Decrease**    | `c` / `C`   |                             |
 | **Slideshow Increase / Decrease**   | `t` / `T`   |                             |
 | **Toggle Slideshow Pause**          | `Space`     |                             |
-| **Cycle Image Scaling Filter**      | `S`         |                             |
-| **Cycle Image Scaling Mode**        | `s`         |                             |
+| **Cycle Scaling Filter**            | `S`         |                             |
+| **Cycle Scale Mode**                | `s`         |                             |
 | **Pan Left / Right**                | `h` / `l`   | `Left` / `Right Arrow`      |
 | **Pan Up / Down**                   | `k` / `j`   | `Up` / `Down Arrow`         |
 | **Show Help / Command Palette**     | `?` / `:`   | `/`                         |
 | **File Search**                     | `f`         |                             |
-| **Toggle Thumbnail Display**        | `m`         |                             |
-| **Mark Image as Pick**              | `z`         |                             |
-| **Mark Image as Reject**            | `x`         |                             |
+| **Toggle Thumbnail Mode**           | `m`         |                             |
+| **Show Image Details**              | `d`         |                             |
+| **Flag Pick**                       | `z`         |                             |
+| **Flag Reject**                     | `x`         |                             |
 | **Unflag Image**                    | `u`         |                             |
 | **Cycle View Filter**               | `v`         |                             |
 | **Cycle Infobar Position**          | `V`         |                             |
@@ -82,7 +83,7 @@ Rather than sending massive raw images to the terminal graphics protocol and lea
 
 When zoomed in, the cropped sub-image is scaled in memory to target screen pixels using a fast `Nearest Neighbor` filter. This has two key advantages:
 
-- It bypasses terminal graphics protocol limitations for image upscaling, enabling zoom levels up to 10000%.
+- It bypasses terminal graphics protocol limitations for image upscaling, enabling zoom levels up to 100000%.
 - It renders sharp, pixel-perfect scaling rather than blurry linear scaling.
 - The resizing overhead is less than `1ms`, ensuring high frame rates during panning and zooming.
 

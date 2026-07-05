@@ -386,14 +386,14 @@ impl Command {
                 shortcuts: Some(&[KeyDef::Char('f')]),
             },
             Self::MarkPick => CommandItem {
-                name: "Mark Pick",
-                description: "Mark the current image as a Pick",
+                name: "Flag Pick",
+                description: "Flag the current image as a Pick",
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('z')]),
             },
             Self::MarkReject => CommandItem {
-                name: "Mark Reject",
-                description: "Mark the current image as a Reject",
+                name: "Flag Reject",
+                description: "Flag the current image as a Reject",
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('x')]),
             },

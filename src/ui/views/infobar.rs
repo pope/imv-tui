@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 
-/// Renders the bottom HUD status bar, file index/mode details, and active filter configuration.
+/// Renders the infobar displaying the file path, index, dimensions, scaling/panning parameters, and active filters.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     if app.queue.is_empty() {
         let status_block = Block::default()

@@ -585,11 +585,11 @@ impl App {
     pub fn filter_name(&self) -> &'static str {
         match self.filter_type {
             FilterType::Nearest => "Nearest",
-            FilterType::Triangle => "Linear",
-            FilterType::CatmullRom => "Cubic",
+            FilterType::Linear => "Linear",
+            FilterType::Cubic => "Cubic",
             FilterType::Mitchell => "Mitchell",
             FilterType::Gaussian => "Gaussian",
-            FilterType::Lanczos3 => "Lanczos",
+            FilterType::Lanczos => "Lanczos",
             FilterType::Hamming => "Hamming",
         }
     }
@@ -600,12 +600,12 @@ impl App {
         }
         self.filter_type = match self.filter_type {
             FilterType::Nearest => FilterType::Hamming,
-            FilterType::Hamming => FilterType::Triangle,
-            FilterType::Triangle => FilterType::CatmullRom,
-            FilterType::CatmullRom => FilterType::Mitchell,
+            FilterType::Hamming => FilterType::Linear,
+            FilterType::Linear => FilterType::Cubic,
+            FilterType::Cubic => FilterType::Mitchell,
             FilterType::Mitchell => FilterType::Gaussian,
-            FilterType::Gaussian => FilterType::Lanczos3,
-            FilterType::Lanczos3 => FilterType::Nearest,
+            FilterType::Gaussian => FilterType::Lanczos,
+            FilterType::Lanczos => FilterType::Nearest,
         };
         self.needs_update = true;
     }
@@ -627,11 +627,11 @@ impl App {
                 self.needs_update = true;
             }
             Command::SetFilterLinear => {
-                self.filter_type = FilterType::Triangle;
+                self.filter_type = FilterType::Linear;
                 self.needs_update = true;
             }
             Command::SetFilterCubic => {
-                self.filter_type = FilterType::CatmullRom;
+                self.filter_type = FilterType::Cubic;
                 self.needs_update = true;
             }
             Command::SetFilterMitchell => {
@@ -643,7 +643,7 @@ impl App {
                 self.needs_update = true;
             }
             Command::SetFilterLanczos => {
-                self.filter_type = FilterType::Lanczos3;
+                self.filter_type = FilterType::Lanczos;
                 self.needs_update = true;
             }
             Command::SetFilterHamming => {

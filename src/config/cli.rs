@@ -136,11 +136,11 @@ where
                 let val = get_arg(&args, &mut i, &flag)?;
                 filter = match val.to_lowercase().as_str() {
                     "nearest" => FilterType::Nearest,
-                    "linear" => FilterType::Triangle,
-                    "cubic" => FilterType::CatmullRom,
+                    "linear" => FilterType::Linear,
+                    "cubic" => FilterType::Cubic,
                     "mitchell" => FilterType::Mitchell,
                     "gaussian" => FilterType::Gaussian,
-                    "lanczos" => FilterType::Lanczos3,
+                    "lanczos" => FilterType::Lanczos,
                     "hamming" => FilterType::Hamming,
                     other => {
                         return Err(format!(

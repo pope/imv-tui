@@ -42,9 +42,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     // Render image viewport
     views::image_view::draw(frame, app, viewport_area);
 
-    // Render status hud if configured
+    // Render infobar if configured
     if let Some(s_area) = status_area {
-        views::status_hud::draw(frame, app, s_area);
+        views::infobar::draw(frame, app, s_area);
     }
 
     // Render active overlay widgets
