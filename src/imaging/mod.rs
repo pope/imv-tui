@@ -118,12 +118,26 @@ pub struct LoaderRequest {
     pub sequence: u64,
 }
 
+/// Encapsulates success values for a decoded image.
+pub struct DecodedImage {
+    /// The decoded DynamicImage.
+    pub image: DynamicImage,
+    /// Width of the image in pixels.
+    pub width: u32,
+    /// Height of the image in pixels.
+    pub height: u32,
+    /// Optional format parsed during load.
+    pub format: Option<image::ImageFormat>,
+    /// The size of the raw source file in bytes.
+    pub disk_size: u64,
+}
+
 /// A response returned by the persistent loader thread.
 pub struct LoaderResponse {
     /// File index inside the App source list.
     pub idx: usize,
-    /// The decode result containing the dynamic image, width, height, format, and file size.
-    pub result: Result<(DynamicImage, u32, u32, Option<image::ImageFormat>, u64), String>,
+    /// The decode result containing the DecodedImage data.
+    pub result: Result<DecodedImage, String>,
     /// Whether this was a background prefetch request.
     pub is_prefetch: bool,
     /// Navigation sequence identifier of the load request.
@@ -221,10 +235,7 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
 }
 
 /// Decodes an image from already loaded memory bytes.
-pub fn decode_image_bytes(
-    bytes: &[u8],
-    source: &ImageSource,
-) -> Result<(DynamicImage, u32, u32, Option<image::ImageFormat>, u64), String> {
+pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedImage, String> {
     let file_size = bytes.len() as u64;
     let format = image::guess_format(bytes).ok();
     let display_name = source.display_name();
@@ -253,7 +264,13 @@ pub fn decode_image_bytes(
             img.apply_orientation(orientation);
             let w = img.width();
             let h = img.height();
-            return Ok((img, w, h, Some(image::ImageFormat::Jpeg), file_size));
+            return Ok(DecodedImage {
+                image: img,
+                width: w,
+                height: h,
+                format: Some(image::ImageFormat::Jpeg),
+                disk_size: file_size,
+            });
         }
     }
 
@@ -281,20 +298,18 @@ pub fn decode_image_bytes(
     let rgba_img = img.to_rgba8();
     let w = rgba_img.width();
     let h = rgba_img.height();
-    Ok((
-        image::DynamicImage::ImageRgba8(rgba_img),
-        w,
-        h,
+    Ok(DecodedImage {
+        image: image::DynamicImage::ImageRgba8(rgba_img),
+        width: w,
+        height: h,
         format,
-        file_size,
-    ))
+        disk_size: file_size,
+    })
 }
 
 /// Decodes an image from local paths or comic book archives.
 /// Employs zune-jpeg for extremely fast decoding of JPEGs.
-pub fn decode_image_source(
-    source: ImageSource,
-) -> Result<(DynamicImage, u32, u32, Option<image::ImageFormat>, u64), String> {
+pub fn decode_image_source(source: ImageSource) -> Result<DecodedImage, String> {
     let bytes = read_source_bytes(&source)?;
     decode_image_bytes(&bytes, &source)
 }

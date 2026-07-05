@@ -26,8 +26,8 @@ use std::time::Instant;
 
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
-    Brightness, Contrast, CropBox, FilterType, ImageIntersection, ImageSource, LoaderRequest,
-    LoaderResponse, PanOffset, ResizeRequest, ScaleMode, process_resize,
+    Brightness, Contrast, CropBox, DecodedImage, FilterType, ImageIntersection, ImageSource,
+    LoaderRequest, LoaderResponse, PanOffset, ResizeRequest, ScaleMode, ZoomFactor, process_resize,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -90,7 +90,7 @@ pub struct App {
     pub img_height: u32,
 
     /// Zoom multiplier relative to fit scale.
-    pub zoom_factor: f64,
+    pub zoom_factor: ZoomFactor,
     /// Viewport panning coordinate offset.
     pub pan_offset: PanOffset,
 
@@ -255,13 +255,13 @@ impl App {
                                 let thumb_dur = start.elapsed();
                                 let _ = response_tx.send(LoaderResponse {
                                     idx: r.idx,
-                                    result: Ok((
-                                        thumb_img,
-                                        real_w,
-                                        real_h,
-                                        Some(image::ImageFormat::Jpeg),
-                                        0, // Filled in by final high-res response
-                                    )),
+                                    result: Ok(DecodedImage {
+                                        image: thumb_img,
+                                        width: real_w,
+                                        height: real_h,
+                                        format: Some(image::ImageFormat::Jpeg),
+                                        disk_size: 0, // Filled in by final high-res response
+                                    }),
                                     is_prefetch: r.is_prefetch,
                                     sequence: r.sequence,
                                     decode_duration: thumb_dur,
@@ -313,7 +313,7 @@ impl App {
             picker,
             img_width: 0,
             img_height: 0,
-            zoom_factor: 1.0,
+            zoom_factor: ZoomFactor::DEFAULT,
             pan_offset: PanOffset::ZERO,
             running: true,
             error_message: None,
@@ -1039,7 +1039,7 @@ impl App {
                 self.stats.thumbnail_dimensions = None;
             }
 
-            self.zoom_factor = 1.0;
+            self.zoom_factor = ZoomFactor::DEFAULT;
             self.pan_offset = PanOffset::ZERO;
             self.is_loading = false;
             self.needs_update = true;
@@ -1066,7 +1066,7 @@ impl App {
         self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
 
-        self.zoom_factor = 1.0;
+        self.zoom_factor = ZoomFactor::DEFAULT;
         self.pan_offset = PanOffset::ZERO;
         self.zoom_needs_initialization = true;
 
@@ -1091,7 +1091,12 @@ impl App {
             }
 
             match resp.result {
-                Ok((img, w, h, format, disk_size)) => {
+                Ok(decoded) => {
+                    let img = decoded.image;
+                    let w = decoded.width;
+                    let h = decoded.height;
+                    let format = decoded.format;
+                    let disk_size = decoded.disk_size;
                     let shared_img = Arc::new(img);
                     if resp.is_prefetch {
                         let window_indices = self.get_sliding_window_indices();
@@ -1296,7 +1301,7 @@ impl App {
 
             if self.zoom_needs_initialization && s > 0.0 {
                 self.zoom_needs_initialization = false;
-                self.zoom_factor = match self.scale_mode {
+                self.zoom_factor = ZoomFactor::new(match self.scale_mode {
                     ScaleMode::None => 1.0 / s,
                     ScaleMode::Shrink => {
                         if s < 1.0 {
@@ -1307,12 +1312,12 @@ impl App {
                     }
                     ScaleMode::Full => 1.0,
                     ScaleMode::Crop => s_w.max(s_h) / s,
-                };
+                });
                 self.pan_offset = PanOffset::ZERO;
             }
 
             // 2. Combined scale is s * zoom_factor
-            let scale = s * self.zoom_factor;
+            let scale = s * self.zoom_factor.value();
             self.current_zoom_pct = scale * 100.0;
 
             // 3. Compute crop window in original image pixels
@@ -1409,7 +1414,7 @@ impl App {
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
-            self.zoom_factor = (self.zoom_factor * 1.25).min(102.4 / s);
+            self.zoom_factor = ZoomFactor::new((self.zoom_factor.value() * 1.25).min(102.4 / s));
             self.clamp_pan();
             self.needs_update = true;
         }
@@ -1421,7 +1426,7 @@ impl App {
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
-            self.zoom_factor = (self.zoom_factor / 1.25).max(0.01 / s);
+            self.zoom_factor = ZoomFactor::new((self.zoom_factor.value() / 1.25).max(0.01 / s));
             self.clamp_pan();
             self.needs_update = true;
         }
@@ -1472,7 +1477,7 @@ impl App {
         levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         levels.dedup_by(|a, b| (*a - *b).abs() < 0.01);
 
-        let current_scale = fit_scale * self.zoom_factor;
+        let current_scale = fit_scale * self.zoom_factor.value();
 
         let mut target_scale = None;
         for &lvl in &levels {
@@ -1483,10 +1488,10 @@ impl App {
         }
 
         if let Some(target) = target_scale {
-            self.zoom_factor = target / fit_scale;
+            self.zoom_factor = ZoomFactor::new(target / fit_scale);
         } else {
             // Double the scale if already past maximum level
-            self.zoom_factor = (current_scale * 2.0).min(102.4) / fit_scale;
+            self.zoom_factor = ZoomFactor::new((current_scale * 2.0).min(102.4) / fit_scale);
         }
 
         self.clamp_pan();
@@ -1538,7 +1543,7 @@ impl App {
         levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         levels.dedup_by(|a, b| (*a - *b).abs() < 0.01);
 
-        let current_scale = fit_scale * self.zoom_factor;
+        let current_scale = fit_scale * self.zoom_factor.value();
 
         let mut target_scale = None;
         for &lvl in levels.iter().rev() {
@@ -1549,10 +1554,10 @@ impl App {
         }
 
         if let Some(target) = target_scale {
-            self.zoom_factor = target / fit_scale;
+            self.zoom_factor = ZoomFactor::new(target / fit_scale);
         } else {
             // Halve the scale if already below minimum level
-            self.zoom_factor = (current_scale / 2.0).max(0.01) / fit_scale;
+            self.zoom_factor = ZoomFactor::new((current_scale / 2.0).max(0.01) / fit_scale);
         }
 
         self.clamp_pan();
@@ -1565,7 +1570,7 @@ impl App {
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
-            self.zoom_factor = 1.0 / s;
+            self.zoom_factor = ZoomFactor::new(1.0 / s);
             self.clamp_pan();
             self.needs_update = true;
             self.clear_on_protocol_receive = true;
@@ -1586,7 +1591,7 @@ impl App {
     pub fn apply_scale_mode(&mut self) {
         let s = self.get_fit_scale();
         if s > 0.0 {
-            self.zoom_factor = match self.scale_mode {
+            self.zoom_factor = ZoomFactor::new(match self.scale_mode {
                 ScaleMode::None => 1.0 / s,
                 ScaleMode::Shrink => {
                     if s < 1.0 {
@@ -1613,7 +1618,7 @@ impl App {
                     let s_h = widget_h_px / self.img_height as f64;
                     s_w.max(s_h) / s
                 }
-            };
+            });
             self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
         }
@@ -1729,13 +1734,21 @@ impl App {
 
     fn pan_step_x(&self) -> i64 {
         let s = self.get_fit_scale();
-        let scale = if s > 0.0 { s * self.zoom_factor } else { 1.0 };
+        let scale = if s > 0.0 {
+            s * self.zoom_factor.value()
+        } else {
+            1.0
+        };
         ((self.img_width as f64 * 0.05) / scale).max(1.0) as i64
     }
 
     fn pan_step_y(&self) -> i64 {
         let s = self.get_fit_scale();
-        let scale = if s > 0.0 { s * self.zoom_factor } else { 1.0 };
+        let scale = if s > 0.0 {
+            s * self.zoom_factor.value()
+        } else {
+            1.0
+        };
         ((self.img_height as f64 * 0.05) / scale).max(1.0) as i64
     }
 
@@ -1758,7 +1771,7 @@ impl App {
                 self.adjustments[idx].rotation = (self.adjustments[idx].rotation + 90) % 360;
             }
 
-            self.zoom_factor = 1.0;
+            self.zoom_factor = ZoomFactor::DEFAULT;
             self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
             self.clear_on_protocol_receive = true;
@@ -1784,7 +1797,7 @@ impl App {
                 self.adjustments[idx].rotation = (self.adjustments[idx].rotation + 270) % 360;
             }
 
-            self.zoom_factor = 1.0;
+            self.zoom_factor = ZoomFactor::DEFAULT;
             self.pan_offset = PanOffset::ZERO;
             self.needs_update = true;
             self.clear_on_protocol_receive = true;

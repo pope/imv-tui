@@ -29,6 +29,8 @@ Mutating application states (such as layout dimensions or screen-clearing trigge
 - **Layout Update Phase**: Introduce a layout pre-calculation phase in the controller (`App::update_layout(term_height)`) to update sizes, check boundaries, and trigger clear signals *before* invoking `terminal.draw`.
 - **Pure Rendering**: Enforce read-only rendering logic inside `src/ui/` where layout parameters are purely read from precomputed state variables.
 - **Rect Boundary Clamping**: Always clamp calculated coordinates (`rect_w`, `rect_h`) against viewport dimensions to prevent crashes and coordinate overflows during terminal resizing.
+- **Narrow Mutability Scope in View Signatures**: Enforce read-only drawing functions by passing an immutable reference `app: &App` (instead of `&mut App`) to view submodules (such as `status_hud`, `prompt`, `info_box`, `palette`, or any other overlay views). This ensures compile-time safety and self-documents the side-effect-free nature of the views. Pass mutable references (`&mut App`) only if the underlying widget requires it (e.g., stateful image protocol views).
+- **Delegate all views from main layout**: Keep `src/ui/mod.rs` clean (~100 lines) by delegating all layout components and floating dialog overlays (including slideshow paused states) into dedicated submodules inside `views/` rather than rendering them inline.
 
 ### 3. Compiler-Enforced Unified Keybindings & Command Architecture
 

@@ -248,3 +248,32 @@ impl ImageIntersection {
         self.x1 >= self.x2 || self.y1 >= self.y2
     }
 }
+
+/// Represents a zoom factor restricted to a safe range [0.0001, 1000.0] (100000%).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct ZoomFactor(f64);
+
+impl ZoomFactor {
+    /// The default zoom factor (100%).
+    pub const DEFAULT: Self = Self(1.0);
+
+    /// Constructor that clamps the value to [0.0001, 1000.0].
+    pub fn new(val: f64) -> Self {
+        Self(if val.is_nan() {
+            1.0
+        } else {
+            val.clamp(0.0001, 1000.0)
+        })
+    }
+
+    /// Access the underlying raw f64 value.
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for ZoomFactor {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}

@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 /// Renders the bottom HUD status bar, file index/mode details, and active filter configuration.
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     if app.queue.is_empty() {
         let status_block = Block::default()
             .title(" imv-tui ")

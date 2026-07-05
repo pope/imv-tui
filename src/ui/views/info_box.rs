@@ -23,7 +23,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Renders the technical details and EXIF / cache telemetry overlay box.
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let title = " Image Details ";
     let w = 55.min(area.width.saturating_sub(1));
     let h = app.palette_height.min(area.height.saturating_sub(1));
