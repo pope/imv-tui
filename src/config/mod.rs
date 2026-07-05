@@ -8,6 +8,16 @@ pub enum InfoBarPosition {
     None,
 }
 
+impl InfoBarPosition {
+    /// Returns the height of the infobar in cells.
+    pub fn height(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Top | Self::Bottom => 3,
+        }
+    }
+}
+
 /// Represents the slideshow transition delay state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SlideshowState {

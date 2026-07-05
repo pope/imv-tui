@@ -12,28 +12,18 @@ use crate::config::InfoBarPosition;
 /// and interactive command/file palette overlays.
 pub fn ui(frame: &mut Frame, app: &mut App) {
     let (viewport_area, status_area) = match app.infobar {
-        InfoBarPosition::None => {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
-                .split(frame.area());
-            (chunks[0], None)
-        }
+        InfoBarPosition::None => (frame.area(), None),
         InfoBarPosition::Top => {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Length(app.infobar.height()), Constraint::Min(0)])
                 .split(frame.area());
             (chunks[1], Some(chunks[0]))
         }
         InfoBarPosition::Bottom => {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .constraints([Constraint::Min(0), Constraint::Length(app.infobar.height())])
                 .split(frame.area());
             (chunks[0], Some(chunks[1]))
         }

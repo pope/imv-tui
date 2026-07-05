@@ -1223,10 +1223,15 @@ impl App {
         received
     }
 
+    /// Calculates the size of the viewport area, subtracting the infobar height if configured.
+    pub fn get_viewport_size(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+        let viewport_h = term_height.saturating_sub(self.infobar.height());
+        (term_width, viewport_h)
+    }
+
     pub fn update_layout(&mut self, term_width: u16, term_height: u16) {
         // 1. First, check if the image protocol needs updating based on the main viewport area size
-        let widget_w = term_width;
-        let widget_h = term_height.saturating_sub(3);
+        let (widget_w, widget_h) = self.get_viewport_size(term_width, term_height);
         if self.needs_update || self.last_widget_size != (widget_w, widget_h) {
             self.last_widget_size = (widget_w, widget_h);
             self.needs_update = false;

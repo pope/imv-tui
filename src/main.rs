@@ -139,8 +139,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let term_size = terminal.size().unwrap_or_default();
-        let widget_w = term_size.width;
-        let widget_h = term_size.height.saturating_sub(3);
+        let (widget_w, widget_h) = app.get_viewport_size(term_size.width, term_size.height);
         if app.last_widget_size != (widget_w, widget_h) {
             draw_needed = true;
         }
