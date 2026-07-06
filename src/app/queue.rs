@@ -109,4 +109,34 @@ mod tests {
         assert_eq!(queue.relative_paths[1], "vacation/mountains.png");
         assert_eq!(queue.relative_paths[2], "work/office.png");
     }
+
+    #[test]
+    fn test_image_queue_no_common_prefix() {
+        let images = vec![
+            ImageSource::Local(PathBuf::from("/a/first.png")),
+            ImageSource::Local(PathBuf::from("/b/second.png")),
+        ];
+        let queue = ImageQueue::new(images, 0).unwrap();
+        // Since root is common prefix, relative paths should preserve directory structure
+        assert_eq!(queue.relative_paths[0], "a/first.png");
+        assert_eq!(queue.relative_paths[1], "b/second.png");
+    }
+
+    #[test]
+    fn test_image_queue_single_file() {
+        let images = vec![ImageSource::Local(PathBuf::from("/home/user/pic.jpg"))];
+        let queue = ImageQueue::new(images, 0).unwrap();
+        assert_eq!(queue.relative_paths[0], "pic.jpg");
+    }
+
+    #[test]
+    fn test_image_queue_current_index_out_of_bounds() {
+        let images = vec![
+            ImageSource::Local(PathBuf::from("1.jpg")),
+            ImageSource::Local(PathBuf::from("2.jpg")),
+        ];
+        // current_index 5 exceeds bounds, should clamp to 1
+        let queue = ImageQueue::new(images, 5).unwrap();
+        assert_eq!(queue.current_index, 1);
+    }
 }

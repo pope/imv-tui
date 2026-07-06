@@ -218,6 +218,9 @@ fn shorten_path(path_str: &str, max_len: usize) -> String {
     let last = components[components.len() - 1];
 
     let get_elided_suffix = |s: &str, elided_len: usize| -> String {
+        if elided_len == 0 {
+            return "...".to_string();
+        }
         let char_indices: Vec<(usize, char)> = s.char_indices().collect();
         if char_indices.len() > elided_len {
             let start_idx = char_indices[char_indices.len() - elided_len].0;
@@ -275,5 +278,21 @@ mod tests {
             shorten_path("a/very_long_nested_filename_that_exceeds_max.png", 20),
             "...t_exceeds_max.png"
         );
+
+        // Very small max_len tests (edge cases <= 3) to prevent out-of-bounds panics
+        assert_eq!(shorten_path("a/b/c/d/e.png", 3), "...");
+        assert_eq!(shorten_path("a/b/c/d/e.png", 2), "...");
+        assert_eq!(shorten_path("a/b/c/d/e.png", 0), "...");
+    }
+
+    #[test]
+    fn test_shorten_path_utf8_boundary() {
+        // Multi-byte character in filename
+        let path = "pics/💖_heart.jpg";
+        let shortened = shorten_path(path, 9);
+        // "💖_heart.jpg" is 11 characters. With max_len = 9:
+        // elided_len = 9 - 3 = 6 chars.
+        // Expecting "...rt.jpg"
+        assert_eq!(shortened, "...rt.jpg");
     }
 }

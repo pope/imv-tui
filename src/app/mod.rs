@@ -2506,4 +2506,99 @@ mod tests {
             assert!(cache.contains_key(&1));
         }
     }
+
+    #[test]
+    fn test_sequence_number_protection() {
+        use crate::imaging::{DecodedImage, LoaderResponse};
+        use std::sync::mpsc;
+        let mut app = setup_test_app();
+
+        // Bump current sequence
+        app.current_sequence = 10;
+
+        // Mock a LoaderResponse sent with older sequence 9
+        let (tx, rx) = mpsc::channel();
+        app.response_rx = rx;
+
+        let dummy_img = image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1));
+        let resp = LoaderResponse {
+            idx: 0,
+            is_prefetch: false,
+            is_thumbnail: false,
+            sequence: 9,
+            result: Ok(DecodedImage {
+                image: dummy_img,
+                width: 1,
+                height: 1,
+                format: None,
+                disk_size: 0,
+            }),
+            decode_duration: std::time::Duration::ZERO,
+        };
+        tx.send(resp).unwrap();
+
+        // Process channels
+        let updated = app.update_channels();
+        // Since sequence was 9 < 10, it should have skipped it
+        assert!(updated); // received was true
+        assert!(app.original_image.is_none());
+    }
+
+    #[test]
+    fn test_error_propagation_boundary() {
+        use crate::imaging::LoaderResponse;
+        use std::sync::mpsc;
+        let mut app = setup_test_app();
+        let (tx, rx) = mpsc::channel();
+        app.response_rx = rx;
+
+        // 1. Prefetch error at index 1 (should not update current image error state)
+        let resp_prefetch_err = LoaderResponse {
+            idx: 1,
+            is_prefetch: true,
+            is_thumbnail: false,
+            sequence: app.current_sequence,
+            result: Err("Failed to load prefetch".to_string()),
+            decode_duration: std::time::Duration::ZERO,
+        };
+        tx.send(resp_prefetch_err).unwrap();
+        app.update_channels();
+        assert!(app.error_message.is_none());
+
+        // 2. Active load error at index 0 (current index)
+        let resp_active_err = LoaderResponse {
+            idx: 0,
+            is_prefetch: false,
+            is_thumbnail: false,
+            sequence: app.current_sequence,
+            result: Err("Corrupt image file".to_string()),
+            decode_duration: std::time::Duration::ZERO,
+        };
+        tx.send(resp_active_err).unwrap();
+        app.update_channels();
+        assert_eq!(app.error_message.as_deref(), Some("Corrupt image file"));
+        assert!(app.original_image.is_none());
+    }
+
+    fn setup_test_app() -> App {
+        let images = vec![
+            ImageSource::Local(PathBuf::from("img1.png")),
+            ImageSource::Local(PathBuf::from("img2.png")),
+        ];
+        let picker = Picker::halfblocks();
+        let app_config = AppConfig {
+            filter_type: crate::imaging::FilterType::Nearest,
+            scale_mode: crate::imaging::ScaleMode::Shrink,
+            disable_thumbnail: true,
+            infobar: InfoBarPosition::Bottom,
+        };
+        let scan_config = ScanConfig {
+            initial_scan_path: PathBuf::from("."),
+            check_magic: false,
+            recursive: false,
+            is_cbz: false,
+            is_piped: false,
+        };
+        App::new(images, 0, picker, app_config, scan_config).unwrap()
+    }
 }

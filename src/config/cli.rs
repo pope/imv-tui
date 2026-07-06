@@ -376,4 +376,118 @@ mod tests {
         assert!(opts2.recursive);
         assert_eq!(opts2.initial_path, None);
     }
+
+    #[test]
+    fn test_invalid_filter_parameter() {
+        let args = vec![
+            "imv-tui".to_string(),
+            "--filter".to_string(),
+            "invalid_filter".to_string(),
+        ];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("Unknown filter 'invalid_filter'"));
+    }
+
+    #[test]
+    fn test_invalid_protocol_parameter() {
+        let args = vec![
+            "imv-tui".to_string(),
+            "-p".to_string(),
+            "invalid_proto".to_string(),
+        ];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("Unknown protocol 'invalid_proto'"));
+    }
+
+    #[test]
+    fn test_invalid_scale_parameter() {
+        let args = vec![
+            "imv-tui".to_string(),
+            "--scale".to_string(),
+            "invalid_scale".to_string(),
+        ];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("Unknown scale mode 'invalid_scale'"));
+    }
+
+    #[test]
+    fn test_invalid_slideshow_parameter() {
+        // slideshow requires positive integer (actually non-negative)
+        let args1 = vec!["imv-tui".to_string(), "-t".to_string(), "abc".to_string()];
+        assert!(parse_cli_args_from(args1).is_err());
+
+        let args2 = vec![
+            "imv-tui".to_string(),
+            "--slideshow".to_string(),
+            "-5".to_string(),
+        ];
+        assert!(parse_cli_args_from(args2).is_err());
+    }
+
+    #[test]
+    fn test_invalid_infobar_parameter() {
+        let args = vec![
+            "imv-tui".to_string(),
+            "--infobar".to_string(),
+            "invalid_pos".to_string(),
+        ];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("Unknown infobar position 'invalid_pos'"));
+    }
+
+    #[test]
+    fn test_option_hijacking() {
+        // Attempting to pass another option as a value should be blocked
+        let args = vec![
+            "imv-tui".to_string(),
+            "--filter".to_string(),
+            "-s".to_string(),
+        ];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("cannot be another option"));
+    }
+
+    #[test]
+    fn test_multiple_paths() {
+        // Only a single path argument is allowed
+        let args = vec![
+            "imv-tui".to_string(),
+            "/path/one".to_string(),
+            "/path/two".to_string(),
+        ];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("multiple paths were provided"));
+    }
+
+    #[test]
+    fn test_missing_argument() {
+        // Options requiring values at the end of input
+        let args = vec!["imv-tui".to_string(), "--filter".to_string()];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("requires an argument"));
+    }
+
+    #[test]
+    fn test_unknown_option() {
+        let args = vec!["imv-tui".to_string(), "--nonexistent-flag".to_string()];
+        let err = parse_cli_args_from(args).err().unwrap();
+        assert!(err.contains("Unknown option '--nonexistent-flag'"));
+    }
+
+    #[test]
+    fn test_case_insensitivity_and_aliases() {
+        let args = vec![
+            "imv-tui".to_string(),
+            "--filter".to_string(),
+            "LANCZOS".to_string(),
+            "--protocol".to_string(),
+            "KITTY".to_string(),
+            "--scale".to_string(),
+            "CROP".to_string(),
+        ];
+        let opts = parse_cli_args_from(args).unwrap();
+        assert_eq!(opts.filter, FilterType::Lanczos);
+        assert_eq!(opts.protocol, Some(ProtocolType::Kitty));
+        assert_eq!(opts.scale, ScaleMode::Crop);
+    }
 }

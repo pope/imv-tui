@@ -924,4 +924,134 @@ mod tests {
             let _ = fs::remove_dir_all("target/tmp/scan_test");
         }
     }
+
+    #[test]
+    fn test_magic_bytes_guessing() {
+        let dir = PathBuf::from("target/tmp/magic_test");
+        let _ = fs::create_dir_all(&dir);
+
+        let jpg_path = dir.join("test.jpg");
+        fs::write(&jpg_path, &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]).unwrap();
+
+        let png_path = dir.join("test.png");
+        fs::write(&png_path, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+        let zip_path = dir.join("test.zip");
+        fs::write(&zip_path, &[0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x00]).unwrap();
+
+        let txt_path = dir.join("test.txt");
+        fs::write(&txt_path, b"hello world this is a text file").unwrap();
+
+        // Test guess_file_type
+        assert_eq!(guess_file_type(&jpg_path), Some(GuessType::Image));
+        assert_eq!(guess_file_type(&png_path), Some(GuessType::Image));
+        assert_eq!(guess_file_type(&zip_path), Some(GuessType::Zip));
+        assert_eq!(guess_file_type(&txt_path), None);
+
+        // Test is_image_file with check_magic = true
+        assert!(is_image_file(&jpg_path, true));
+        assert!(is_image_file(&png_path, true));
+        assert!(!is_image_file(&zip_path, true));
+        assert!(!is_image_file(&txt_path, true));
+
+        // Test is_cbz_or_zip with check_magic = true
+        assert!(is_cbz_or_zip(&zip_path, true));
+        assert!(!is_cbz_or_zip(&jpg_path, true));
+        assert!(!is_cbz_or_zip(&txt_path, true));
+
+        // Test with check_magic = false (extension-only)
+        assert!(is_image_file(&jpg_path, false));
+        assert!(is_cbz_or_zip(&zip_path, false));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_cbz_page_decoding() {
+        let zip_path = PathBuf::from("target/tmp/test_cbz.cbz");
+        let _ = fs::create_dir_all("target/tmp");
+
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::<()>::default();
+
+            zip.start_file("cover.png", options).unwrap();
+            use std::io::Write;
+            zip.write_all(b"fake png data").unwrap();
+
+            zip.start_file("page1.jpg", options).unwrap();
+            zip.write_all(b"fake jpg data").unwrap();
+
+            zip.start_file("README.txt", options).unwrap();
+            zip.write_all(b"text file").unwrap();
+
+            zip.start_file("subfolder/page2.webp", options).unwrap();
+            zip.write_all(b"fake webp data").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        // Test list_cbz_pages
+        let pages = list_cbz_pages(&zip_path).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0], "cover.png");
+        assert_eq!(pages[1], "page1.jpg");
+        assert_eq!(pages[2], "subfolder/page2.webp");
+
+        // Test read_source_bytes_limited from inside CBZ
+        let src = ImageSource::Cbz {
+            zip_path: zip_path.clone(),
+            file_in_zip: "cover.png".to_string(),
+        };
+        let bytes_limited = read_source_bytes_limited(&src, 4).unwrap();
+        assert_eq!(bytes_limited, b"fake");
+
+        let bytes_all = read_source_bytes(&src).unwrap();
+        assert_eq!(bytes_all, b"fake png data");
+
+        // Test collect_sources
+        let sources = collect_sources(&[zip_path.clone()], true).unwrap();
+        assert_eq!(sources.len(), 3);
+        match &sources[0] {
+            ImageSource::Cbz { file_in_zip, .. } => assert_eq!(file_in_zip, "cover.png"),
+            _ => panic!("Expected Cbz source"),
+        }
+
+        let _ = fs::remove_file(zip_path);
+    }
+
+    #[test]
+    fn test_read_source_bytes_limited_local() {
+        let dir = PathBuf::from("target/tmp/limited_test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.dat");
+        fs::write(&path, b"0123456789").unwrap();
+
+        let src = ImageSource::Local(path.clone());
+        let limited = read_source_bytes_limited(&src, 5).unwrap();
+        assert_eq!(limited, b"01234");
+
+        let unlimited = read_source_bytes_limited(&src, 50).unwrap();
+        assert_eq!(unlimited, b"0123456789");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_empty_or_corrupt_exif() {
+        let empty_bytes = &[];
+        assert_eq!(
+            get_exif_orientation(empty_bytes),
+            image::metadata::Orientation::NoTransforms
+        );
+        assert!(extract_jpeg_thumbnail(empty_bytes).is_none());
+
+        let corrupt_bytes = &[0x01, 0x02, 0x03, 0x04];
+        assert_eq!(
+            get_exif_orientation(corrupt_bytes),
+            image::metadata::Orientation::NoTransforms
+        );
+        assert!(extract_jpeg_thumbnail(corrupt_bytes).is_none());
+    }
 }

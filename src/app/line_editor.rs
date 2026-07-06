@@ -363,4 +363,83 @@ mod tests {
         assert_eq!(le.value(), "");
         assert_eq!(le.cursor_char_idx(), 0);
     }
+
+    fn make_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn test_utf8_char_boundaries() {
+        let mut le = LineEditor::new();
+        // Emojis are 4 bytes each, Japanese chars are 3 bytes
+        le.insert_char('💖');
+        le.insert_char('画');
+        le.insert_char('像');
+        assert_eq!(le.value(), "💖画像");
+        assert_eq!(le.cursor_char_idx(), 3);
+        assert_eq!(le.cursor_byte_offset(), 10); // 4 + 3 + 3
+
+        // Move left once (behind '像')
+        le.move_left();
+        assert_eq!(le.cursor_char_idx(), 2);
+        assert_eq!(le.cursor_byte_offset(), 7); // 4 + 3
+
+        // Delete '像'
+        assert!(le.delete());
+        assert_eq!(le.value(), "💖画");
+        assert_eq!(le.cursor_char_idx(), 2);
+
+        // Backspace '画'
+        assert!(le.backspace());
+        assert_eq!(le.value(), "💖");
+        assert_eq!(le.cursor_char_idx(), 1);
+    }
+
+    #[test]
+    fn test_delete_word_before_edge_cases() {
+        let mut le = LineEditor::new();
+
+        // Empty
+        assert!(!le.delete_word_before());
+
+        // Only spaces
+        for _ in 0..4 {
+            le.insert_char(' ');
+        }
+        assert!(le.delete_word_before());
+        assert_eq!(le.value(), "");
+        assert_eq!(le.cursor_char_idx(), 0);
+
+        // Multiple spaces between words
+        for c in "hello   world".chars() {
+            le.insert_char(c);
+        }
+        assert!(le.delete_word_before());
+        assert_eq!(le.value(), "hello   ");
+        assert_eq!(le.cursor_char_idx(), 8);
+    }
+
+    #[test]
+    fn test_navigation_saturation() {
+        let mut le = LineEditor::new();
+        le.insert_char('a');
+
+        // Saturates to 0 on left
+        le.move_left();
+        le.move_left();
+        assert_eq!(le.cursor_char_idx(), 0);
+
+        // Saturates to 1 on right
+        le.move_right();
+        le.move_right();
+        assert_eq!(le.cursor_char_idx(), 1);
+    }
+
+    #[test]
+    fn test_unconsumed_key_events() {
+        let mut le = LineEditor::new();
+        // Shift + Enter should bubble up
+        let key = make_key(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(le.handle_key_event(&key), EditorResult::NotConsumed);
+    }
 }

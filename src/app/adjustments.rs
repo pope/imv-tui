@@ -101,4 +101,57 @@ mod tests {
         let adj4 = "+10".parse::<Adjustment<i32>>().unwrap();
         assert_eq!(adj4, Adjustment::RelativeAdd(10));
     }
+
+    #[test]
+    fn test_brightness_clamping() {
+        use crate::imaging::types::Brightness;
+        let mut b = Brightness::new(250);
+        b.adjust(20);
+        assert_eq!(b.value(), 255); // clamped
+
+        let mut b2 = Brightness::new(-250);
+        b2.adjust(-30);
+        assert_eq!(b2.value(), -255); // clamped
+    }
+
+    #[test]
+    fn test_rotation_degree_math() {
+        use crate::imaging::types::Rotation;
+        assert_eq!(Rotation::from_degrees(450), Rotation::D90);
+        assert_eq!(Rotation::from_degrees(540), Rotation::D180);
+        assert_eq!(Rotation::from_degrees(110), Rotation::D0); // non-multiple of 90 defaults to D0
+    }
+
+    #[test]
+    fn test_pan_offset_limits() {
+        use crate::imaging::types::PanOffset;
+        let mut pan = PanOffset::new(1000, -1000);
+        // img dimensions 100x200 limits pan to [-50, 50] x [-100, 100]
+        pan.clamp(100, 200);
+        assert_eq!(pan.x, 50);
+        assert_eq!(pan.y, -100);
+    }
+
+    #[test]
+    fn test_crop_box_normalization() {
+        use crate::imaging::types::CropBox;
+        let crop = CropBox::new(100, 200, 50, 100);
+        assert_eq!(crop.x1, 50);
+        assert_eq!(crop.x2, 100);
+        assert_eq!(crop.y1, 100);
+        assert_eq!(crop.y2, 200);
+    }
+
+    #[test]
+    fn test_zoom_factor_clamping() {
+        use crate::imaging::types::ZoomFactor;
+        let z = ZoomFactor::new(2000.0);
+        assert_eq!(z.value(), 1000.0); // clamped max
+
+        let z2 = ZoomFactor::new(-5.0);
+        assert_eq!(z2.value(), 0.0001); // clamped min
+
+        let z_nan = ZoomFactor::new(f64::NAN);
+        assert_eq!(z_nan.value(), 1.0); // NaN reset
+    }
 }
