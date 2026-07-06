@@ -26,6 +26,8 @@ pub struct CliOptions {
     pub export_path: Option<PathBuf>,
     /// Position of the info bar (top, bottom, none).
     pub infobar: InfoBarPosition,
+    /// If true, scans directories recursively.
+    pub recursive: bool,
 }
 
 /// Reads piped file paths from standard input when stdin is not a terminal,
@@ -127,6 +129,7 @@ where
     let mut export_path = None;
     let mut sync_path = None;
     let mut infobar = InfoBarPosition::Bottom;
+    let mut recursive = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -198,6 +201,10 @@ where
                 check_magic = true;
                 i += 1;
             }
+            "--recursive" | "-R" => {
+                recursive = true;
+                i += 1;
+            }
             "--no-thumbnail" => {
                 no_thumbnail = true;
                 i += 1;
@@ -253,6 +260,7 @@ where
                 println!(
                     "  -m, --check-magic          Check file magic bytes on startup (slower on network drives)"
                 );
+                println!("  -R, --recursive            Scan directories recursively");
                 println!(
                     "      --no-thumbnail         Disable low-res EXIF thumbnail placeholder loading"
                 );
@@ -310,6 +318,7 @@ where
         import_path,
         export_path,
         infobar,
+        recursive,
     })
 }
 
@@ -348,5 +357,22 @@ mod tests {
         let opts = parse_cli_args_from(args3).unwrap();
         assert_eq!(opts.import_path, Some(PathBuf::from("sync.json")));
         assert_eq!(opts.export_path, Some(PathBuf::from("sync.json")));
+    }
+
+    #[test]
+    fn test_recursive_parsing() {
+        let args = vec![
+            "imv-tui".to_string(),
+            "-R".to_string(),
+            "/some/path".to_string(),
+        ];
+        let opts = parse_cli_args_from(args).unwrap();
+        assert!(opts.recursive);
+        assert_eq!(opts.initial_path, Some(PathBuf::from("/some/path")));
+
+        let args2 = vec!["imv-tui".to_string(), "--recursive".to_string()];
+        let opts2 = parse_cli_args_from(args2).unwrap();
+        assert!(opts2.recursive);
+        assert_eq!(opts2.initial_path, None);
     }
 }

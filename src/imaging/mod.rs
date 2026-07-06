@@ -520,6 +520,7 @@ pub fn process_resize(
 pub fn scan_directory(
     initial_path: &Path,
     check_magic: bool,
+    recursive: bool,
 ) -> Result<(Vec<PathBuf>, usize), String> {
     let (dir, file_name) = if initial_path.is_file() {
         let parent = initial_path.parent().unwrap_or_else(|| Path::new("."));
@@ -540,7 +541,35 @@ pub fn scan_directory(
     };
 
     let mut images = Vec::new();
-    if let Ok(entries) = fs::read_dir(&dir) {
+    if recursive {
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![(dir.clone(), 0)]; // Store path and current depth
+        let max_depth = 32;
+
+        while let Some((current_dir, depth)) = stack.pop() {
+            if depth > max_depth {
+                continue;
+            }
+            if let Ok(canonical) = current_dir.canonicalize() {
+                if !visited.insert(canonical) {
+                    continue; // Skip circular symlink
+                }
+            } else {
+                continue;
+            }
+
+            if let Ok(entries) = fs::read_dir(&current_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push((path, depth + 1));
+                    } else if is_image_file(&path, check_magic) {
+                        images.push(path);
+                    }
+                }
+            }
+        }
+    } else if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if is_image_file(&path, check_magic) {
@@ -603,22 +632,22 @@ pub fn is_image_file(path: &Path, check_magic: bool) -> bool {
     if !path.is_file() {
         return false;
     }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && (ext.eq_ignore_ascii_case("png")
-            || ext.eq_ignore_ascii_case("jpg")
-            || ext.eq_ignore_ascii_case("jpeg")
-            || ext.eq_ignore_ascii_case("gif")
-            || ext.eq_ignore_ascii_case("webp")
-            || ext.eq_ignore_ascii_case("bmp")
-            || ext.eq_ignore_ascii_case("tiff")
-            || ext.eq_ignore_ascii_case("ico"))
-    {
-        return true;
-    }
     if check_magic {
         matches!(guess_file_type(path), Some(GuessType::Image))
     } else {
-        false
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| {
+                ext.eq_ignore_ascii_case("png")
+                    || ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("gif")
+                    || ext.eq_ignore_ascii_case("webp")
+                    || ext.eq_ignore_ascii_case("bmp")
+                    || ext.eq_ignore_ascii_case("tiff")
+                    || ext.eq_ignore_ascii_case("ico")
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -627,15 +656,13 @@ pub fn is_cbz_or_zip(path: &Path, check_magic: bool) -> bool {
     if !path.is_file() {
         return false;
     }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && (ext.eq_ignore_ascii_case("cbz") || ext.eq_ignore_ascii_case("zip"))
-    {
-        return true;
-    }
     if check_magic {
         matches!(guess_file_type(path), Some(GuessType::Zip))
     } else {
-        false
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("cbz") || ext.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false)
     }
 }
 
@@ -677,12 +704,22 @@ pub fn collect_sources(paths: &[PathBuf], check_magic: bool) -> Result<Vec<Image
     let mut sources = Vec::with_capacity(paths.len());
     for path in paths {
         if is_cbz_or_zip(path, check_magic) {
-            let pages = list_cbz_pages(path)?;
-            for page in pages {
-                sources.push(ImageSource::Cbz {
-                    zip_path: path.clone(),
-                    file_in_zip: page,
-                });
+            match list_cbz_pages(path) {
+                Ok(pages) => {
+                    for page in pages {
+                        sources.push(ImageSource::Cbz {
+                            zip_path: path.clone(),
+                            file_in_zip: page,
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Skipping corrupt zip archive {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
             }
         } else if is_image_file(path, check_magic) {
             sources.push(ImageSource::Local(path.clone()));
@@ -788,6 +825,49 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
         thumb_img
     };
 
-    // Return the tiny oriented and cropped thumbnail directly without upscaling to avoid massive buffers/CPU overhead
     Some((cropped_thumb, real_w, real_h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_is_image_file_logic() {
+        let _ = fs::create_dir_all("target/tmp");
+        let txt_path = PathBuf::from("target/tmp/fake_image.png");
+        fs::write(&txt_path, "not an image").unwrap();
+
+        // Without check_magic, it matches by extension .png
+        assert!(is_image_file(&txt_path, false));
+
+        // With check_magic, it validates bytes and rejects it
+        assert!(!is_image_file(&txt_path, true));
+
+        let _ = fs::remove_file(txt_path);
+    }
+
+    #[test]
+    fn test_recursive_directory_scan() {
+        let _ = fs::create_dir_all("target/tmp/scan_test/sub");
+        let img1 = PathBuf::from("target/tmp/scan_test/img1.png");
+        let img2 = PathBuf::from("target/tmp/scan_test/sub/img2.jpg");
+        fs::write(&img1, "fake").unwrap();
+        fs::write(&img2, "fake").unwrap();
+
+        // Scan non-recursively
+        let (non_rec_files, _) =
+            scan_directory(&PathBuf::from("target/tmp/scan_test"), false, false).unwrap();
+        assert_eq!(non_rec_files.len(), 1);
+        assert_eq!(non_rec_files[0].file_name().unwrap(), "img1.png");
+
+        // Scan recursively
+        let (rec_files, _) =
+            scan_directory(&PathBuf::from("target/tmp/scan_test"), false, true).unwrap();
+        assert_eq!(rec_files.len(), 2);
+
+        let _ = fs::remove_dir_all("target/tmp/scan_test");
+    }
 }

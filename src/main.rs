@@ -51,6 +51,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let slideshow_opt = options.slideshow;
     let check_magic = options.check_magic;
 
+    if is_piped && initial_path.is_some() {
+        return Err(
+            "Error: Positional path argument cannot be specified when piping input from stdin"
+                .into(),
+        );
+    }
+
+    // Validate recursive scanning option
+    if options.recursive {
+        if is_piped {
+            return Err(
+                "Error: Option --recursive (-R) cannot be used with piped stdin input".into(),
+            );
+        }
+        if let Some(ref path) = initial_path {
+            if is_cbz_or_zip(path, check_magic) {
+                return Err(
+                    "Error: Option --recursive (-R) is not applicable to zip/cbz archives".into(),
+                );
+            }
+            if path.is_file() {
+                return Err(
+                    "Error: Option --recursive (-R) is not applicable when specifying a file path"
+                        .into(),
+                );
+            }
+        }
+    }
+
     // Get the image file list and current starting index
     let (images, current_index) = if is_piped {
         let sources = collect_sources(&piped_files, check_magic)?;
@@ -68,7 +97,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             (sources, 0)
         } else {
-            let (paths, index) = scan_directory(&initial_path, check_magic)?;
+            let (paths, index) = scan_directory(&initial_path, check_magic, options.recursive)?;
             let sources = paths.into_iter().map(ImageSource::Local).collect();
             (sources, index)
         }
