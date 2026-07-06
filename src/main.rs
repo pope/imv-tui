@@ -80,24 +80,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let initial_scan_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
+    let is_cbz = !is_piped && is_cbz_or_zip(&initial_scan_path, check_magic);
+
     // Get the image file list and current starting index
     let (images, current_index) = if is_piped {
         let sources = collect_sources(&piped_files, check_magic)?;
         (sources, 0)
     } else {
-        let initial_path = initial_path.unwrap_or_else(|| PathBuf::from("."));
-        if is_cbz_or_zip(&initial_path, check_magic) {
-            let pages = list_cbz_pages(&initial_path)?;
+        if is_cbz {
+            let pages = list_cbz_pages(&initial_scan_path)?;
             let sources = pages
                 .into_iter()
                 .map(|page| ImageSource::Cbz {
-                    zip_path: initial_path.clone(),
+                    zip_path: initial_scan_path.clone(),
                     file_in_zip: page,
                 })
                 .collect();
             (sources, 0)
         } else {
-            let (paths, index) = scan_directory(&initial_path, check_magic, options.recursive)?;
+            let (paths, index) =
+                scan_directory(&initial_scan_path, check_magic, options.recursive)?;
             let sources = paths.into_iter().map(ImageSource::Local).collect();
             (sources, index)
         }
@@ -115,16 +118,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app
-    let mut app = App::new(
-        images,
-        current_index,
-        picker,
-        initial_filter,
+    let app_config = crate::app::AppConfig {
+        filter_type: initial_filter,
         scale_mode,
-        options.no_thumbnail,
-        options.infobar,
-    )?;
+        disable_thumbnail: options.no_thumbnail,
+        infobar: options.infobar,
+    };
+
+    let scan_config = crate::app::ScanConfig {
+        initial_scan_path,
+        check_magic,
+        recursive: options.recursive,
+        is_cbz,
+        is_piped,
+    };
+
+    // Create app
+    let mut app = App::new(images, current_index, picker, app_config, scan_config)?;
     if let Some(state) = slideshow_opt {
         app.slideshow_state = state;
         app.slideshow_last_transition = std::time::Instant::now();

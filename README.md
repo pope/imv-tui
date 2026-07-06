@@ -66,6 +66,7 @@ ______________________________________________________________________
 | **Jump to View: Picks Only**        | `3`         |                             |
 | **Jump to View: Rejects Only**      | `4`         |                             |
 | **Jump to View: All Files**         | `5`         |                             |
+| **Refresh Files**                   | `F5`        | `Ctrl+r`                    |
 
 ### Text Input & Search Palette Shortcuts
 
@@ -149,6 +150,7 @@ If no path is specified, it scans and opens images from the current directory (`
 - `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection). `halfblock` maps to `halfblocks`.
 - `-t, --slideshow <seconds>`: Start the slideshow with the given delay in seconds.
 - `-m, --check-magic`: Check file magic bytes on startup (slower on network drives).
+- `-R, --recursive`: Scan directories recursively.
 - `--no-thumbnail`: Disable low-res EXIF thumbnail placeholder loading entirely.
 - `--infobar <top|bottom|none>`: Set the position of the status infobar (defaults to `bottom`).
 - `-i, --import <file>`: Import image classification/flagged states from a file (.json or prefix text).

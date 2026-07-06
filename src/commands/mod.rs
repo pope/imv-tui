@@ -69,6 +69,8 @@ pub enum Command {
     MarkReject,
     /// Remove any pick/reject flags from the current image.
     Unflag,
+    /// Refresh the files in the scanned directory.
+    RefreshFiles,
     /// Cycle the display view mode filter.
     CycleView,
     /// Set view mode to Unflagged + Picks.
@@ -402,6 +404,12 @@ impl Command {
                 description: "Remove any pick/reject flags from the current image",
                 show_in_palette: true,
                 shortcuts: Some(&[KeyDef::Char('u')]),
+            },
+            Self::RefreshFiles => CommandItem {
+                name: "Refresh Files",
+                description: "Re-scan the directory or CBZ archive to pick up any added or removed files",
+                show_in_palette: true,
+                shortcuts: Some(&[KeyDef::Code(event::KeyCode::F(5)), KeyDef::Ctrl('r')]),
             },
             Self::CycleView => CommandItem {
                 name: "Cycle View Filter",

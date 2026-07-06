@@ -29,7 +29,7 @@ use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
     Brightness, Contrast, CropBox, DecodedImage, FilterType, ImageIntersection, ImageSource,
     LoaderRequest, LoaderResponse, PanOffset, ResizeRequest, Rotation, ScaleMode, ZoomFactor,
-    process_resize,
+    list_cbz_pages, process_resize, scan_directory,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +65,25 @@ pub struct ResizeResponse {
     pub target_width: u32,
     pub target_height: u32,
     pub sequence: u64,
+}
+
+/// Configuration parameters for app components.
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub filter_type: FilterType,
+    pub scale_mode: ScaleMode,
+    pub disable_thumbnail: bool,
+    pub infobar: InfoBarPosition,
+}
+
+/// Configuration parameters for directory/archive scanning.
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    pub initial_scan_path: std::path::PathBuf,
+    pub check_magic: bool,
+    pub recursive: bool,
+    pub is_cbz: bool,
+    pub is_piped: bool,
 }
 
 /// The central application state controller.
@@ -171,6 +190,8 @@ pub struct App {
     pub infobar: InfoBarPosition,
     /// Classifications and adjustments loaded from import files for sources not present in the current queue.
     pub unmapped_classifications: HashMap<String, (Classification, ImageAdjustments)>,
+    /// Configuration for directory/archive scanning.
+    pub scan_config: ScanConfig,
 }
 
 impl App {
@@ -180,10 +201,8 @@ impl App {
         images: Vec<ImageSource>,
         current_index: usize,
         picker: Picker,
-        filter_type: FilterType,
-        scale_mode: ScaleMode,
-        disable_thumbnail: bool,
-        infobar: InfoBarPosition,
+        config: AppConfig,
+        scan_config: ScanConfig,
     ) -> Result<Self, String> {
         let queue = ImageQueue::new(images, current_index)?;
 
@@ -219,6 +238,7 @@ impl App {
         let (response_tx, response_rx) = mpsc::channel::<LoaderResponse>();
 
         // Spawn persistent background loader thread
+        let disable_thumbnail = config.disable_thumbnail;
         std::thread::spawn(move || {
             while let Ok(req) = loader_rx.recv() {
                 let mut requests = vec![req];
@@ -329,8 +349,8 @@ impl App {
             palette_width: 0,
             palette_height: 0,
             prompt_type: None,
-            filter_type,
-            scale_mode,
+            filter_type: config.filter_type,
+            scale_mode: config.scale_mode,
             matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT),
             resize_tx,
             protocol_rx,
@@ -346,12 +366,13 @@ impl App {
             slideshow_last_transition: std::time::Instant::now(),
             stats: StatsForNerds::default(),
             last_info_toggle: None,
-            disable_thumbnail,
+            disable_thumbnail: config.disable_thumbnail,
             view_mode: ViewMode::Default,
             classifications: vec![Classification::Unflagged; num_images],
             adjustments: vec![ImageAdjustments::default(); num_images],
-            infobar,
+            infobar: config.infobar,
             unmapped_classifications: HashMap::new(),
+            scan_config,
         };
 
         app.start_load_image();
@@ -484,6 +505,121 @@ impl App {
             .get(self.queue.current_index)
             .cloned()
             .unwrap_or(Classification::Unflagged)
+    }
+
+    /// Re-scans the directory or CBZ archive to pick up any added or removed files, preserving existing classifications/adjustments.
+    pub fn refresh_files(&mut self) -> Result<(), String> {
+        if self.scan_config.is_piped {
+            return Err("Refresh is not supported for piped stdin inputs".to_string());
+        }
+
+        // Get the current selected image identifier, if any, to preserve the position
+        let current_ident = self
+            .queue
+            .images
+            .get(self.queue.current_index)
+            .map(|img| img.identifier());
+
+        // Scan the directory or archive again
+        let new_images = if self.scan_config.is_cbz {
+            let pages = list_cbz_pages(&self.scan_config.initial_scan_path)?;
+            pages
+                .into_iter()
+                .map(|page| ImageSource::Cbz {
+                    zip_path: self.scan_config.initial_scan_path.clone(),
+                    file_in_zip: page,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let (paths, _) = scan_directory(
+                &self.scan_config.initial_scan_path,
+                self.scan_config.check_magic,
+                self.scan_config.recursive,
+            )?;
+            paths
+                .into_iter()
+                .map(ImageSource::Local)
+                .collect::<Vec<_>>()
+        };
+
+        if new_images.is_empty() {
+            return Err("No supported images found".to_string());
+        }
+
+        // Build mapping from identifier to (classification, adjustments) from the old queue
+        let mut old_mapping = HashMap::new();
+        for (idx, img) in self.queue.images.iter().enumerate() {
+            let ident = img.identifier();
+            let class = self
+                .classifications
+                .get(idx)
+                .cloned()
+                .unwrap_or(Classification::Unflagged);
+            let adj = self.adjustments.get(idx).cloned().unwrap_or_default();
+            old_mapping.insert(ident, (class, adj));
+        }
+
+        // Prepare new vectors
+        let num_new_images = new_images.len();
+        let mut new_classifications = vec![Classification::Unflagged; num_new_images];
+        let mut new_adjustments = vec![ImageAdjustments::default(); num_new_images];
+
+        // Match new images against old mapping and unmapped_classifications
+        for (idx, img) in new_images.iter().enumerate() {
+            let ident = img.identifier();
+            if let Some((class, adj)) = old_mapping.remove(&ident) {
+                new_classifications[idx] = class;
+                new_adjustments[idx] = adj;
+            } else if let Some((class, adj)) = self.unmapped_classifications.remove(&ident) {
+                new_classifications[idx] = class;
+                new_adjustments[idx] = adj;
+            }
+        }
+
+        // Move remaining old items that were flagged/adjusted to unmapped_classifications
+        for (ident, (class, adj)) in old_mapping {
+            if class != Classification::Unflagged || adj != ImageAdjustments::default() {
+                self.unmapped_classifications.insert(ident, (class, adj));
+            }
+        }
+
+        // Find the index of the previously selected image in the new queue
+        let new_index = if let Some(ref target_ident) = current_ident {
+            new_images
+                .iter()
+                .position(|img| img.identifier() == *target_ident)
+                .unwrap_or_else(|| self.queue.current_index.min(num_new_images - 1))
+        } else {
+            0
+        };
+
+        // Clear prefetch cache immediately since index associations have changed
+        self.prefetch_cache.lock().unwrap().clear();
+
+        // Create the new ImageQueue
+        self.queue = ImageQueue::new(new_images, new_index)?;
+        self.classifications = new_classifications;
+        self.adjustments = new_adjustments;
+
+        // Reset search/fuzzy matching filtered files
+        self.filtered_files = self
+            .queue
+            .relative_paths
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| (idx, path.clone()))
+            .collect();
+
+        // Adjust selected index for visibility in case files are filtered out
+        self.adjust_current_index_for_visibility();
+
+        // Reload current image to apply adjustments immediately
+        self.start_load_image();
+
+        self.needs_update = true;
+        self.needs_clear = true;
+
+        Ok(())
     }
 
     /// Imports image classification states and adjustments from a text file or a JSON manifest.
@@ -736,6 +872,11 @@ impl App {
             Command::MarkPick => self.mark_pick(),
             Command::MarkReject => self.mark_reject(),
             Command::Unflag => self.unflag_image(),
+            Command::RefreshFiles => {
+                if let Err(e) = self.refresh_files() {
+                    self.error_message = Some(e);
+                }
+            }
             Command::CycleView => self.cycle_view_mode(),
             Command::SetViewDefault => self.set_view_mode(ViewMode::Default),
             Command::SetViewUnflagged => self.set_view_mode(ViewMode::Unflagged),
@@ -1074,7 +1215,7 @@ impl App {
         let mut received = false;
         while let Ok(resp) = self.response_rx.try_recv() {
             received = true;
-            if resp.sequence < self.current_sequence && !resp.is_prefetch {
+            if resp.sequence < self.current_sequence {
                 continue;
             }
 
@@ -1904,6 +2045,7 @@ mod tests {
     use crate::app::classifications::ClassificationJsonItem;
     use crate::imaging::ImageSource;
     use ratatui_image::picker::Picker;
+    use std::fs;
     use std::path::PathBuf;
 
     #[test]
@@ -1922,16 +2064,20 @@ mod tests {
         ];
 
         let picker = Picker::halfblocks();
-        let mut app = App::new(
-            images.clone(),
-            0,
-            picker,
-            crate::imaging::FilterType::Nearest,
-            crate::imaging::ScaleMode::Shrink,
-            true,
-            InfoBarPosition::Bottom,
-        )
-        .unwrap();
+        let app_config = AppConfig {
+            filter_type: crate::imaging::FilterType::Nearest,
+            scale_mode: crate::imaging::ScaleMode::Shrink,
+            disable_thumbnail: true,
+            infobar: InfoBarPosition::Bottom,
+        };
+        let scan_config = ScanConfig {
+            initial_scan_path: PathBuf::from("."),
+            check_magic: false,
+            recursive: false,
+            is_cbz: false,
+            is_piped: false,
+        };
+        let mut app = App::new(images.clone(), 0, picker, app_config, scan_config).unwrap();
 
         app.classifications[0] = Classification::Pick;
         app.classifications[1] = Classification::Reject;
@@ -2057,16 +2203,20 @@ mod tests {
         let images = vec![ImageSource::Local(PathBuf::from("active.png"))];
 
         let picker = Picker::halfblocks();
-        let mut app = App::new(
-            images,
-            0,
-            picker,
-            crate::imaging::FilterType::Nearest,
-            crate::imaging::ScaleMode::Shrink,
-            true,
-            InfoBarPosition::Bottom,
-        )
-        .unwrap();
+        let app_config = AppConfig {
+            filter_type: crate::imaging::FilterType::Nearest,
+            scale_mode: crate::imaging::ScaleMode::Shrink,
+            disable_thumbnail: true,
+            infobar: InfoBarPosition::Bottom,
+        };
+        let scan_config = ScanConfig {
+            initial_scan_path: PathBuf::from("."),
+            check_magic: false,
+            recursive: false,
+            is_cbz: false,
+            is_piped: false,
+        };
+        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
 
         // Initially no unmapped files
         assert!(app.unmapped_classifications.is_empty());
@@ -2115,5 +2265,141 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_file(manifest_path);
         let _ = std::fs::remove_file(export_path);
+    }
+
+    #[test]
+    fn test_refresh_files_preservation() {
+        let _ = fs::create_dir_all("target/tmp/refresh_test");
+        let img1_path = PathBuf::from("target/tmp/refresh_test/img1.png");
+        fs::write(&img1_path, "fake").unwrap();
+
+        let images = vec![ImageSource::Local(img1_path.clone())];
+        let picker = Picker::halfblocks();
+
+        let app_config = AppConfig {
+            filter_type: crate::imaging::FilterType::Nearest,
+            scale_mode: crate::imaging::ScaleMode::Shrink,
+            disable_thumbnail: true,
+            infobar: InfoBarPosition::Bottom,
+        };
+        let scan_config = ScanConfig {
+            initial_scan_path: PathBuf::from("target/tmp/refresh_test"),
+            check_magic: false,
+            recursive: false,
+            is_cbz: false,
+            is_piped: false,
+        };
+        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+
+        // Flag the first image as a Pick
+        app.classifications[0] = Classification::Pick;
+        app.adjustments[0].brightness = Brightness::new(15);
+
+        // Add a second image to the directory
+        let img2_path = PathBuf::from("target/tmp/refresh_test/img2.png");
+        fs::write(&img2_path, "fake").unwrap();
+
+        // Refresh the files
+        app.refresh_files().unwrap();
+
+        // Verify we now have 2 images
+        assert_eq!(app.queue.images.len(), 2);
+
+        let current_dir = std::env::current_dir().unwrap();
+        let img1_abs = current_dir.join(&img1_path).to_string_lossy().into_owned();
+        let img2_abs = current_dir.join(&img2_path).to_string_lossy().into_owned();
+
+        // Verify the classification and adjustment for img1 are preserved
+        // Find index of img1 in the new queue
+        let img1_idx = app
+            .queue
+            .images
+            .iter()
+            .position(|img| img.identifier() == img1_abs)
+            .unwrap();
+        assert_eq!(app.classifications[img1_idx], Classification::Pick);
+        assert_eq!(app.adjustments[img1_idx].brightness, Brightness::new(15));
+
+        // Verify img2 is unflagged
+        let img2_idx = app
+            .queue
+            .images
+            .iter()
+            .position(|img| img.identifier() == img2_abs)
+            .unwrap();
+        assert_eq!(app.classifications[img2_idx], Classification::Unflagged);
+
+        // Clean up
+        let _ = fs::remove_dir_all("target/tmp/refresh_test");
+    }
+
+    #[test]
+    fn test_refresh_files_unmapped_migration() {
+        let _ = fs::create_dir_all("target/tmp/refresh_unmapped_test");
+        let img1_path = PathBuf::from("target/tmp/refresh_unmapped_test/img1.png");
+        let img2_path = PathBuf::from("target/tmp/refresh_unmapped_test/img2.png");
+        fs::write(&img1_path, "fake1").unwrap();
+        fs::write(&img2_path, "fake2").unwrap();
+
+        let images = vec![
+            ImageSource::Local(img1_path.clone()),
+            ImageSource::Local(img2_path.clone()),
+        ];
+        let picker = Picker::halfblocks();
+        let app_config = AppConfig {
+            filter_type: crate::imaging::FilterType::Nearest,
+            scale_mode: crate::imaging::ScaleMode::Shrink,
+            disable_thumbnail: true,
+            infobar: InfoBarPosition::Bottom,
+        };
+        let scan_config = ScanConfig {
+            initial_scan_path: PathBuf::from("target/tmp/refresh_unmapped_test"),
+            check_magic: false,
+            recursive: false,
+            is_cbz: false,
+            is_piped: false,
+        };
+        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+
+        // Flag img2 and set contrast
+        app.classifications[1] = Classification::Reject;
+        app.adjustments[1].contrast = Contrast::new(3.0);
+
+        let current_dir = std::env::current_dir().unwrap();
+        let img2_abs = current_dir.join(&img2_path).to_string_lossy().into_owned();
+
+        // Delete img2 from disk
+        fs::remove_file(&img2_path).unwrap();
+
+        // Refresh files - img2 is now missing
+        app.refresh_files().unwrap();
+
+        // Verify we only have 1 active image (img1)
+        assert_eq!(app.queue.images.len(), 1);
+
+        // Verify img2's classification & adjustments migrated to unmapped_classifications
+        let entry = app.unmapped_classifications.get(&img2_abs).unwrap();
+        assert_eq!(entry.0, Classification::Reject);
+        assert_eq!(entry.1.contrast, Contrast::new(3.0));
+
+        // Re-create img2 on disk
+        fs::write(&img2_path, "fake2").unwrap();
+
+        // Refresh files again - img2 should be restored and removed from unmapped
+        app.refresh_files().unwrap();
+        assert_eq!(app.queue.images.len(), 2);
+
+        let img2_idx = app
+            .queue
+            .images
+            .iter()
+            .position(|img| img.identifier() == img2_abs)
+            .unwrap();
+        assert_eq!(app.classifications[img2_idx], Classification::Reject);
+        assert_eq!(app.adjustments[img2_idx].contrast, Contrast::new(3.0));
+        assert!(!app.unmapped_classifications.contains_key(&img2_abs));
+
+        // Clean up
+        let _ = fs::remove_dir_all("target/tmp/refresh_unmapped_test");
     }
 }

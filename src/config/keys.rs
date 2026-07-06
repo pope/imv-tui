@@ -83,6 +83,7 @@ impl std::fmt::Display for KeyDef {
                 event::KeyCode::Up => write!(f, "Up"),
                 event::KeyCode::Down => write!(f, "Down"),
                 event::KeyCode::Char(' ') => write!(f, "Space"),
+                event::KeyCode::F(n) => write!(f, "F{}", n),
                 _ => write!(f, "Other"),
             },
             Self::Ctrl(c) => write!(f, "Ctrl+{}", c),

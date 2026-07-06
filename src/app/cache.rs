@@ -37,7 +37,11 @@ pub fn get_sliding_window_indices(
     let mut indices = Vec::new();
     indices.push(visible[current_pos]);
     for i in 1..=n {
-        let prev = (current_pos + total - i) % total;
+        let prev = if current_pos >= i % total {
+            current_pos - (i % total)
+        } else {
+            current_pos + total - (i % total)
+        };
         let next = (current_pos + i) % total;
         indices.push(visible[prev]);
         indices.push(visible[next]);
