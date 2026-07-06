@@ -38,6 +38,14 @@ impl Classification {
             Self::Reject => "❌ ",
         }
     }
+
+    pub fn export_prefix(&self) -> &'static str {
+        match self {
+            Self::Pick => "PICK",
+            Self::Reject => "REJECT",
+            Self::Unflagged => "UNFLAGGED",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,9 +165,12 @@ pub fn export_to_file(
     images: &[ImageSource],
     classifications: &[Classification],
     adjustments: &[ImageAdjustments],
+    unmapped_entries: &HashMap<String, (Classification, ImageAdjustments)>,
 ) -> Result<(), String> {
     let mut text_lines = Vec::new();
     let mut json_items = Vec::new();
+    let active_idents: std::collections::HashSet<String> =
+        images.iter().map(|img| img.identifier()).collect();
 
     for (idx, img) in images.iter().enumerate() {
         let class = classifications
@@ -221,12 +232,43 @@ pub fn export_to_file(
 
         // For text export: only write if flagged
         if class != Classification::Unflagged {
-            let text_state = match class {
-                Classification::Pick => "PICK",
-                Classification::Reject => "REJECT",
-                Classification::Unflagged => "UNFLAGGED",
-            };
-            text_lines.push(format!("{}\t{}", text_state, ident));
+            text_lines.push(format!("{}\t{}", class.export_prefix(), ident));
+        }
+    }
+
+    // Export unmapped entries as well to prevent data loss
+    for (key, &(class, adj)) in unmapped_entries {
+        if active_idents.contains(key) {
+            continue;
+        }
+
+        if class == Classification::Unflagged && adj == ImageAdjustments::default() {
+            continue;
+        }
+
+        let (archive, filename) = if let Some((archive_path, file_in_zip)) = key.split_once("::") {
+            (Some(archive_path.to_string()), file_in_zip.to_string())
+        } else {
+            (None, key.clone())
+        };
+
+        let flag_str = match class {
+            Classification::Pick => "picked",
+            Classification::Reject => "rejected",
+            Classification::Unflagged => "unflagged",
+        };
+
+        json_items.push(ClassificationJsonItem {
+            archive,
+            filename,
+            flag: flag_str.to_string(),
+            brightness: adj.brightness,
+            contrast: adj.contrast,
+            rotation: adj.rotation,
+        });
+
+        if class != Classification::Unflagged {
+            text_lines.push(format!("{}\t{}", class.export_prefix(), key));
         }
     }
 

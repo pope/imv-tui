@@ -206,12 +206,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .cloned()
                 .unwrap_or(Classification::Unflagged);
             if class != Classification::Unflagged {
-                let state_str = match class {
-                    Classification::Pick => "PICK",
-                    Classification::Reject => "REJECT",
-                    Classification::Unflagged => "UNFLAGGED",
-                };
-                println!("{}\t{}", state_str, img.identifier());
+                println!("{}\t{}", class.export_prefix(), img.identifier());
+            }
+        }
+        for (key, &(class, _)) in &app.unmapped_classifications {
+            if class != Classification::Unflagged {
+                println!("{}\t{}", class.export_prefix(), key);
             }
         }
     }

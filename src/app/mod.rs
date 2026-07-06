@@ -169,6 +169,8 @@ pub struct App {
     pub adjustments: Vec<ImageAdjustments>,
     /// Position of the info bar (top, bottom, none).
     pub infobar: InfoBarPosition,
+    /// Classifications and adjustments loaded from import files for sources not present in the current queue.
+    pub unmapped_classifications: HashMap<String, (Classification, ImageAdjustments)>,
 }
 
 impl App {
@@ -349,6 +351,7 @@ impl App {
             classifications: vec![Classification::Unflagged; num_images],
             adjustments: vec![ImageAdjustments::default(); num_images],
             infobar,
+            unmapped_classifications: HashMap::new(),
         };
 
         app.start_load_image();
@@ -485,16 +488,20 @@ impl App {
 
     /// Imports image classification states and adjustments from a text file or a JSON manifest.
     pub fn import_classifications(&mut self, import_path: &std::path::Path) -> Result<(), String> {
-        let imported = import_from_file(import_path)?;
+        let mut imported = import_from_file(import_path)?;
 
         // Apply imported states to existing files
         for (idx, img) in self.queue.images.iter().enumerate() {
             let ident = img.identifier();
-            if let Some(&(class, adj)) = imported.get(&ident) {
+            if let Some((class, adj)) = imported.remove(&ident) {
                 self.classifications[idx] = class;
                 self.adjustments[idx] = adj;
             }
+            self.unmapped_classifications.remove(&ident);
         }
+
+        // Store the remaining unmapped entries
+        self.unmapped_classifications.extend(imported);
 
         // Adjust selected index for visibility in case files are filtered out
         self.adjust_current_index_for_visibility();
@@ -512,6 +519,7 @@ impl App {
             &self.queue.images,
             &self.classifications,
             &self.adjustments,
+            &self.unmapped_classifications,
         )
     }
 
@@ -2001,5 +2009,107 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_file(json_path);
         let _ = std::fs::remove_file(txt_path);
+    }
+
+    #[test]
+    fn test_unmapped_classifications_preservation() {
+        let _ = std::fs::create_dir_all("target/tmp");
+        let manifest_path = PathBuf::from("target/tmp/unmapped_test.json");
+
+        let current_dir = std::env::current_dir().unwrap();
+        let active_abs = current_dir
+            .join("active.png")
+            .to_string_lossy()
+            .into_owned();
+        let missing_abs = current_dir
+            .join("missing.png")
+            .to_string_lossy()
+            .into_owned();
+
+        // Write a mock manifest containing two files:
+        // - active_abs (which will be present in the session queue)
+        // - missing_abs (which will NOT be in the session queue)
+        let mock_items = vec![
+            ClassificationJsonItem {
+                archive: None,
+                filename: active_abs.clone(),
+                flag: "picked".to_string(),
+                brightness: Brightness::new(10),
+                contrast: Contrast::ZERO,
+                rotation: Rotation::D0,
+            },
+            ClassificationJsonItem {
+                archive: None,
+                filename: missing_abs.clone(),
+                flag: "rejected".to_string(),
+                brightness: Brightness::ZERO,
+                contrast: Contrast::new(2.5),
+                rotation: Rotation::D0,
+            },
+        ];
+        let manifest_content = serde_json::to_string(&mock_items).unwrap();
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+
+        let images = vec![ImageSource::Local(PathBuf::from("active.png"))];
+
+        let picker = Picker::halfblocks();
+        let mut app = App::new(
+            images,
+            0,
+            picker,
+            crate::imaging::FilterType::Nearest,
+            crate::imaging::ScaleMode::Shrink,
+            true,
+            InfoBarPosition::Bottom,
+        )
+        .unwrap();
+
+        // Initially no unmapped files
+        assert!(app.unmapped_classifications.is_empty());
+
+        // Import the classifications
+        app.import_classifications(&manifest_path).unwrap();
+
+        // "active.png" should be mapped to the active classifications/adjustments
+        assert_eq!(app.classifications[0], Classification::Pick);
+        assert_eq!(app.adjustments[0].brightness, Brightness::new(10));
+
+        // "missing.png" should be stored in the unmapped classifications
+        assert_eq!(app.unmapped_classifications.len(), 1);
+        let unmapped_val = app.unmapped_classifications.get(&active_abs);
+        assert!(unmapped_val.is_none());
+        let unmapped_val = app.unmapped_classifications.get(&missing_abs).unwrap();
+        assert_eq!(unmapped_val.0, Classification::Reject);
+        assert_eq!(unmapped_val.1.contrast, Contrast::new(2.5));
+
+        // Now export classifications to a new JSON file
+        let export_path = PathBuf::from("target/tmp/unmapped_test_exported.json");
+        app.export_classifications(&export_path).unwrap();
+
+        // Read the exported file and verify it contains BOTH files
+        let exported_content = std::fs::read_to_string(&export_path).unwrap();
+        let parsed_json: Vec<ClassificationJsonItem> =
+            serde_json::from_str(&exported_content).unwrap();
+
+        assert_eq!(parsed_json.len(), 2);
+
+        // Find each item
+        let active_item = parsed_json
+            .iter()
+            .find(|item| item.filename == active_abs)
+            .unwrap();
+        assert_eq!(active_item.flag, "picked");
+        assert_eq!(active_item.brightness, Brightness::new(10));
+
+        let missing_item = parsed_json
+            .iter()
+            .find(|item| item.filename == missing_abs)
+            .unwrap();
+        assert_eq!(missing_item.flag, "rejected");
+        assert_eq!(missing_item.contrast, Contrast::new(2.5));
+
+        // Clean up
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(export_path);
     }
 }
