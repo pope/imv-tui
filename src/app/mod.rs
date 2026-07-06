@@ -1476,6 +1476,9 @@ impl App {
         };
 
         if let Some(img) = active_img {
+            if self.img_width == 0 || self.img_height == 0 {
+                return;
+            }
             let w_orig = self.img_width as f64;
             let h_orig = self.img_height as f64;
 
@@ -1567,6 +1570,9 @@ impl App {
     }
 
     fn get_fit_scale(&self) -> f64 {
+        if self.img_width == 0 || self.img_height == 0 {
+            return 0.0;
+        }
         let (widget_w_cells, widget_h_cells) = self.last_widget_size;
         if widget_w_cells == 0 || widget_h_cells == 0 {
             return 0.0;
@@ -1920,7 +1926,7 @@ impl App {
             return;
         }
         let step = self.pan_step_x();
-        self.pan_offset.x -= step;
+        self.pan_offset.x = self.pan_offset.x.saturating_sub(step);
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1930,7 +1936,7 @@ impl App {
             return;
         }
         let step = self.pan_step_x();
-        self.pan_offset.x += step;
+        self.pan_offset.x = self.pan_offset.x.saturating_add(step);
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1940,7 +1946,7 @@ impl App {
             return;
         }
         let step = self.pan_step_y();
-        self.pan_offset.y -= step;
+        self.pan_offset.y = self.pan_offset.y.saturating_sub(step);
         self.clamp_pan();
         self.needs_update = true;
     }
@@ -1950,29 +1956,71 @@ impl App {
             return;
         }
         let step = self.pan_step_y();
-        self.pan_offset.y += step;
+        self.pan_offset.y = self.pan_offset.y.saturating_add(step);
         self.clamp_pan();
         self.needs_update = true;
     }
 
     fn pan_step_x(&self) -> i64 {
+        let (widget_w_cells, _) = self.last_widget_size;
+        let font_size = self.picker.font_size();
+        let cell_w = if font_size.width == 0 {
+            8
+        } else {
+            font_size.width
+        };
+        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
+
         let s = self.get_fit_scale();
         let scale = if s > 0.0 {
             s * self.zoom_factor.value()
         } else {
             1.0
         };
-        ((self.img_width as f64 * 0.05) / scale).max(1.0) as i64
+
+        let step_px = if widget_w_px > 0.0 {
+            widget_w_px * 0.05
+        } else {
+            self.img_width as f64 * 0.05
+        };
+
+        let step = step_px / scale;
+        if step.is_nan() || step.is_infinite() {
+            self.img_width as i64
+        } else {
+            (step.max(1.0) as i64).min(self.img_width as i64)
+        }
     }
 
     fn pan_step_y(&self) -> i64 {
+        let (_, widget_h_cells) = self.last_widget_size;
+        let font_size = self.picker.font_size();
+        let cell_h = if font_size.height == 0 {
+            16
+        } else {
+            font_size.height
+        };
+        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+
         let s = self.get_fit_scale();
         let scale = if s > 0.0 {
             s * self.zoom_factor.value()
         } else {
             1.0
         };
-        ((self.img_height as f64 * 0.05) / scale).max(1.0) as i64
+
+        let step_px = if widget_h_px > 0.0 {
+            widget_h_px * 0.05
+        } else {
+            self.img_height as f64 * 0.05
+        };
+
+        let step = step_px / scale;
+        if step.is_nan() || step.is_infinite() {
+            self.img_height as i64
+        } else {
+            (step.max(1.0) as i64).min(self.img_height as i64)
+        }
     }
 
     pub fn rotate_clockwise(&mut self) {
@@ -2578,6 +2626,49 @@ mod tests {
         app.update_channels();
         assert_eq!(app.error_message.as_deref(), Some("Corrupt image file"));
         assert!(app.original_image.is_none());
+    }
+
+    #[test]
+    fn test_panning_safety_and_bounds() {
+        let mut app = setup_test_app();
+
+        // 1. Initial state
+        assert_eq!(app.pan_offset.x, 0);
+        assert_eq!(app.pan_offset.y, 0);
+
+        // Mock a loaded image width and height
+        app.img_width = 800;
+        app.img_height = 600;
+        app.is_loading = false;
+        app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(800, 600),
+        )));
+
+        // Set last widget size to zero
+        app.last_widget_size = (0, 0);
+        let step_x = app.pan_step_x();
+        let step_y = app.pan_step_y();
+        // Since widget size is zero, s should be 0.0, which falls back to scale 1.0, and step_px should fall back to img_width * 0.05
+        assert_eq!(step_x, (800.0 * 0.05) as i64);
+        assert_eq!(step_y, (600.0 * 0.05) as i64);
+
+        // 2. Extremely tiny scale or zero division checks
+        app.last_widget_size = (10, 10);
+        // Let's set zoom_factor extremely small
+        app.zoom_factor = crate::imaging::types::ZoomFactor::new(0.0001);
+        let step_x_large = app.pan_step_x();
+        // The step is clamped to image width/height to avoid infinite or giant jumps
+        assert!(step_x_large <= 800);
+        assert!(step_x_large >= 1);
+
+        // 3. Test saturating math in panning methods
+        app.pan_offset.x = i64::MAX - 5;
+        app.pan_right(); // should use saturating_add and then clamp back to max_pan_x (which is 800/2 = 400)
+        assert_eq!(app.pan_offset.x, 400);
+
+        app.pan_offset.x = i64::MIN + 5;
+        app.pan_left(); // should use saturating_sub and then clamp back to -max_pan_x (-400)
+        assert_eq!(app.pan_offset.x, -400);
     }
 
     fn setup_test_app() -> App {
