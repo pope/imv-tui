@@ -2,10 +2,13 @@
 
 This workspace contains specialized agent skills under `.agents/skills/` to provide detailed implementation guidelines and learnings:
 
-- **\[terminal-graphics\](file:///.agents/skills/terminal_graphics/SKILL.md)**: Sixel/Kitty redrawing protocols, selective clearing, double-buffering overlays, and repeat event coalescing.
-- **\[image-processing\](file:///.agents/skills/image_processing/SKILL.md)**: Aspect-ratio crop mapping, zooming beyond 1:1, canvas panning limits, cache prefetching, and one-hit memory decodes.
-- **\[tui-architecture\](file:///.agents/skills/tui_architecture/SKILL.md)**: RAII safety guards, pure rendering viewports, unified input maps, and modular separations.
-- **\[code-review\](file:///.agents/skills/code_review/SKILL.md)**: Core code review framework, validation checklists, async boundaries, and type safety constraints.
+- **\[terminal-graphics\](file:///.agents/skills/terminal_graphics/SKILL.md)**: Sixel/Kitty redrawing protocols, selective clearing, and input repeat coalescing.
+- **\[image-processing\](file:///.agents/skills/image_processing/SKILL.md)**: Aspect-ratio crop mapping, zooming beyond 1:1, canvas panning limits, cache prefetching, and EXIF metadata decodes.
+- **\[tui-architecture\](file:///.agents/skills/tui_architecture/SKILL.md)**: RAII safety guards, pure rendering viewports, and modular separations.
+- **\[code-review\](file:///.agents/skills/code_review/SKILL.md)**: Core code review framework, validation check bounds, async boundaries, and type safety constraints.
+- **\[line-editing\](file:///.agents/skills/line_editing/SKILL.md)**: Line editor input delegation, UTF-8 indexing bounds safety, and negation overflow protections.
+- **\[keybindings\](file:///.agents/skills/keybindings/SKILL.md)**: Unified event matching, modifier collision checks, and declarative command metadata schemas.
+- **\[testing\](file:///.agents/skills/testing/SKILL.md)**: Guidelines for writing unit tests, mocking channels, and clamping validation asserts.
 
 Refer to those files when making modifications in those domains.
 

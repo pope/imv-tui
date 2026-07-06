@@ -5,71 +5,25 @@ description: Guidelines on RAII safety guards, pure rendering viewports, command
 
 # Rust TUI Architectural Guidelines
 
-### 1. RAII Terminal Guards & Clean Panics
+### 1. RAII Terminal Guards
 
-When building TUI applications, standard crash panics or early returns (`?`) can exit the binary before Crossterm has restored raw terminal settings and left the alternate screen.
+- **Alt-Screen Exit Invariant**: Standard panic crashes or returns (`?`) can exit the binary before Crossterm disables raw mode and alternate screen, leaving the terminal state corrupted.
+- **TerminalGuard Widget**: Implement a RAII `TerminalGuard` with a `Drop` implementation that restores raw mode and screen settings.
+- **Drop Order**: Drop the guard explicitly *before* printing any stdout data intended for pipe composition on program exit, ensuring the stdout output remains visible in the parent shell history.
 
-- **Terminal Guard**: Implement a RAII `TerminalGuard` that triggers standard terminal restoration inside its `Drop` implementation:
-  ```rust
-  struct TerminalGuard;
-  impl Drop for TerminalGuard {
-      fn drop(&mut self) {
-          let _ = disable_raw_mode();
-          let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-      }
-  }
-  ```
-- **Custom Panic Hooks**: Register a custom panic hook at startup to clean up alternate screen and raw modes before writing panic details to stderr.
-- **Stdout Output on Exit**: If the TUI application outputs data (e.g. classification lists, paths, stats) to stdout upon termination for pipe/shell composition, ensure the `TerminalGuard` is dropped (e.g. `drop(_guard)`) *before* printing the output. This returns the terminal from raw mode to the primary screen buffer first so that the printed output is preserved and visible in the parent shell scrollback.
+### 2. Pure Rendering Viewports
 
-### 2. Pure Rendering Viewports & separation of concerns
+- **Zero Mutations**: Drawing view functions (under `src/ui/`) must be read-only and side-effect free. Pass immutable references `app: &App` (rather than `&mut App`).
+- **Pre-calculated Layouts**: Calculate all sizes, viewport coordinates, and overlays in a pre-calculation phase in the state controller (`App::update_layout()`) *before* invoking `terminal.draw`.
+- **Defensive Clamping**: Defensively clamp calculated popup coordinate parameters (`rect_x`, `rect_y`, `rect_w`, `rect_h`) and cursor offsets to fit within the viewport area.
+- **Delegated Viewports**: Keep `src/ui/mod.rs` clean (\<100 lines) by delegating all view blocks and dialog layouts (prompts, command palettes, stats lists) into individual submodules under `src/ui/views/`.
 
-Mutating application states (such as layout dimensions or screen-clearing triggers) inside the drawing loops of `src/ui/` breaks the read-only rendering guarantee, leads to visual lag, and triggers double terminal refreshes.
+### 3. Modular File Encapsulation
 
-- **Layout Update Phase**: Introduce a layout pre-calculation phase in the controller (`App::update_layout(term_height)`) to update sizes, check boundaries, and trigger clear signals *before* invoking `terminal.draw`.
-- **Pure Rendering**: Enforce read-only rendering logic inside `src/ui/` where layout parameters are purely read from precomputed state variables.
-- **Rect Boundary Clamping**: Always clamp calculated coordinates (`rect_w`, `rect_h`) against viewport dimensions to prevent crashes and coordinate overflows during terminal resizing.
-- **Narrow Mutability Scope in View Signatures**: Enforce read-only drawing functions by passing an immutable reference `app: &App` (instead of `&mut App`) to view submodules (such as `infobar`, `prompt`, `info_box`, `palette`, or any other overlay views). This ensures compile-time safety and self-documents the side-effect-free nature of the views. Pass mutable references (`&mut App`) only if the underlying widget requires it (e.g., stateful image protocol views).
-- **Delegate all views from main layout**: Keep `src/ui/mod.rs` clean (~100 lines) by delegating all layout components and floating dialog overlays (including slideshow paused states) into dedicated submodules inside `views/` rather than rendering them inline.
-
-### 3. Compiler-Enforced Unified Keybindings & Command Architecture
-
-- **1-to-1 Command Mappings**: Map each variant of the `Command` enum to a single metadata `CommandItem` struct. This centralizes description name, palette search visibility, and keyboard shortcuts configuration in one location (`get_metadata()`).
-- **General Event Matching**: Match shortcuts against `crossterm::event::Event` rather than just `KeyEvent` to support unified mapping of keyboard keys, mouse scroll updates, and custom combinations.
-- **Pre-computed UI Formats**: Pre-calculate static formatted strings (like command shortcuts) once at initialization instead of joining/collecting arrays inside hot rendering loops.
-- **Declarative Expressions**: Prefer iterator chains (`find`, `any`, `filter`, `cloned`, `map`) over imperative search blocks to make code more readable and idiomatic.
-
-### 4. Modular Encapsulation & File Separation
-
-Keep file responsibilities clean and modularized:
-
-- `src/main.rs`: Entry point, raw-mode initialization, panic hooks, and Crossterm event loop.
-- `src/config/`: CLI command line option parsing (`cli.rs`), raw key defs and shortcut match bindings (`keys.rs`).
-- `src/commands/`: Mappings of keys, keyboard descriptions, command metadata, registry index lists.
-- `src/imaging/`: Image source decoders, directory scans, clamping types, and background resizers.
-- `src/app/`: State controller, sub-states, adjustments, classification databases, events handler, and worker thread managers.
-- `src/ui/`: Layout grids, HUD bars, command search palettes, details tables, prompt widgets.
-
-### 5. Interactive Input & Line Editing
-
-- **Encapsulated Event Delegation**: Rather than processing input characters and cursor movements directly in the main app controller, delegate keyboard event handling to a specialized `LineEditor` widget.
-- **Editor Result Classification**: Return a descriptive `EditorResult` enum to control downstream behavior:
-  - `ConsumedChanged`: Text content changed. Trigger search matches cache updates and reset selection indexes.
-  - `ConsumedNoChange`: Text content remained identical (e.g. cursor moved left/right). Trigger a redraw directly without recalculating filters.
-  - `NotConsumed`: Key event was not used for text editing (e.g., Enter, Esc) and should be handled by the parent container.
-- **Panic-Safe UTF-8 Slicing**: When eliding or truncating string displays (e.g. filename truncations), never slice using direct arithmetic on byte lengths (`&last[start_idx..]`). Emojis and CJK characters have multi-byte sizes, and slicing in the middle of a sequence will crash the application with a byte-boundary panic. Always use `.char_indices()` to determine valid character boundaries:
-  ```rust
-  let char_indices: Vec<(usize, char)> = s.char_indices().collect();
-  if char_indices.len() > elided_len {
-      let start_idx = char_indices[char_indices.len() - elided_len].0;
-      format!("...{}", &s[start_idx..])
-  } else {
-      s.to_string()
-  }
-  ```
-
-### 6. Directory-Aware Searching & Prefix Stripping
-
-- **Common Prefix Stripping**: To prevent directory pollution in recursive file listings, compute the longest common parent directory prefix among all loaded file paths on startup. Strip this prefix to produce relative subpaths for matching.
-- **Search vs. Display Paths**: Match search queries against the full relative subpaths (allowing users to search by subfolders, e.g., typing `vacation image`), but visually collapse intermediate directories using `shorten_path` (e.g., `folder/.../image.jpg`) to prevent visual clipping in fixed-width TUI windows.
-- **Status HUD Hierarchy Formatting**: Highlight filenames in status bars by splitting relative paths into parent directories and filenames: render parent directories in normal styling (not bold) and filenames in bold styling. This instantly clarifies file locations without visual clutter.
+- Keep file responsibilities clean and modularized:
+  - `src/main.rs`: Alt-screen, raw mode, panic hooks, and main event loops.
+  - `src/config/`: CLI parsing (`cli.rs`) and raw key definitions (`keys.rs`).
+  - `src/commands/`: Key mappings and command registry metadata.
+  - `src/imaging/`: Decoders, directory scanning, and imaging clamping types.
+  - `src/app/`: Controller state, adjustments db, and background worker handles.
+  - `src/ui/`: Pure layout templates, dialog overlays, HUD widgets.
