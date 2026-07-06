@@ -51,6 +51,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         area.y.saturating_add(1)
     };
 
+    // Ensure popup fits entirely within the parent area
+    let w = w.max(1);
+    let h = h.max(1);
+    let x = x.min(area.right().saturating_sub(w));
+    let y = y.min(area.bottom().saturating_sub(h));
+
     let popup_area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(palette_paragraph, popup_area);
@@ -59,5 +65,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let prefix = &app.palette_query.value()[..cursor_byte_offset];
     let cursor_col = Span::raw(prefix).width() as u16;
 
-    frame.set_cursor_position((popup_area.x + 4 + cursor_col, popup_area.y + 2));
+    let cursor_x = (popup_area.x + 4 + cursor_col).min(popup_area.right().saturating_sub(1));
+    let cursor_y = (popup_area.y + 2).min(popup_area.bottom().saturating_sub(1));
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
