@@ -1050,9 +1050,9 @@ impl App {
                         Adjustment::RelativeAdd(val) => {
                             self.adjustments[idx].brightness.adjust(val)
                         }
-                        Adjustment::RelativeSub(val) => {
-                            self.adjustments[idx].brightness.adjust(val.saturating_neg())
-                        }
+                        Adjustment::RelativeSub(val) => self.adjustments[idx]
+                            .brightness
+                            .adjust(val.saturating_neg()),
                     }
                     if old != self.adjustments[idx].brightness {
                         self.needs_update = true;
@@ -1211,18 +1211,16 @@ impl App {
             } else if let Some(ref thumb) = cached_img.thumbnail {
                 // If we only have a thumbnail, display it immediately as a fast placeholder,
                 // but continue loading the full resolution image in the background.
-                self.thumbnail_image = Some(thumb.clone()).map(|thumb| {
-                    adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb)
-                });
+                self.thumbnail_image = Some(thumb.clone())
+                    .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
                 self.original_image = self.thumbnail_image.clone();
 
-                let (orig_w, orig_h) = if adj.rotation == Rotation::D90
-                    || adj.rotation == Rotation::D270
-                {
-                    (cached_img.height, cached_img.width)
-                } else {
-                    (cached_img.width, cached_img.height)
-                };
+                let (orig_w, orig_h) =
+                    if adj.rotation == Rotation::D90 || adj.rotation == Rotation::D270 {
+                        (cached_img.height, cached_img.width)
+                    } else {
+                        (cached_img.width, cached_img.height)
+                    };
                 self.img_width = orig_w;
                 self.img_height = orig_h;
 

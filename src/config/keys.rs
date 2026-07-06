@@ -114,7 +114,7 @@ impl std::fmt::Display for KeyDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind, KeyEventState};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     #[test]
     fn test_key_modifier_matching() {
