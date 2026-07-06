@@ -39,17 +39,17 @@ impl Drop for TerminalGuard {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Check if we have piped input via stdin (e.g. from fd or find)
-    let piped_files = read_piped_stdin();
-    let is_piped = !piped_files.is_empty();
-
-    // Parse CLI arguments
+    // 1. Parse CLI arguments first to handle help/invalid options without blocking stdin
     let options = parse_cli_args()?;
     let initial_path = options.initial_path;
     let initial_filter = options.filter;
     let scale_mode = options.scale;
     let slideshow_opt = options.slideshow;
     let check_magic = options.check_magic;
+
+    // 2. Check if we have piped input via stdin (e.g. from fd or find)
+    let piped_files = read_piped_stdin();
+    let is_piped = !piped_files.is_empty();
 
     if is_piped && initial_path.is_some() {
         return Err(
