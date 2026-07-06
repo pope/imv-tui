@@ -138,11 +138,16 @@ impl Contrast {
 
     /// Mutably adjust by a delta, clamping internally.
     pub fn adjust(&mut self, delta: f32) {
-        self.0 = (self.0 + delta).clamp(-255.0, 255.0);
+        if !delta.is_nan() {
+            self.0 = (self.0 + delta).clamp(-255.0, 255.0);
+        }
     }
 
     /// Update with a new value if it differs from the current value by more than f32::EPSILON.
     pub fn update(&mut self, new_val: f32) -> bool {
+        if new_val.is_nan() {
+            return false;
+        }
         let proposed = new_val.clamp(-255.0, 255.0);
         if (proposed - self.0).abs() > f32::EPSILON {
             self.0 = proposed;

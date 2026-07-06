@@ -1051,7 +1051,7 @@ impl App {
                             self.adjustments[idx].brightness.adjust(val)
                         }
                         Adjustment::RelativeSub(val) => {
-                            self.adjustments[idx].brightness.adjust(-val)
+                            self.adjustments[idx].brightness.adjust(val.saturating_neg())
                         }
                     }
                     if old != self.adjustments[idx].brightness {

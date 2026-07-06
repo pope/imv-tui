@@ -21,7 +21,12 @@ impl<T: FromStr> FromStr for Adjustment<T> {
         if s.is_empty() {
             return Err("Empty input".to_string());
         }
-        if let Some(stripped) = s.strip_prefix('+') {
+        if let Some(stripped) = s.strip_prefix('=') {
+            let val = stripped
+                .parse::<T>()
+                .map_err(|_| "Invalid absolute value".to_string())?;
+            Ok(Self::Absolute(val))
+        } else if let Some(stripped) = s.strip_prefix('+') {
             let val = stripped
                 .parse::<T>()
                 .map_err(|_| "Invalid positive offset".to_string())?;
@@ -59,5 +64,41 @@ impl ImageAdjustments {
             Rotation::D270 => Some(img.rotate270()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imaging::types::Contrast;
+
+    #[test]
+    fn test_nan_guards() {
+        let mut contrast = Contrast::new(10.0);
+
+        // Adjust with NaN should be ignored and not panic
+        contrast.adjust(f32::NAN);
+        assert_eq!(contrast.value(), 10.0);
+
+        // Update with NaN should return false and not change value
+        assert!(!contrast.update(f32::NAN));
+        assert_eq!(contrast.value(), 10.0);
+    }
+
+    #[test]
+    fn test_absolute_adjustment_prefix() {
+        // Absolute with prefix =
+        let adj = "=-10".parse::<Adjustment<i32>>().unwrap();
+        assert_eq!(adj, Adjustment::Absolute(-10));
+
+        let adj2 = "=50".parse::<Adjustment<i32>>().unwrap();
+        assert_eq!(adj2, Adjustment::Absolute(50));
+
+        // Relative with signs
+        let adj3 = "-10".parse::<Adjustment<i32>>().unwrap();
+        assert_eq!(adj3, Adjustment::RelativeSub(10));
+
+        let adj4 = "+10".parse::<Adjustment<i32>>().unwrap();
+        assert_eq!(adj4, Adjustment::RelativeAdd(10));
     }
 }
