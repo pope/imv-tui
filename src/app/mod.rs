@@ -1162,66 +1162,84 @@ impl App {
 
         // Check if the image is in the prefetch cache
         let cached = {
-            let mut cache = self.prefetch_cache.lock().unwrap();
-            if cache
-                .get(&self.queue.current_index)
-                .is_some_and(|c| c.image.is_some())
-            {
-                cache.remove(&self.queue.current_index)
-            } else {
-                None
-            }
+            let cache = self.prefetch_cache.lock().unwrap();
+            cache.get(&self.queue.current_index).cloned()
         };
 
         if let Some(cached_img) = cached {
-            self.current_sequence += 1;
-            self.original_image = cached_img.image.map(|img| {
-                if let Some(rotated) = adj.rotate_image(&img) {
-                    self.img_width = rotated.width();
-                    self.img_height = rotated.height();
-                    Arc::new(rotated)
+            if let Some(ref img) = cached_img.image {
+                self.current_sequence += 1;
+                self.original_image = Some(img.clone()).map(|img| {
+                    if let Some(rotated) = adj.rotate_image(&img) {
+                        self.img_width = rotated.width();
+                        self.img_height = rotated.height();
+                        Arc::new(rotated)
+                    } else {
+                        self.img_width = cached_img.width;
+                        self.img_height = cached_img.height;
+                        img
+                    }
+                });
+
+                self.thumbnail_image = cached_img
+                    .thumbnail
+                    .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
+                self.show_thumbnail_only = false;
+
+                if let Some(ref thumb) = self.thumbnail_image {
+                    self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
+                    self.stats.thumbnail_dimensions = Some((thumb.width(), thumb.height()));
                 } else {
-                    self.img_width = cached_img.width;
-                    self.img_height = cached_img.height;
-                    img
+                    self.stats.thumbnail_load_duration = None;
+                    self.stats.thumbnail_dimensions = None;
                 }
-            });
 
-            self.thumbnail_image = cached_img
-                .thumbnail
-                .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
-            self.show_thumbnail_only = false;
+                self.zoom_factor = ZoomFactor::DEFAULT;
+                self.pan_offset = PanOffset::ZERO;
+                self.is_loading = false;
+                self.needs_update = true;
+                self.zoom_needs_initialization = true;
 
-            if let Some(ref thumb) = self.thumbnail_image {
+                // Set stats for cache hit
+                self.stats.load_duration = cached_img.decode_duration;
+                self.stats.is_prefetch_cache_hit = true;
+                self.stats.disk_size = cached_img.disk_size;
+                self.stats.format = cached_img.format;
+
+                self.trigger_prefetch();
+                return;
+            } else if let Some(ref thumb) = cached_img.thumbnail {
+                // If we only have a thumbnail, display it immediately as a fast placeholder,
+                // but continue loading the full resolution image in the background.
+                self.thumbnail_image = Some(thumb.clone()).map(|thumb| {
+                    adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb)
+                });
+                self.original_image = self.thumbnail_image.clone();
+
+                let (orig_w, orig_h) = if adj.rotation == Rotation::D90
+                    || adj.rotation == Rotation::D270
+                {
+                    (cached_img.height, cached_img.width)
+                } else {
+                    (cached_img.width, cached_img.height)
+                };
+                self.img_width = orig_w;
+                self.img_height = orig_h;
+
+                self.show_thumbnail_only = true;
                 self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
-                self.stats.thumbnail_dimensions = Some((thumb.width(), thumb.height()));
-            } else {
-                self.stats.thumbnail_load_duration = None;
-                self.stats.thumbnail_dimensions = None;
+                self.stats.thumbnail_dimensions = Some((cached_img.width, cached_img.height));
             }
-
-            self.zoom_factor = ZoomFactor::DEFAULT;
-            self.pan_offset = PanOffset::ZERO;
-            self.is_loading = false;
-            self.needs_update = true;
-            self.zoom_needs_initialization = true;
-
-            // Set stats for cache hit
-            self.stats.load_duration = cached_img.decode_duration;
-            self.stats.is_prefetch_cache_hit = true;
-            self.stats.disk_size = cached_img.disk_size;
-            self.stats.format = cached_img.format;
-
-            self.trigger_prefetch();
-            return;
         }
 
-        // Cache miss: load as normal via background loader worker
-        self.original_image = None;
-        self.thumbnail_image = None;
-        self.show_thumbnail_only = false;
-        self.stats.thumbnail_load_duration = None;
-        self.stats.thumbnail_dimensions = None;
+        // Cache miss (or thumbnail-only hit): load as normal via background loader worker
+        if self.thumbnail_image.is_none() {
+            self.original_image = None;
+            self.thumbnail_image = None;
+            self.show_thumbnail_only = false;
+            self.stats.thumbnail_load_duration = None;
+            self.stats.thumbnail_dimensions = None;
+        }
         self.image_protocol = None;
         self.is_loading = true;
         self.loading_start_time = Some(Instant::now());
@@ -1259,55 +1277,55 @@ impl App {
                     let format = decoded.format;
                     let disk_size = decoded.disk_size;
                     let shared_img = Arc::new(img);
-                    if resp.is_prefetch {
-                        let window_indices = self.get_sliding_window_indices();
-                        if window_indices.contains(&resp.idx) {
-                            let mut cache = self.prefetch_cache.lock().unwrap();
-                            if resp.is_thumbnail {
-                                if let Some(cached) = cache.get_mut(&resp.idx) {
-                                    cached.thumbnail = Some(shared_img);
-                                    cached.thumbnail_decode_duration = resp.decode_duration;
-                                } else {
-                                    cache.insert(
-                                        resp.idx,
-                                        CachedImage {
-                                            image: None,
-                                            thumbnail: Some(shared_img),
-                                            width: w,
-                                            height: h,
-                                            format,
-                                            decode_duration: std::time::Duration::ZERO,
-                                            thumbnail_decode_duration: resp.decode_duration,
-                                            disk_size,
-                                        },
-                                    );
-                                }
+                    let window_indices = self.get_sliding_window_indices();
+                    if window_indices.contains(&resp.idx) {
+                        let mut cache = self.prefetch_cache.lock().unwrap();
+                        if resp.is_thumbnail {
+                            if let Some(cached) = cache.get_mut(&resp.idx) {
+                                cached.thumbnail = Some(shared_img.clone());
+                                cached.thumbnail_decode_duration = resp.decode_duration;
                             } else {
-                                if let Some(cached) = cache.get_mut(&resp.idx) {
-                                    cached.image = Some(shared_img);
-                                    cached.width = w;
-                                    cached.height = h;
-                                    cached.format = format;
-                                    cached.decode_duration = resp.decode_duration;
-                                    cached.disk_size = disk_size;
-                                } else {
-                                    cache.insert(
-                                        resp.idx,
-                                        CachedImage {
-                                            image: Some(shared_img),
-                                            thumbnail: None,
-                                            width: w,
-                                            height: h,
-                                            format,
-                                            decode_duration: resp.decode_duration,
-                                            thumbnail_decode_duration: std::time::Duration::ZERO,
-                                            disk_size,
-                                        },
-                                    );
-                                }
+                                cache.insert(
+                                    resp.idx,
+                                    CachedImage {
+                                        image: None,
+                                        thumbnail: Some(shared_img.clone()),
+                                        width: w,
+                                        height: h,
+                                        format,
+                                        decode_duration: std::time::Duration::ZERO,
+                                        thumbnail_decode_duration: resp.decode_duration,
+                                        disk_size,
+                                    },
+                                );
+                            }
+                        } else {
+                            if let Some(cached) = cache.get_mut(&resp.idx) {
+                                cached.image = Some(shared_img.clone());
+                                cached.width = w;
+                                cached.height = h;
+                                cached.format = format;
+                                cached.decode_duration = resp.decode_duration;
+                                cached.disk_size = disk_size;
+                            } else {
+                                cache.insert(
+                                    resp.idx,
+                                    CachedImage {
+                                        image: Some(shared_img.clone()),
+                                        thumbnail: None,
+                                        width: w,
+                                        height: h,
+                                        format,
+                                        decode_duration: resp.decode_duration,
+                                        thumbnail_decode_duration: std::time::Duration::ZERO,
+                                        disk_size,
+                                    },
+                                );
                             }
                         }
-                    } else if resp.idx == self.queue.current_index {
+                    }
+
+                    if !resp.is_prefetch && resp.idx == self.queue.current_index {
                         let adj = self.adjustments.get(resp.idx).copied().unwrap_or_default();
                         let rotated_img = adj
                             .rotate_image(&shared_img)
@@ -1340,6 +1358,7 @@ impl App {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();
                             self.original_image = Some(rotated_img);
+                            self.show_thumbnail_only = false;
                             self.error_message = None;
                             self.is_loading = false;
                             self.needs_update = true;
@@ -2433,5 +2452,60 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all("target/tmp/refresh_unmapped_test");
+    }
+
+    #[test]
+    fn test_prefetch_cache_retention_and_hits() {
+        let images = vec![
+            ImageSource::Local(PathBuf::from("img1.png")),
+            ImageSource::Local(PathBuf::from("img2.png")),
+        ];
+        let picker = Picker::halfblocks();
+        let app_config = AppConfig {
+            filter_type: crate::imaging::FilterType::Nearest,
+            scale_mode: crate::imaging::ScaleMode::Shrink,
+            disable_thumbnail: true,
+            infobar: InfoBarPosition::Bottom,
+        };
+        let scan_config = ScanConfig {
+            initial_scan_path: PathBuf::from("."),
+            check_magic: false,
+            recursive: false,
+            is_cbz: false,
+            is_piped: false,
+        };
+        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+
+        // Simulate background loading inserting into prefetch cache
+        let shared_img = Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+        {
+            let mut cache = app.prefetch_cache.lock().unwrap();
+            cache.insert(
+                1,
+                CachedImage {
+                    image: Some(shared_img.clone()),
+                    thumbnail: None,
+                    width: 10,
+                    height: 10,
+                    format: Some(image::ImageFormat::Png),
+                    decode_duration: std::time::Duration::from_millis(5),
+                    thumbnail_decode_duration: std::time::Duration::ZERO,
+                    disk_size: 100,
+                },
+            );
+        }
+
+        // Navigate to index 1
+        app.execute_command(Command::NextImage);
+
+        // Check that it was a cache hit!
+        assert!(app.stats.is_prefetch_cache_hit);
+        assert_eq!(app.stats.disk_size, 100);
+
+        // Verify that it was NOT evicted from the cache on hit
+        {
+            let cache = app.prefetch_cache.lock().unwrap();
+            assert!(cache.contains_key(&1));
+        }
     }
 }
