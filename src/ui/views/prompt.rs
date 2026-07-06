@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Style, Stylize},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
@@ -27,11 +27,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = vec![
         Line::from(format!("   {}", prompt_label).gray()),
-        Line::from(vec![
-            " > ".bold().cyan(),
-            app.palette_query.as_str().into(),
-            "▊".cyan(), // cursor block
-        ]),
+        Line::from(vec![" > ".bold().cyan(), app.palette_query.value().into()]),
     ];
 
     let w = 45.min(area.width.saturating_sub(1));
@@ -58,4 +54,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let popup_area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(palette_paragraph, popup_area);
+
+    let cursor_byte_offset = app.palette_query.cursor_byte_offset();
+    let prefix = &app.palette_query.value()[..cursor_byte_offset];
+    let cursor_col = Span::raw(prefix).width() as u16;
+
+    frame.set_cursor_position((popup_area.x + 4 + cursor_col, popup_area.y + 2));
 }

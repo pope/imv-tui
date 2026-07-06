@@ -41,6 +41,20 @@ impl App {
                 if key.kind != KeyEventKind::Press {
                     return;
                 }
+
+                // Handle editor keys first
+                match self.palette_query.handle_key_event(&key) {
+                    super::line_editor::EditorResult::ConsumedChanged => {
+                        self.palette_selected_index = 0;
+                        self.update_palette_filter();
+                        return;
+                    }
+                    super::line_editor::EditorResult::ConsumedNoChange => {
+                        return;
+                    }
+                    super::line_editor::EditorResult::NotConsumed => {}
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         self.palette_mode = PaletteMode::Closed;
@@ -77,10 +91,23 @@ impl App {
                         }
                         _ => {}
                     },
-                    KeyCode::Up if self.palette_selected_index > 0 => {
+                    // List Navigation: Up / Ctrl+P
+                    KeyCode::Up | KeyCode::Char('p')
+                        if (key.code == KeyCode::Up
+                            || key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL))
+                            && self.palette_selected_index > 0 =>
+                    {
                         self.palette_selected_index -= 1;
                     }
-                    KeyCode::Down => {
+                    // List Navigation: Down / Ctrl+N / Ctrl+J
+                    KeyCode::Down | KeyCode::Char('n') | KeyCode::Char('j')
+                        if key.code == KeyCode::Down
+                            || key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
                         let max_len = match self.palette_mode {
                             PaletteMode::File => self.get_filtered_files().len(),
                             PaletteMode::Command => self.get_filtered_commands().len(),
@@ -90,7 +117,11 @@ impl App {
                             self.palette_selected_index += 1;
                         }
                     }
-                    KeyCode::PageUp => {
+                    KeyCode::PageUp | KeyCode::Char('v')
+                        if key.code == KeyCode::PageUp
+                            || (key.code == KeyCode::Char('v')
+                                && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)) =>
+                    {
                         let max_len = match self.palette_mode {
                             PaletteMode::File => self.get_filtered_files().len(),
                             PaletteMode::Command => self.get_filtered_commands().len(),
@@ -104,7 +135,13 @@ impl App {
                         self.palette_selected_index =
                             self.palette_selected_index.saturating_sub(page_size);
                     }
-                    KeyCode::PageDown => {
+                    KeyCode::PageDown | KeyCode::Char('v')
+                        if key.code == KeyCode::PageDown
+                            || (key.code == KeyCode::Char('v')
+                                && key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL)) =>
+                    {
                         let max_len = match self.palette_mode {
                             PaletteMode::File => self.get_filtered_files().len(),
                             PaletteMode::Command => self.get_filtered_commands().len(),
@@ -119,34 +156,6 @@ impl App {
                             self.palette_selected_index =
                                 (self.palette_selected_index + page_size).min(max_len - 1);
                         }
-                    }
-                    KeyCode::Char('k')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                            && self.palette_selected_index > 0 =>
-                    {
-                        self.palette_selected_index -= 1;
-                    }
-                    KeyCode::Char('j')
-                        if key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                    {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 && self.palette_selected_index < max_len - 1 {
-                            self.palette_selected_index += 1;
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        self.palette_pop_char();
-                    }
-                    KeyCode::Char(c) => {
-                        self.palette_push_char(c);
                     }
                     _ => {}
                 }

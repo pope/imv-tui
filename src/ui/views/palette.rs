@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::{Margin, Rect},
     style::{Color, Style, Stylize},
-    text::Line,
+    text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
         ScrollbarState,
@@ -25,11 +25,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let mut total_items = 0;
 
     let mut lines = vec![
-        Line::from(vec![
-            " > ".bold().cyan(),
-            app.palette_query.as_str().into(),
-            "▊".cyan(), // cursor block
-        ]),
+        Line::from(vec![" > ".bold().cyan(), app.palette_query.value().into()]),
         Line::from("──────────────────────────────────────────────────────────".gray()),
     ];
 
@@ -192,4 +188,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             &mut scrollbar_state,
         );
     }
+
+    let cursor_byte_offset = app.palette_query.cursor_byte_offset();
+    let prefix = &app.palette_query.value()[..cursor_byte_offset];
+    let cursor_col = Span::raw(prefix).width() as u16;
+
+    frame.set_cursor_position((popup_area.x + 4 + cursor_col, popup_area.y + 1));
 }

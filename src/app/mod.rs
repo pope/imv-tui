@@ -2,6 +2,7 @@ pub mod adjustments;
 pub mod cache;
 pub mod classifications;
 pub mod events;
+pub mod line_editor;
 pub mod palette;
 pub mod queue;
 
@@ -118,7 +119,7 @@ pub struct App {
     /// The active overlay panel state.
     pub palette_mode: PaletteMode,
     /// Input buffer for fuzzy queries or prompt values.
-    pub palette_query: String,
+    pub palette_query: line_editor::LineEditor,
     /// Selected row inside the fuzzy matcher list.
     pub palette_selected_index: usize,
     /// Freezed layout width of the popup dialogue.
@@ -321,7 +322,7 @@ impl App {
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
             palette_mode: PaletteMode::Closed,
-            palette_query: String::new(),
+            palette_query: line_editor::LineEditor::new(),
             palette_selected_index: 0,
             palette_width: 0,
             palette_height: 0,
@@ -524,20 +525,6 @@ impl App {
         &self.filtered_commands
     }
 
-    /// Appends a character to the search query and updates matches cache.
-    pub fn palette_push_char(&mut self, c: char) {
-        self.palette_query.push(c);
-        self.palette_selected_index = 0;
-        self.update_palette_filter();
-    }
-
-    /// Removes the last character from the search query and updates matches cache.
-    pub fn palette_pop_char(&mut self) {
-        self.palette_query.pop();
-        self.palette_selected_index = 0;
-        self.update_palette_filter();
-    }
-
     /// Re-calculates and caches the matched files or commands based on the query.
     pub fn update_palette_filter(&mut self) {
         match self.palette_mode {
@@ -570,7 +557,7 @@ impl App {
             .map(|idx| self.is_visible(idx))
             .collect();
         filter_files(
-            &self.palette_query,
+            self.palette_query.value(),
             &self.queue.display_names,
             &self.queue.display_names_lowercase,
             &mut self.matcher,
@@ -579,7 +566,7 @@ impl App {
     }
 
     fn get_filtered_commands_uncached(&mut self) -> Vec<PaletteCommand> {
-        filter_commands(&self.palette_query, &mut self.matcher)
+        filter_commands(self.palette_query.value(), &mut self.matcher)
     }
 
     pub fn filter_name(&self) -> &'static str {
@@ -836,7 +823,7 @@ impl App {
                 if visible.is_empty() {
                     return;
                 }
-                let input = self.palette_query.trim();
+                let input = self.palette_query.value().trim();
                 let Ok(adj) = input.parse::<Adjustment<usize>>() else {
                     return;
                 };
@@ -870,7 +857,7 @@ impl App {
                 }
                 let idx = self.queue.current_index;
                 if idx < self.adjustments.len() {
-                    let input = self.palette_query.trim();
+                    let input = self.palette_query.value().trim();
                     let Ok(adj) = input.parse::<Adjustment<i32>>() else {
                         return;
                     };
@@ -897,7 +884,7 @@ impl App {
                 }
                 let idx = self.queue.current_index;
                 if idx < self.adjustments.len() {
-                    let input = self.palette_query.trim();
+                    let input = self.palette_query.value().trim();
                     let Ok(adj) = input.parse::<Adjustment<f32>>() else {
                         return;
                     };
@@ -913,7 +900,7 @@ impl App {
                 }
             }
             PromptType::SetSlideshow => {
-                let input = self.palette_query.trim();
+                let input = self.palette_query.value().trim();
                 let Ok(adj) = input.parse::<Adjustment<u32>>() else {
                     return;
                 };
