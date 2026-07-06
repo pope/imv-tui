@@ -566,8 +566,8 @@ impl App {
             .collect();
         filter_files(
             self.palette_query.value(),
-            &self.queue.display_names,
-            &self.queue.display_names_lowercase,
+            &self.queue.relative_paths,
+            &self.queue.relative_paths_lowercase,
             &mut self.matcher,
             &visibility,
         )
@@ -791,15 +791,15 @@ impl App {
         let max_text_width = match mode {
             PaletteMode::File => self
                 .queue
-                .display_names
+                .relative_paths
                 .iter()
-                .map(|name| name.len())
+                .map(|name| name.chars().count())
                 .max()
                 .unwrap_or(0) as u16,
             PaletteMode::Command => get_commands()
                 .iter()
                 .filter(|cmd| cmd.item.show_in_palette)
-                .map(|cmd| cmd.item.name.len() + 3 + cmd.item.description.len())
+                .map(|cmd| cmd.item.name.chars().count() + 3 + cmd.item.description.chars().count())
                 .max()
                 .unwrap_or(0) as u16,
             _ => 0,
@@ -1838,11 +1838,15 @@ impl App {
         }
     }
 
-    pub fn current_filename(&self) -> &str {
+    pub fn current_relative_path(&self) -> &str {
         if self.queue.is_empty() || self.get_visible_count() == 0 {
             return "No file loaded";
         }
-        self.queue.get_current_filename()
+        self.queue
+            .relative_paths
+            .get(self.queue.current_index)
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     pub fn next_image(&mut self) {

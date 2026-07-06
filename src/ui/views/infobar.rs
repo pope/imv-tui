@@ -54,12 +54,31 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Classification::Unflagged => Color::Yellow,
         };
 
+        let relative_path = app.current_relative_path();
+        let path = std::path::Path::new(relative_path);
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(relative_path);
+
+        let parent_str = if let Some(parent) = path.parent() {
+            let p_str = parent.to_string_lossy();
+            if p_str.is_empty() {
+                "".to_string()
+            } else {
+                format!("[{}]", p_str)
+            }
+        } else {
+            "".to_string()
+        };
+
         let left_title_line = ratatui::text::Line::from(vec![
             ratatui::text::Span::raw(format!(" {} ", flag_icon)),
             ratatui::text::Span::styled(
-                app.current_filename(),
+                format!("[{}]", filename),
                 Style::default().fg(filename_color).bold(),
             ),
+            ratatui::text::Span::styled(parent_str, Style::default().fg(Color::White)),
             ratatui::text::Span::raw(" "),
         ])
         .left_aligned();

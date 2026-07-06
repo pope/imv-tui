@@ -541,6 +541,8 @@ pub fn scan_directory(
     };
 
     let mut images = Vec::new();
+    let mut visited_files = std::collections::HashSet::new();
+
     if recursive {
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![(dir.clone(), 0)]; // Store path and current depth
@@ -564,7 +566,13 @@ pub fn scan_directory(
                     if path.is_dir() {
                         stack.push((path, depth + 1));
                     } else if is_image_file(&path, check_magic) {
-                        images.push(path);
+                        if let Ok(canonical) = path.canonicalize() {
+                            if visited_files.insert(canonical) {
+                                images.push(path);
+                            }
+                        } else {
+                            images.push(path);
+                        }
                     }
                 }
             }
@@ -573,7 +581,13 @@ pub fn scan_directory(
         for entry in entries.flatten() {
             let path = entry.path();
             if is_image_file(&path, check_magic) {
-                images.push(path);
+                if let Ok(canonical) = path.canonicalize() {
+                    if visited_files.insert(canonical) {
+                        images.push(path);
+                    }
+                } else {
+                    images.push(path);
+                }
             }
         }
     }
@@ -583,7 +597,13 @@ pub fn scan_directory(
     let index = if let Some(ref target_name) = file_name {
         images
             .iter()
-            .position(|path| path.file_name().map(|n| n == target_name).unwrap_or(false))
+            .position(|path| {
+                if let (Ok(c1), Ok(c2)) = (path.canonicalize(), initial_path.canonicalize()) {
+                    c1 == c2
+                } else {
+                    path.file_name().map(|n| n == target_name).unwrap_or(false)
+                }
+            })
             .unwrap_or_else(|| {
                 if initial_path.exists() {
                     images.push(initial_path.to_path_buf());
@@ -869,5 +889,21 @@ mod tests {
         assert_eq!(rec_files.len(), 2);
 
         let _ = fs::remove_dir_all("target/tmp/scan_test");
+
+        // Verify file path deduplication (e.g. symlinks pointing to the same file)
+        #[cfg(unix)]
+        {
+            let _ = fs::create_dir_all("target/tmp/scan_test");
+            let img1 = PathBuf::from("target/tmp/scan_test/img1.png");
+            let sym = PathBuf::from("target/tmp/scan_test/symlink_img1.png");
+            fs::write(&img1, "fake").unwrap();
+            let _ = std::os::unix::fs::symlink(&img1, &sym);
+
+            let (rec_files, _) =
+                scan_directory(&PathBuf::from("target/tmp/scan_test"), false, true).unwrap();
+            assert_eq!(rec_files.len(), 1);
+
+            let _ = fs::remove_dir_all("target/tmp/scan_test");
+        }
     }
 }
