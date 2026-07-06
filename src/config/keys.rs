@@ -6,14 +6,20 @@ use crossterm::event;
 pub enum KeyDef {
     /// A single character press (e.g. 'q', 'i').
     Char(char),
+    /// A standalone keyboard key (e.g. Esc, Backspace, Left, Right).
     Code(event::KeyCode),
+    /// A key modification with Control pressed (e.g. Ctrl+n, Ctrl+p).
     Ctrl(char),
+    /// A key modification with Shift pressed (e.g. Shift+Esc).
     Shift(event::KeyCode),
+    /// Mouse wheel scroll up action.
     ScrollUp,
+    /// Mouse wheel scroll down action.
     ScrollDown,
 }
 
 impl KeyDef {
+    /// Evaluates if an incoming crossterm Event matches the configured KeyDef shortcut.
     pub fn matches(self, event: &event::Event) -> bool {
         match event {
             event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {

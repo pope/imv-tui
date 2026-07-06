@@ -1,3 +1,4 @@
+/// Presentation submodules for overlay and layout widgets.
 pub mod views;
 
 use ratatui::{

@@ -1,3 +1,7 @@
+//! Fast, keyboard-driven terminal image viewer (imv-tui).
+
+#![warn(missing_docs)]
+
 mod app;
 mod commands;
 mod config;

@@ -108,6 +108,7 @@ fn get_arg(args: &[String], i: &mut usize, flag: &str) -> Result<String, String>
     }
 }
 
+/// Parse command-line option arguments from the environment args list.
 pub fn parse_cli_args() -> Result<CliOptions, String> {
     parse_cli_args_from(std::env::args())
 }

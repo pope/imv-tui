@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The outcome of the LineEditor handling a key event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditorResult {
+pub(crate) enum EditorResult {
     /// The key was not handled by the editor (e.g., navigation, submit, cancel).
     NotConsumed,
     /// The key was handled, but the input value did not change (e.g., cursor movement).
@@ -13,14 +13,14 @@ pub enum EditorResult {
 
 /// A simple, cursor-aware line editing buffer.
 #[derive(Debug, Clone, Default)]
-pub struct LineEditor {
+pub(crate) struct LineEditor {
     value: String,
     cursor_char_idx: usize,
 }
 
 impl LineEditor {
     /// Handles editing or cursor navigation key events.
-    pub fn handle_key_event(&mut self, key: &KeyEvent) -> EditorResult {
+    pub(crate) fn handle_key_event(&mut self, key: &KeyEvent) -> EditorResult {
         match key.code {
             // Left / Ctrl+B
             KeyCode::Left | KeyCode::Char('b')
@@ -112,28 +112,33 @@ impl LineEditor {
         }
     }
 
-    pub fn new() -> Self {
+    /// Creates a new, empty LineEditor.
+    pub(crate) fn new() -> Self {
         Self {
             value: String::new(),
             cursor_char_idx: 0,
         }
     }
 
-    pub fn value(&self) -> &str {
+    /// Accesses the underlying string slice value of the editor.
+    pub(crate) fn value(&self) -> &str {
         &self.value
     }
 
+    /// Retrieves the current character index of the cursor.
     #[allow(dead_code)]
-    pub fn cursor_char_idx(&self) -> usize {
+    pub(crate) fn cursor_char_idx(&self) -> usize {
         self.cursor_char_idx
     }
 
-    pub fn clear(&mut self) {
+    /// Clears the editor value and resets the cursor to index 0.
+    pub(crate) fn clear(&mut self) {
         self.value.clear();
         self.cursor_char_idx = 0;
     }
 
-    pub fn cursor_byte_offset(&self) -> usize {
+    /// Returns the byte offset corresponding to the current character cursor position.
+    pub(crate) fn cursor_byte_offset(&self) -> usize {
         self.byte_offset_for_char_idx(self.cursor_char_idx)
             .unwrap_or(self.value.len())
     }
@@ -143,14 +148,14 @@ impl LineEditor {
     }
 
     /// Inserts a character at the current cursor position.
-    pub fn insert_char(&mut self, c: char) {
+    pub(crate) fn insert_char(&mut self, c: char) {
         let byte_offset = self.cursor_byte_offset();
         self.value.insert(byte_offset, c);
         self.cursor_char_idx += 1;
     }
 
     /// Deletes the character before the current cursor position.
-    pub fn backspace(&mut self) -> bool {
+    pub(crate) fn backspace(&mut self) -> bool {
         if self.cursor_char_idx == 0 {
             return false;
         }
@@ -165,7 +170,7 @@ impl LineEditor {
     }
 
     /// Deletes the character at the current cursor position (Delete / Ctrl+D).
-    pub fn delete(&mut self) -> bool {
+    pub(crate) fn delete(&mut self) -> bool {
         if let Some(offset) = self.byte_offset_for_char_idx(self.cursor_char_idx) {
             self.value.remove(offset);
             true
@@ -174,27 +179,31 @@ impl LineEditor {
         }
     }
 
-    pub fn move_left(&mut self) {
+    /// Moves the editing cursor one character to the left.
+    pub(crate) fn move_left(&mut self) {
         self.cursor_char_idx = self.cursor_char_idx.saturating_sub(1);
     }
 
-    pub fn move_right(&mut self) {
+    /// Moves the editing cursor one character to the right.
+    pub(crate) fn move_right(&mut self) {
         let total_chars = self.value.chars().count();
         if self.cursor_char_idx < total_chars {
             self.cursor_char_idx += 1;
         }
     }
 
-    pub fn move_to_start(&mut self) {
+    /// Moves the editing cursor to the start of the line.
+    pub(crate) fn move_to_start(&mut self) {
         self.cursor_char_idx = 0;
     }
 
-    pub fn move_to_end(&mut self) {
+    /// Moves the editing cursor to the end of the line.
+    pub(crate) fn move_to_end(&mut self) {
         self.cursor_char_idx = self.value.chars().count();
     }
 
     /// Deletes from the cursor to the end of the line (Ctrl+K).
-    pub fn delete_to_end(&mut self) -> bool {
+    pub(crate) fn delete_to_end(&mut self) -> bool {
         let byte_offset = self.cursor_byte_offset();
         if byte_offset < self.value.len() {
             self.value.truncate(byte_offset);
@@ -205,7 +214,7 @@ impl LineEditor {
     }
 
     /// Deletes from the cursor to the beginning of the line (Ctrl+U).
-    pub fn delete_to_start(&mut self) -> bool {
+    pub(crate) fn delete_to_start(&mut self) -> bool {
         if self.cursor_char_idx == 0 {
             return false;
         }
@@ -216,7 +225,7 @@ impl LineEditor {
     }
 
     /// Deletes the word before the current cursor position (Ctrl+W).
-    pub fn delete_word_before(&mut self) -> bool {
+    pub(crate) fn delete_word_before(&mut self) -> bool {
         if self.cursor_char_idx == 0 {
             return false;
         }

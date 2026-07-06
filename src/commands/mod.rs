@@ -1,6 +1,7 @@
 use crossterm::event;
 use strum::IntoEnumIterator;
 
+/// Commands registry for matching descriptions and shortcut keys.
 pub mod registry;
 
 pub use crate::config::keys::KeyDef;
@@ -144,6 +145,7 @@ pub enum Command {
 }
 
 impl Command {
+    /// Matches an incoming Crossterm Event to find if it triggers any mapped keyboard/mouse shortcut command.
     pub fn from_event(event: &event::Event) -> Option<Self> {
         Self::iter().find(|cmd| {
             let def = cmd.get_metadata();
@@ -152,6 +154,7 @@ impl Command {
         })
     }
 
+    /// Retreives user-facing presentation metadata and shortcut keys configured for the command variant.
     pub fn get_metadata(self) -> CommandItem {
         match self {
             Self::ResetView => CommandItem {

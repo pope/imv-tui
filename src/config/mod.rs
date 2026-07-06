@@ -1,10 +1,16 @@
+/// Command-line argument parsing.
 pub mod cli;
+/// Key definitions and crossterm matching logic.
 pub mod keys;
 
+/// Position of the status infobar on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoBarPosition {
+    /// Render status HUD at the top boundary.
     Top,
+    /// Render status HUD at the bottom boundary.
     Bottom,
+    /// Disable status HUD rendering entirely.
     None,
 }
 
@@ -21,12 +27,17 @@ impl InfoBarPosition {
 /// Represents the slideshow transition delay state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SlideshowState {
+    /// Slideshow mode is inactive/stopped.
     #[default]
     Stopped,
+    /// Slideshow mode is playing, transitioning images after the specified delay.
     Playing {
+        /// Time delay between image transitions.
         delay: std::time::Duration,
     },
+    /// Slideshow mode is paused, keeping the current image displayed but retaining the delay configuration.
     Paused {
+        /// Programmed transition delay duration.
         delay: std::time::Duration,
     },
 }

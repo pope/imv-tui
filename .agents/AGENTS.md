@@ -36,3 +36,9 @@ ______________________________________________________________________
      - Run `cargo clippy` and address all errors/warnings.
      - Run `nix fmt` to auto-format code changes.
      - Run `cargo build --release` to verify compilation and build a release candidate to test with.
+
+5. **API Visibility & Documentation Coverage**:
+
+   - Enforce compiler-checked documentation coverage by keeping `#![warn(missing_docs)]` active at the crate root.
+   - Enforce encapsulation by keeping visibility as narrow as possible: always prefer `pub(crate)` or private over standard `pub` for structures, enums, fields, and functions that do not need to be exposed outside the crate boundary.
+   - All public and internal API surfaces must be thoroughly documented with standard Rust doc comments (`///` and `//!`).

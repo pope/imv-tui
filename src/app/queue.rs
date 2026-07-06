@@ -1,5 +1,6 @@
 use crate::imaging::ImageSource;
 
+/// An interactive queue containing the loaded images, relative path caches, and selection state.
 pub struct ImageQueue {
     /// Loaded list of image sources.
     pub images: Vec<ImageSource>,
