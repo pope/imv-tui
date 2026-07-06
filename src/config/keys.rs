@@ -21,7 +21,9 @@ impl KeyDef {
                 match self {
                     Self::Char(c) => {
                         if let KeyCode::Char(key_char) = key_event.code {
-                            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                            if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                || key_event.modifiers.contains(KeyModifiers::ALT)
+                            {
                                 return false;
                             }
                             if c.is_alphabetic() {
@@ -44,16 +46,23 @@ impl KeyDef {
                     Self::Code(code) => {
                         key_event.code == code
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key_event.modifiers.contains(KeyModifiers::SHIFT)
+                            && !key_event.modifiers.contains(KeyModifiers::ALT)
                     }
                     Self::Ctrl(c) => {
                         if let KeyCode::Char(key_char) = key_event.code {
-                            key_char == c && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            key_char == c
+                                && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key_event.modifiers.contains(KeyModifiers::ALT)
                         } else {
                             false
                         }
                     }
                     Self::Shift(code) => {
-                        key_event.code == code && key_event.modifiers.contains(KeyModifiers::SHIFT)
+                        key_event.code == code
+                            && key_event.modifiers.contains(KeyModifiers::SHIFT)
+                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key_event.modifiers.contains(KeyModifiers::ALT)
                     }
                     Self::ScrollUp | Self::ScrollDown => false,
                 }
@@ -99,5 +108,47 @@ impl std::fmt::Display for KeyDef {
             Self::ScrollUp => write!(f, "Scroll Up"),
             Self::ScrollDown => write!(f, "Scroll Down"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind, KeyEventState};
+
+    #[test]
+    fn test_key_modifier_matching() {
+        let press_right = Event::Key(KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        let press_shift_right = Event::Key(KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        let press_ctrl_right = Event::Key(KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        let key_code_right = KeyDef::Code(KeyCode::Right);
+        let key_shift_right = KeyDef::Shift(KeyCode::Right);
+
+        // Code(Right) should only match exact Right arrow, not Shift+Right or Ctrl+Right
+        assert!(key_code_right.matches(&press_right));
+        assert!(!key_code_right.matches(&press_shift_right));
+        assert!(!key_code_right.matches(&press_ctrl_right));
+
+        // Shift(Right) should match Shift+Right, not exact Right
+        assert!(key_shift_right.matches(&press_shift_right));
+        assert!(!key_shift_right.matches(&press_right));
     }
 }
