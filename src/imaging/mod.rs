@@ -249,16 +249,7 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
             && let Some(rgba_img) =
                 image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
         {
-            let cursor_meta = std::io::Cursor::new(bytes);
-            let orientation = match image::ImageReader::new(cursor_meta).with_guessed_format() {
-                Ok(reader) => match reader.into_decoder() {
-                    Ok(mut dec) => dec
-                        .orientation()
-                        .unwrap_or(image::metadata::Orientation::NoTransforms),
-                    Err(_) => image::metadata::Orientation::NoTransforms,
-                },
-                Err(_) => image::metadata::Orientation::NoTransforms,
-            };
+            let orientation = get_exif_orientation(bytes);
 
             let mut img = image::DynamicImage::ImageRgba8(rgba_img);
             img.apply_orientation(orientation);
@@ -295,7 +286,7 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
         .map_err(|e| format!("Failed to decode image:\n{}\n\nError: {}", display_name, e))?;
 
     img.apply_orientation(orientation);
-    let rgba_img = img.to_rgba8();
+    let rgba_img = img.into_rgba8();
     let w = rgba_img.width();
     let h = rgba_img.height();
     Ok(DecodedImage {
@@ -746,6 +737,33 @@ pub fn collect_sources(paths: &[PathBuf], check_magic: bool) -> Result<Vec<Image
         }
     }
     Ok(sources)
+}
+
+/// Helper to extract EXIF orientation from raw bytes.
+fn get_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = match exif::Reader::new().read_from_container(&mut cursor) {
+        Ok(exif) => exif,
+        Err(_) => return image::metadata::Orientation::NoTransforms,
+    };
+    let val = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| match f.value {
+            exif::Value::Short(ref v) => v.first().copied(),
+            _ => None,
+        })
+        .unwrap_or(1);
+    match val {
+        1 => image::metadata::Orientation::NoTransforms,
+        2 => image::metadata::Orientation::FlipHorizontal,
+        3 => image::metadata::Orientation::Rotate180,
+        4 => image::metadata::Orientation::FlipVertical,
+        5 => image::metadata::Orientation::Rotate90FlipH,
+        6 => image::metadata::Orientation::Rotate90,
+        7 => image::metadata::Orientation::Rotate270FlipH,
+        8 => image::metadata::Orientation::Rotate270,
+        _ => image::metadata::Orientation::NoTransforms,
+    }
 }
 
 /// Tries to extract the embedded JPEG thumbnail from EXIF APP1 metadata segment.
