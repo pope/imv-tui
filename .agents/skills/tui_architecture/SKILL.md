@@ -49,3 +49,27 @@ Keep file responsibilities clean and modularized:
 - `src/imaging/`: Image source decoders, directory scans, clamping types, and background resizers.
 - `src/app/`: State controller, sub-states, adjustments, classification databases, events handler, and worker thread managers.
 - `src/ui/`: Layout grids, HUD bars, command search palettes, details tables, prompt widgets.
+
+### 5. Interactive Input & Line Editing
+
+- **Encapsulated Event Delegation**: Rather than processing input characters and cursor movements directly in the main app controller, delegate keyboard event handling to a specialized `LineEditor` widget.
+- **Editor Result Classification**: Return a descriptive `EditorResult` enum to control downstream behavior:
+  - `ConsumedChanged`: Text content changed. Trigger search matches cache updates and reset selection indexes.
+  - `ConsumedNoChange`: Text content remained identical (e.g. cursor moved left/right). Trigger a redraw directly without recalculating filters.
+  - `NotConsumed`: Key event was not used for text editing (e.g., Enter, Esc) and should be handled by the parent container.
+- **Panic-Safe UTF-8 Slicing**: When eliding or truncating string displays (e.g. filename truncations), never slice using direct arithmetic on byte lengths (`&last[start_idx..]`). Emojis and CJK characters have multi-byte sizes, and slicing in the middle of a sequence will crash the application with a byte-boundary panic. Always use `.char_indices()` to determine valid character boundaries:
+  ```rust
+  let char_indices: Vec<(usize, char)> = s.char_indices().collect();
+  if char_indices.len() > elided_len {
+      let start_idx = char_indices[char_indices.len() - elided_len].0;
+      format!("...{}", &s[start_idx..])
+  } else {
+      s.to_string()
+  }
+  ```
+
+### 6. Directory-Aware Searching & Prefix Stripping
+
+- **Common Prefix Stripping**: To prevent directory pollution in recursive file listings, compute the longest common parent directory prefix among all loaded file paths on startup. Strip this prefix to produce relative subpaths for matching.
+- **Search vs. Display Paths**: Match search queries against the full relative subpaths (allowing users to search by subfolders, e.g., typing `vacation image`), but visually collapse intermediate directories using `shorten_path` (e.g., `folder/.../image.jpg`) to prevent visual clipping in fixed-width TUI windows.
+- **Status HUD Hierarchy Formatting**: Highlight filenames in status bars by splitting relative paths into parent directories and filenames: render parent directories in normal styling (not bold) and filenames in bold styling. This instantly clarifies file locations without visual clutter.

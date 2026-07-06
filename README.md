@@ -67,6 +67,21 @@ ______________________________________________________________________
 | **Jump to View: Rejects Only**      | `4`         |                             |
 | **Jump to View: All Files**         | `5`         |                             |
 
+### Text Input & Search Palette Shortcuts
+
+When the command palette (`:`), file search (`f`), or any parameter input prompt is open, the following readline-like shortcuts are active:
+
+| Action                                     | Keys                                               |
+| :----------------------------------------- | :------------------------------------------------- |
+| **Scroll matching list down / up**         | `ctrl+n` / `ctrl+p`                                |
+| **Page matching list down / up**           | `ctrl+v` / `alt+v`                                 |
+| **Move cursor left / right**               | `ctrl+b` / `ctrl+f` (or `Left` / `Right`)          |
+| **Move cursor to start / end of line**     | `ctrl+a` / `ctrl+e` (or `Home` / `End`)            |
+| **Delete character before / under cursor** | `ctrl+h` (or `Backspace`) / `ctrl+d` (or `Delete`) |
+| **Delete word backward**                   | `ctrl+w` / `alt+Backspace`                         |
+| **Delete to start / end of line**          | `ctrl+u` / `ctrl+k`                                |
+| **Accept input / Cancel**                  | `Enter` / `Esc` or `ctrl+g`                        |
+
 ______________________________________________________________________
 
 ## How It Works Under the Hood
