@@ -240,8 +240,20 @@ impl App {
         // Spawn persistent background loader thread
         let disable_thumbnail = config.disable_thumbnail;
         std::thread::spawn(move || {
-            while let Ok(req) = loader_rx.recv() {
-                let mut requests = vec![req];
+            let mut pending_requests = Vec::new();
+
+            loop {
+                // If we don't have any pending requests, block until we receive one
+                let mut requests = if pending_requests.is_empty() {
+                    match loader_rx.recv() {
+                        Ok(req) => vec![req],
+                        Err(_) => break, // Channel disconnected, exit thread
+                    }
+                } else {
+                    std::mem::take(&mut pending_requests)
+                };
+
+                // Read any other immediately available requests
                 while let Ok(r) = loader_rx.try_recv() {
                     requests.push(r);
                 }
@@ -258,7 +270,23 @@ impl App {
                 // Sort current_requests so that the active load (is_prefetch == false) is processed first
                 current_requests.sort_by_key(|r| r.is_prefetch);
 
+                let mut aborted = false;
                 for r in current_requests {
+                    // Poll channel for newer sequence requests
+                    let mut new_reqs = Vec::new();
+                    while let Ok(nr) = loader_rx.try_recv() {
+                        new_reqs.push(nr);
+                    }
+                    if !new_reqs.is_empty() {
+                        let new_max_seq = new_reqs.iter().map(|nr| nr.sequence).max().unwrap_or(0);
+                        if new_max_seq > highest_seq {
+                            // Abort current sequence processing
+                            pending_requests = new_reqs;
+                            aborted = true;
+                            break;
+                        }
+                    }
+
                     let start = std::time::Instant::now();
 
                     // Try to load limited bytes first and extract thumbnail if this is an active cold load
@@ -317,6 +345,10 @@ impl App {
                         decode_duration,
                         is_thumbnail: false,
                     });
+                }
+
+                if aborted {
+                    continue;
                 }
             }
         });
