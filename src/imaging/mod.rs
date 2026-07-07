@@ -148,8 +148,168 @@ pub struct LoaderResponse {
     pub is_thumbnail: bool,
 }
 
+fn read_source_range(source: &ImageSource, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+    if length > 64 * 1024 * 1024 {
+        return Err(format!(
+            "Requested read segment length {} is too large (max 64MB)",
+            length
+        ));
+    }
+    match source {
+        ImageSource::Local(path) => {
+            use std::io::{Read, Seek};
+            let mut file =
+                std::fs::File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|e| format!("Failed to seek file: {}", e))?;
+            let mut buffer = vec![0u8; length as usize];
+            file.read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read file segment: {}", e))?;
+            Ok(buffer)
+        }
+        ImageSource::Cbz {
+            zip_path,
+            file_in_zip,
+        } => {
+            let file = std::fs::File::open(zip_path)
+                .map_err(|e| format!("Failed to open zip file: {}", e))?;
+            let reader = std::io::BufReader::new(file);
+            let mut archive = zip::ZipArchive::new(reader)
+                .map_err(|e| format!("Failed to read zip archive: {}", e))?;
+            let mut zip_entry = archive
+                .by_name(file_in_zip)
+                .map_err(|e| format!("Failed to locate zip entry: {}", e))?;
+            let _total_len = offset
+                .checked_add(length)
+                .ok_or_else(|| "Offset + length calculation overflowed u64".to_string())?;
+            use std::io::Read;
+            std::io::copy(&mut zip_entry.by_ref().take(offset), &mut std::io::sink())
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut buffer = vec![0u8; length as usize];
+            zip_entry
+                .read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+    }
+}
+
+fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
+    let header_bytes = read_source_bytes_limited(source, 256 * 1024).ok()?;
+
+    if header_bytes.starts_with(b"FUJIFILM") {
+        if header_bytes.len() < 92 {
+            return None;
+        }
+        let offset = u32::from_be_bytes(header_bytes[84..88].try_into().ok()?) as u64;
+        let length = u32::from_be_bytes(header_bytes[88..92].try_into().ok()?) as u64;
+        return read_source_range(source, offset, length).ok();
+    }
+
+    let mut cursor = std::io::Cursor::new(&header_bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+    let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
+    let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
+
+    let thumb_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL);
+    let thumb_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL);
+
+    let mut best_offset = None;
+    let mut best_length = 0;
+
+    if let Some(f_off) = primary_offset
+        && let Some(f_len) = primary_length
+    {
+        let off = match f_off.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        let len = match f_len.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        if let Some(off) = off
+            && let Some(len) = len
+        {
+            best_offset = Some(off as u64);
+            best_length = len as u64;
+        }
+    }
+
+    if let Some(f_off) = thumb_offset
+        && let Some(f_len) = thumb_length
+    {
+        let off = match f_off.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        let len = match f_len.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        if let Some(off) = off
+            && let Some(len) = len
+            && len as u64 > best_length
+        {
+            best_offset = Some(off as u64);
+            best_length = len as u64;
+        }
+    }
+
+    let offset = best_offset?;
+    let length = best_length;
+
+    let is_tiff = header_bytes.len() >= 4
+        && ((header_bytes[0] == 0x49
+            && header_bytes[1] == 0x49
+            && header_bytes[2] == 0x2A
+            && header_bytes[3] == 0x00)
+            || (header_bytes[0] == 0x4D
+                && header_bytes[1] == 0x4D
+                && header_bytes[2] == 0x00
+                && header_bytes[3] == 0x2A));
+
+    let tiff_start = if is_tiff {
+        0
+    } else {
+        header_bytes
+            .windows(6)
+            .position(|window| window == b"Exif\0\0")? as u64
+            + 6
+    };
+
+    let start = tiff_start.checked_add(offset)?;
+    read_source_range(source, start, length).ok()
+}
+
 /// Reads the source raw bytes from local files or CBZ zip archives.
 pub fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
+    let is_raw_extension = match source {
+        ImageSource::Local(path) => path.extension(),
+        ImageSource::Cbz { zip_path, .. } => zip_path.extension(),
+    }
+    .and_then(|ext| ext.to_str())
+    .map(|ext| {
+        ext.eq_ignore_ascii_case("dng")
+            || ext.eq_ignore_ascii_case("cr2")
+            || ext.eq_ignore_ascii_case("nef")
+            || ext.eq_ignore_ascii_case("arw")
+            || ext.eq_ignore_ascii_case("orf")
+            || ext.eq_ignore_ascii_case("rw2")
+            || ext.eq_ignore_ascii_case("pef")
+            || ext.eq_ignore_ascii_case("raf")
+    })
+    .unwrap_or(false);
+
+    if is_raw_extension && let Some(preview_bytes) = read_raw_preview_bytes(source) {
+        return Ok(preview_bytes);
+    }
+
     match source {
         ImageSource::Local(path) => std::fs::read(path)
             .map_err(|e| format!("Failed to read file:\n{}\n\nError: {}", path.display(), e)),
@@ -236,9 +396,44 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
 
 /// Decodes an image from already loaded memory bytes.
 pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedImage, String> {
-    let file_size = bytes.len() as u64;
+    let file_size = match source {
+        ImageSource::Local(path) => std::fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(bytes.len() as u64),
+        _ => bytes.len() as u64,
+    };
     let format = image::guess_format(bytes).ok();
     let display_name = source.display_name();
+
+    // Intercept RAW/TIFF files to extract and decode their embedded JPEG preview/thumbnail
+    let is_raw_extension = match source {
+        ImageSource::Local(path) => path.extension(),
+        ImageSource::Cbz { zip_path, .. } => zip_path.extension(),
+    }
+    .and_then(|ext| ext.to_str())
+    .map(|ext| {
+        ext.eq_ignore_ascii_case("dng")
+            || ext.eq_ignore_ascii_case("cr2")
+            || ext.eq_ignore_ascii_case("nef")
+            || ext.eq_ignore_ascii_case("arw")
+            || ext.eq_ignore_ascii_case("orf")
+            || ext.eq_ignore_ascii_case("rw2")
+            || ext.eq_ignore_ascii_case("pef")
+            || ext.eq_ignore_ascii_case("raf")
+    })
+    .unwrap_or(false);
+
+    if format != Some(image::ImageFormat::Jpeg)
+        && (format == Some(image::ImageFormat::Tiff) || is_raw_extension)
+        && let Some(jpeg_bytes) = extract_jpeg_preview(bytes)
+    {
+        // Recurse using the extracted JPEG bytes
+        if let Ok(mut decoded) = decode_image_bytes(&jpeg_bytes, source) {
+            decoded.format = Some(image::ImageFormat::Jpeg);
+            decoded.disk_size = file_size;
+            return Ok(decoded);
+        }
+    }
 
     if let Some(image::ImageFormat::Jpeg) = format {
         let options = zune_jpeg::zune_core::options::DecoderOptions::default()
@@ -249,7 +444,13 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
             && let Some(rgba_img) =
                 image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
         {
-            let orientation = get_exif_orientation(bytes);
+            let mut orientation = get_exif_orientation(bytes);
+            if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
+                orientation = read_source_bytes_limited(source, 256 * 1024)
+                    .ok()
+                    .map(|pb| get_exif_orientation(&pb))
+                    .unwrap_or(image::metadata::Orientation::NoTransforms);
+            }
 
             let mut img = image::DynamicImage::ImageRgba8(rgba_img);
             img.apply_orientation(orientation);
@@ -657,6 +858,14 @@ pub fn is_image_file(path: &Path, check_magic: bool) -> bool {
                     || ext.eq_ignore_ascii_case("bmp")
                     || ext.eq_ignore_ascii_case("tiff")
                     || ext.eq_ignore_ascii_case("ico")
+                    || ext.eq_ignore_ascii_case("dng")
+                    || ext.eq_ignore_ascii_case("cr2")
+                    || ext.eq_ignore_ascii_case("nef")
+                    || ext.eq_ignore_ascii_case("arw")
+                    || ext.eq_ignore_ascii_case("orf")
+                    || ext.eq_ignore_ascii_case("rw2")
+                    || ext.eq_ignore_ascii_case("pef")
+                    || ext.eq_ignore_ascii_case("raf")
             })
             .unwrap_or(false)
     }
@@ -766,41 +975,301 @@ fn get_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
     }
 }
 
-/// Tries to extract the embedded JPEG thumbnail from EXIF APP1 metadata segment.
+/// Tries to extract the smaller embedded JPEG thumbnail from EXIF APP1 metadata segment or TIFF/RAW container.
 pub fn extract_jpeg_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    // 1. Detect Fujifilm RAF raw formats (which are not standard TIFF files)
+    if bytes.starts_with(b"FUJIFILM") {
+        if bytes.len() < 92 {
+            return None;
+        }
+        let offset = u32::from_be_bytes(bytes[84..88].try_into().ok()?) as usize;
+        let length = u32::from_be_bytes(bytes[88..92].try_into().ok()?) as usize;
+        let end = offset.checked_add(length)?;
+        if end <= bytes.len() {
+            return Some(bytes[offset..end].to_vec());
+        }
+        return None;
+    }
+
+    // 2. Parse standard TIFF/EXIF structures for other formats
     let mut cursor = std::io::Cursor::new(bytes);
     let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
 
-    let offset = exif
-        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)
-        .and_then(|f| match f.value {
+    let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
+    let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
+
+    let thumb_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL);
+    let thumb_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL);
+
+    let mut candidates = Vec::new();
+
+    if let Some(f_off) = primary_offset
+        && let Some(f_len) = primary_length
+    {
+        let off = match f_off.value {
             exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
             _ => None,
-        })? as usize;
-
-    let length = exif
-        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)
-        .and_then(|f| match f.value {
+        };
+        let len = match f_len.value {
             exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
             _ => None,
-        })? as usize;
+        };
+        if let Some(off) = off
+            && let Some(len) = len
+        {
+            candidates.push((off as usize, len as usize));
+        }
+    }
 
-    let tiff_start = bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6;
+    if let Some(f_off) = thumb_offset
+        && let Some(f_len) = thumb_length
+    {
+        let off = match f_off.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        let len = match f_len.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        if let Some(off) = off
+            && let Some(len) = len
+        {
+            candidates.push((off as usize, len as usize));
+        }
+    }
 
-    let end = tiff_start
-        .checked_add(offset)
-        .and_then(|val| val.checked_add(length))?;
+    // Sort by length ascending (smallest first)
+    candidates.sort_by_key(|&(_, len)| len);
+
+    // TIFF magic headers: II*\0 or MM\0*
+    let is_tiff = bytes.len() >= 4
+        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
+            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A));
+
+    let tiff_start = if is_tiff {
+        0
+    } else {
+        bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6
+    };
+
+    // Pick the smallest candidate that fits within the provided bytes slice
+    for (offset, length) in candidates {
+        if let Some(start) = tiff_start.checked_add(offset)
+            && let Some(end) = start.checked_add(length)
+            && end <= bytes.len()
+        {
+            return Some(bytes[start..end].to_vec());
+        }
+    }
+
+    None
+}
+
+/// Tries to extract the larger/highest-resolution embedded JPEG preview from EXIF APP1 metadata segment or TIFF/RAW/RAF container.
+pub fn extract_jpeg_preview(bytes: &[u8]) -> Option<Vec<u8>> {
+    // 1. Detect Fujifilm RAF raw formats (which are not standard TIFF files)
+    if bytes.starts_with(b"FUJIFILM") {
+        if bytes.len() < 92 {
+            return None;
+        }
+        let offset = u32::from_be_bytes(bytes[84..88].try_into().ok()?) as usize;
+        let length = u32::from_be_bytes(bytes[88..92].try_into().ok()?) as usize;
+        let end = offset.checked_add(length)?;
+        if end <= bytes.len() {
+            return Some(bytes[offset..end].to_vec());
+        }
+        return None;
+    }
+
+    // 2. Parse standard TIFF/EXIF structures for other formats
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+    let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
+    let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
+
+    let thumb_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL);
+    let thumb_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL);
+
+    let mut best_offset = None;
+    let mut best_length = 0;
+
+    if let Some(f_off) = primary_offset
+        && let Some(f_len) = primary_length
+    {
+        let off = match f_off.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        let len = match f_len.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        if let Some(off) = off
+            && let Some(len) = len
+        {
+            best_offset = Some(off as usize);
+            best_length = len as usize;
+        }
+    }
+
+    if let Some(f_off) = thumb_offset
+        && let Some(f_len) = thumb_length
+    {
+        let off = match f_off.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        let len = match f_len.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        };
+        if let Some(off) = off
+            && let Some(len) = len
+            && len as usize > best_length
+        {
+            best_offset = Some(off as usize);
+            best_length = len as usize;
+        }
+    }
+
+    let offset = best_offset?;
+    let length = best_length;
+
+    // TIFF magic headers: II*\0 or MM\0*
+    let is_tiff = bytes.len() >= 4
+        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
+            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A));
+
+    let tiff_start = if is_tiff {
+        0
+    } else {
+        bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6
+    };
+
+    let start = tiff_start.checked_add(offset)?;
+    let end = start.checked_add(length)?;
 
     if end <= bytes.len() {
-        Some(bytes[tiff_start + offset..end].to_vec())
+        Some(bytes[start..end].to_vec())
     } else {
         None
     }
 }
 
+fn get_dimensions_from_exif(exif: &exif::Exif) -> Option<(u32, u32)> {
+    let w = exif
+        .get_field(exif::Tag::ImageWidth, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::PixelXDimension, exif::In::PRIMARY))
+        .and_then(|f| match f.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        })?;
+
+    let h = exif
+        .get_field(exif::Tag::ImageLength, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::PixelYDimension, exif::In::PRIMARY))
+        .and_then(|f| match f.value {
+            exif::Value::Long(ref v) => v.first().copied(),
+            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+            _ => None,
+        })?;
+
+    Some((w, h))
+}
+
 /// Reads the image dimensions extremely quickly from header headers, and decodes/scales
 /// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
 pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
+    // Check if this is a TIFF/RAW container
+    let is_tiff = bytes.len() >= 4
+        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
+            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A));
+
+    if is_tiff {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+        let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
+        let mut thumb_img = image::load_from_memory(&thumb_bytes).ok()?;
+
+        let orientation = exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| match f.value {
+                exif::Value::Short(ref v) => v.first().copied(),
+                _ => None,
+            })
+            .map(|val| match val {
+                2 => image::metadata::Orientation::FlipHorizontal,
+                3 => image::metadata::Orientation::Rotate180,
+                4 => image::metadata::Orientation::FlipVertical,
+                5 => image::metadata::Orientation::Rotate90FlipH,
+                6 => image::metadata::Orientation::Rotate90,
+                7 => image::metadata::Orientation::Rotate270FlipH,
+                8 => image::metadata::Orientation::Rotate270,
+                _ => image::metadata::Orientation::NoTransforms,
+            })
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+
+        thumb_img.apply_orientation(orientation);
+
+        let (mut raw_w, mut raw_h) =
+            get_dimensions_from_exif(&exif).unwrap_or((thumb_img.width(), thumb_img.height()));
+
+        let swaps = matches!(
+            orientation,
+            image::metadata::Orientation::Rotate90
+                | image::metadata::Orientation::Rotate270
+                | image::metadata::Orientation::Rotate90FlipH
+                | image::metadata::Orientation::Rotate270FlipH
+        );
+        if swaps {
+            std::mem::swap(&mut raw_w, &mut raw_h);
+        }
+
+        // Crop out any black padding/letterboxing in the thumbnail frame
+        let ar_main = raw_w as f64 / raw_h as f64;
+        let thumb_w = thumb_img.width();
+        let thumb_h = thumb_img.height();
+        let ar_thumb = thumb_w as f64 / thumb_h as f64;
+
+        let cropped_thumb = if (ar_main - ar_thumb).abs() > 0.01 {
+            if ar_main > ar_thumb {
+                let content_h = (thumb_w as f64 / ar_main).round() as u32;
+                let padding_y = (thumb_h.saturating_sub(content_h)) / 2;
+                let content_h = content_h.min(thumb_h.saturating_sub(padding_y));
+                if content_h > 0 {
+                    thumb_img.crop_imm(0, padding_y, thumb_w, content_h)
+                } else {
+                    thumb_img
+                }
+            } else {
+                let content_w = (thumb_h as f64 * ar_main).round() as u32;
+                let padding_x = (thumb_w.saturating_sub(content_w)) / 2;
+                let content_w = content_w.min(thumb_w.saturating_sub(padding_x));
+                if content_w > 0 {
+                    thumb_img.crop_imm(padding_x, 0, content_w, thumb_h)
+                } else {
+                    thumb_img
+                }
+            }
+        } else {
+            thumb_img
+        };
+
+        return Some((cropped_thumb, raw_w, raw_h));
+    }
+
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -931,13 +1400,13 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
 
         let jpg_path = dir.join("test.jpg");
-        fs::write(&jpg_path, &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]).unwrap();
+        fs::write(&jpg_path, [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]).unwrap();
 
         let png_path = dir.join("test.png");
-        fs::write(&png_path, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        fs::write(&png_path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
 
         let zip_path = dir.join("test.zip");
-        fs::write(&zip_path, &[0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x00]).unwrap();
+        fs::write(&zip_path, [0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x00]).unwrap();
 
         let txt_path = dir.join("test.txt");
         fs::write(&txt_path, b"hello world this is a text file").unwrap();
@@ -1011,7 +1480,7 @@ mod tests {
         assert_eq!(bytes_all, b"fake png data");
 
         // Test collect_sources
-        let sources = collect_sources(&[zip_path.clone()], true).unwrap();
+        let sources = collect_sources(std::slice::from_ref(&zip_path), true).unwrap();
         assert_eq!(sources.len(), 3);
         match &sources[0] {
             ImageSource::Cbz { file_in_zip, .. } => assert_eq!(file_in_zip, "cover.png"),
@@ -1053,5 +1522,142 @@ mod tests {
             image::metadata::Orientation::NoTransforms
         );
         assert!(extract_jpeg_thumbnail(corrupt_bytes).is_none());
+    }
+
+    #[test]
+    fn test_raw_image_file_recognition() {
+        // Assert RAW extensions are recognized as valid image files
+        let dir = PathBuf::from("target/tmp/raw_test");
+        let _ = fs::create_dir_all(&dir);
+
+        let dng_file = dir.join("test.dng");
+        let nef_file = dir.join("test.nef");
+        let cr2_file = dir.join("test.cr2");
+        let arw_file = dir.join("test.arw");
+
+        fs::write(&dng_file, []).unwrap();
+        fs::write(&nef_file, []).unwrap();
+        fs::write(&cr2_file, []).unwrap();
+        fs::write(&arw_file, []).unwrap();
+
+        assert!(is_image_file(&dng_file, false));
+        assert!(is_image_file(&nef_file, false));
+        assert!(is_image_file(&cr2_file, false));
+        assert!(is_image_file(&arw_file, false));
+
+        assert!(!is_cbz_or_zip(&dng_file, false));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_raf_preview_extraction() {
+        let mut raf_bytes = vec![0u8; 100];
+        // Write Fuji magic signature
+        raf_bytes[0..8].copy_from_slice(b"FUJIFILM");
+
+        // Write JPEG offset = 92
+        let offset = 92u32.to_be_bytes();
+        raf_bytes[84..88].copy_from_slice(&offset);
+
+        // Write JPEG length = 4
+        let length = 4u32.to_be_bytes();
+        raf_bytes[88..92].copy_from_slice(&length);
+
+        // Write mock JPEG bytes
+        raf_bytes[92..96].copy_from_slice(b"JPEG");
+
+        let extracted = extract_jpeg_thumbnail(&raf_bytes).unwrap();
+        assert_eq!(extracted, b"JPEG");
+    }
+
+    #[test]
+    fn test_arw_diagnostic() {
+        let path =
+            PathBuf::from("/home/pope/Pictures/2017-08-16.KayJay/Capture/20170816-KayJay-0121.ARW");
+        if path.exists() {
+            let bytes = std::fs::read(&path).unwrap();
+            let partial = &bytes[..256 * 1024];
+            println!("ARW file size: {}", bytes.len());
+
+            let mut cursor = std::io::Cursor::new(partial);
+            let exif = exif::Reader::new().read_from_container(&mut cursor);
+            match exif {
+                Ok(exif) => {
+                    println!("EXIF successfully parsed!");
+                    for f in exif.fields() {
+                        if f.tag == exif::Tag::JPEGInterchangeFormat
+                            || f.tag == exif::Tag::JPEGInterchangeFormatLength
+                        {
+                            println!(
+                                "Tag: {:?}, IFD: {:?}, Value: {:?}",
+                                f.tag, f.ifd_num, f.value
+                            );
+                        }
+                    }
+                    let thumb = extract_jpeg_thumbnail(partial);
+                    println!("extracted thumbnail size: {:?}", thumb.map(|t| t.len()));
+
+                    let thumb_and_dims = decode_thumbnail_and_dimensions(partial);
+                    assert!(thumb_and_dims.is_some());
+                    let (_, w, h) = thumb_and_dims.unwrap();
+                    println!("Parsed RAW dimensions: {}x{}", w, h);
+                    assert!(w > 0 && h > 0);
+                }
+                Err(e) => {
+                    println!("EXIF parse error: {:?}", e);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_source_range_limits() {
+        let path = PathBuf::from("target/tmp/nonexistent_file_limits.dat");
+        let src = ImageSource::Local(path);
+        // length > 64MB should fail with size limit error immediately
+        let res = read_source_range(&src, 0, 65 * 1024 * 1024);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("too large"));
+
+        // offset + length overflow should fail immediately in Cbz
+        let cbz_src = ImageSource::Cbz {
+            zip_path: PathBuf::from("target/tmp/nonexistent.zip"),
+            file_in_zip: "test.png".to_string(),
+        };
+        let res = read_source_range(&cbz_src, u64::MAX - 10, 20);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_cbz_read_source_range_streaming() {
+        let zip_path = PathBuf::from("target/tmp/test_cbz_stream.cbz");
+        let _ = fs::create_dir_all("target/tmp");
+
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::<()>::default();
+
+            zip.start_file("data.bin", options).unwrap();
+            use std::io::Write;
+            zip.write_all(b"0123456789abcdef").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let src = ImageSource::Cbz {
+            zip_path: zip_path.clone(),
+            file_in_zip: "data.bin".to_string(),
+        };
+
+        // Read offset=4, length=4 (should return "4567")
+        let res = read_source_range(&src, 4, 4).unwrap();
+        assert_eq!(res, b"4567");
+
+        // Read out of bounds should error gracefully
+        let res = read_source_range(&src, 10, 10);
+        assert!(res.is_err());
+
+        let _ = fs::remove_file(zip_path);
     }
 }
