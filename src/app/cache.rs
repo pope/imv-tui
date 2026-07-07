@@ -5,14 +5,26 @@ use std::sync::{Arc, Mutex};
 /// A cached image and its associated metadata in the prefetch cache.
 #[derive(Clone)]
 pub struct CachedImage {
+    /// The cached full-resolution decoded image, if loaded.
     pub image: Option<Arc<DynamicImage>>,
+    /// The cached low-resolution thumbnail image, if loaded.
     pub thumbnail: Option<Arc<DynamicImage>>,
+    /// The width of the image.
     pub width: u32,
+    /// The height of the image.
     pub height: u32,
+    /// The image format (e.g., JPEG, PNG, etc.).
     pub format: Option<image::ImageFormat>,
+    /// Time taken to decode the full-resolution image.
     pub decode_duration: std::time::Duration,
+    /// Time taken to decode the thumbnail image.
     pub thumbnail_decode_duration: std::time::Duration,
+    /// Size of the raw source file on disk in bytes.
     pub disk_size: u64,
+    /// The original raw/sensor width of the raw image, if any.
+    pub raw_width: Option<u32>,
+    /// The original raw/sensor height of the raw image, if any.
+    pub raw_height: Option<u32>,
 }
 
 pub type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;

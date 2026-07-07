@@ -54,6 +54,10 @@ pub struct StatsForNerds {
     pub disk_size: u64,
     /// Image format of the loaded image.
     pub format: Option<image::ImageFormat>,
+    /// The original raw/sensor width of the raw image, if any.
+    pub raw_width: Option<u32>,
+    /// The original raw/sensor height of the raw image, if any.
+    pub raw_height: Option<u32>,
 }
 
 /// A response payload sent by the resizing worker thread.
@@ -309,6 +313,8 @@ impl App {
                                         height: real_h,
                                         format: Some(image::ImageFormat::Jpeg),
                                         disk_size: 0, // Filled in by final high-res response
+                                        raw_width: Some(real_w),
+                                        raw_height: Some(real_h),
                                     }),
                                     is_prefetch: r.is_prefetch,
                                     sequence: r.sequence,
@@ -1205,6 +1211,8 @@ impl App {
                 self.stats.is_prefetch_cache_hit = true;
                 self.stats.disk_size = cached_img.disk_size;
                 self.stats.format = cached_img.format;
+                self.stats.raw_width = cached_img.raw_width;
+                self.stats.raw_height = cached_img.raw_height;
 
                 self.trigger_prefetch();
                 return;
@@ -1227,6 +1235,8 @@ impl App {
                 self.show_thumbnail_only = true;
                 self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
                 self.stats.thumbnail_dimensions = Some((cached_img.width, cached_img.height));
+                self.stats.raw_width = cached_img.raw_width;
+                self.stats.raw_height = cached_img.raw_height;
             }
         }
 
@@ -1237,6 +1247,8 @@ impl App {
             self.show_thumbnail_only = false;
             self.stats.thumbnail_load_duration = None;
             self.stats.thumbnail_dimensions = None;
+            self.stats.raw_width = None;
+            self.stats.raw_height = None;
         }
         self.image_protocol = None;
         self.is_loading = true;
@@ -1282,6 +1294,8 @@ impl App {
                             if let Some(cached) = cache.get_mut(&resp.idx) {
                                 cached.thumbnail = Some(shared_img.clone());
                                 cached.thumbnail_decode_duration = resp.decode_duration;
+                                cached.raw_width = decoded.raw_width;
+                                cached.raw_height = decoded.raw_height;
                             } else {
                                 cache.insert(
                                     resp.idx,
@@ -1294,6 +1308,8 @@ impl App {
                                         decode_duration: std::time::Duration::ZERO,
                                         thumbnail_decode_duration: resp.decode_duration,
                                         disk_size,
+                                        raw_width: decoded.raw_width,
+                                        raw_height: decoded.raw_height,
                                     },
                                 );
                             }
@@ -1305,6 +1321,8 @@ impl App {
                                 cached.format = format;
                                 cached.decode_duration = resp.decode_duration;
                                 cached.disk_size = disk_size;
+                                cached.raw_width = decoded.raw_width;
+                                cached.raw_height = decoded.raw_height;
                             } else {
                                 cache.insert(
                                     resp.idx,
@@ -1317,6 +1335,8 @@ impl App {
                                         decode_duration: resp.decode_duration,
                                         thumbnail_decode_duration: std::time::Duration::ZERO,
                                         disk_size,
+                                        raw_width: decoded.raw_width,
+                                        raw_height: decoded.raw_height,
                                     },
                                 );
                             }
@@ -1352,6 +1372,8 @@ impl App {
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;
+                            self.stats.raw_width = decoded.raw_width;
+                            self.stats.raw_height = decoded.raw_height;
                         } else {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();
@@ -1365,6 +1387,8 @@ impl App {
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;
+                            self.stats.raw_width = decoded.raw_width;
+                            self.stats.raw_height = decoded.raw_height;
 
                             self.trigger_prefetch();
                         }
@@ -2537,6 +2561,8 @@ mod tests {
                     decode_duration: std::time::Duration::from_millis(5),
                     thumbnail_decode_duration: std::time::Duration::ZERO,
                     disk_size: 100,
+                    raw_width: None,
+                    raw_height: None,
                 },
             );
         }
@@ -2580,6 +2606,8 @@ mod tests {
                 height: 1,
                 format: None,
                 disk_size: 0,
+                raw_width: None,
+                raw_height: None,
             }),
             decode_duration: std::time::Duration::ZERO,
         };

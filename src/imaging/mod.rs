@@ -73,6 +73,27 @@ impl ImageSource {
             }
         }
     }
+
+    /// Returns true if the image source is a RAW format.
+    pub fn is_raw(&self) -> bool {
+        let path = match self {
+            Self::Local(p) => p,
+            Self::Cbz { zip_path, .. } => zip_path,
+        };
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                ext.eq_ignore_ascii_case("dng")
+                    || ext.eq_ignore_ascii_case("cr2")
+                    || ext.eq_ignore_ascii_case("nef")
+                    || ext.eq_ignore_ascii_case("arw")
+                    || ext.eq_ignore_ascii_case("orf")
+                    || ext.eq_ignore_ascii_case("rw2")
+                    || ext.eq_ignore_ascii_case("pef")
+                    || ext.eq_ignore_ascii_case("raf")
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// A request payload sent to the resizing worker threads.
@@ -130,6 +151,10 @@ pub struct DecodedImage {
     pub format: Option<image::ImageFormat>,
     /// The size of the raw source file in bytes.
     pub disk_size: u64,
+    /// The original raw/sensor width of the raw image, if any.
+    pub raw_width: Option<u32>,
+    /// The original raw/sensor height of the raw image, if any.
+    pub raw_height: Option<u32>,
 }
 
 /// A response returned by the persistent loader thread.
@@ -423,6 +448,47 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
     })
     .unwrap_or(false);
 
+    let mut raw_width = None;
+    let mut raw_height = None;
+    if is_raw_extension && let Ok(partial_bytes) = read_source_bytes_limited(source, 256 * 1024) {
+        let mut cursor = std::io::Cursor::new(&partial_bytes);
+        if let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor)
+            && let Some((w, h)) = get_dimensions_from_exif(&exif)
+        {
+            let orientation = exif
+                .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                .and_then(|f| match f.value {
+                    exif::Value::Short(ref v) => v.first().copied(),
+                    _ => None,
+                })
+                .map(|val| match val {
+                    2 => image::metadata::Orientation::FlipHorizontal,
+                    3 => image::metadata::Orientation::Rotate180,
+                    4 => image::metadata::Orientation::FlipVertical,
+                    5 => image::metadata::Orientation::Rotate90FlipH,
+                    6 => image::metadata::Orientation::Rotate90,
+                    7 => image::metadata::Orientation::Rotate270FlipH,
+                    8 => image::metadata::Orientation::Rotate270,
+                    _ => image::metadata::Orientation::NoTransforms,
+                })
+                .unwrap_or(image::metadata::Orientation::NoTransforms);
+            let swaps = matches!(
+                orientation,
+                image::metadata::Orientation::Rotate90
+                    | image::metadata::Orientation::Rotate270
+                    | image::metadata::Orientation::Rotate90FlipH
+                    | image::metadata::Orientation::Rotate270FlipH
+            );
+            if swaps {
+                raw_width = Some(h);
+                raw_height = Some(w);
+            } else {
+                raw_width = Some(w);
+                raw_height = Some(h);
+            }
+        }
+    }
+
     if format != Some(image::ImageFormat::Jpeg)
         && (format == Some(image::ImageFormat::Tiff) || is_raw_extension)
         && let Some(jpeg_bytes) = extract_jpeg_preview(bytes)
@@ -462,6 +528,8 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
                 height: h,
                 format: Some(image::ImageFormat::Jpeg),
                 disk_size: file_size,
+                raw_width,
+                raw_height,
             });
         }
     }
@@ -496,6 +564,8 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
         height: h,
         format,
         disk_size: file_size,
+        raw_width,
+        raw_height,
     })
 }
 

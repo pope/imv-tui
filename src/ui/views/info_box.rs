@@ -93,6 +93,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     (filename, dir_str, disk_size_str, mem_size_str)
                 }
             };
+        let is_raw = app
+            .queue
+            .images
+            .get(app.queue.current_index)
+            .map(|src| src.is_raw())
+            .unwrap_or(false);
         let pixels_str = format!("{} x {} px", app.img_width, app.img_height);
 
         lines.push(Line::from(vec![
@@ -108,18 +114,38 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             .format
             .map(|fmt| fmt.to_mime_type())
             .unwrap_or("image/unknown");
-        lines.push(Line::from(vec![
-            " MIME Type: ".bold().cyan(),
-            mime_str.into(),
-        ]));
+        let mime_label = if is_raw {
+            " Preview MIME Type: "
+        } else {
+            " MIME Type: "
+        };
+        lines.push(Line::from(vec![mime_label.bold().cyan(), mime_str.into()]));
         lines.push(Line::from(vec![
             " Size on Disk: ".bold().cyan(),
             disk_size_str.as_str().into(),
         ]));
+        let dims_label = if is_raw {
+            " Preview Dimensions: "
+        } else {
+            " Dimensions: "
+        };
         lines.push(Line::from(vec![
-            " Dimensions: ".bold().cyan(),
+            dims_label.bold().cyan(),
             pixels_str.as_str().into(),
         ]));
+        if is_raw {
+            let raw_dims_str = if let Some(w) = app.stats.raw_width
+                && let Some(h) = app.stats.raw_height
+            {
+                format!("{} x {} px", w, h)
+            } else {
+                "Unknown px".to_string()
+            };
+            lines.push(Line::from(vec![
+                " RAW Dimensions: ".bold().cyan(),
+                raw_dims_str.into(),
+            ]));
+        }
         let classification = app.current_classification();
         let flag_style = match classification {
             crate::app::Classification::Unflagged => Style::default().fg(Color::Gray),

@@ -96,6 +96,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let inner_rect = status_block.inner(area);
         frame.render_widget(status_block, area);
 
+        let is_raw = app
+            .queue
+            .images
+            .get(app.queue.current_index)
+            .map(|src| src.is_raw())
+            .unwrap_or(false);
         let left_text = format!(
             " [{}/{}] ({}x{}){} ",
             app.get_visible_position().map(|pos| pos + 1).unwrap_or(0),
@@ -104,6 +110,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             app.img_height,
             if app.show_thumbnail_only {
                 " [THUMB]"
+            } else if is_raw {
+                " [PREVIEW]"
             } else {
                 ""
             }
