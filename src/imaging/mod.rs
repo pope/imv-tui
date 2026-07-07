@@ -419,6 +419,67 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
     }
 }
 
+/// Extracts the original full raw image dimensions from the Fujifilm RAF metadata records container bytes.
+fn get_fuji_raf_dimensions(meta_bytes: &[u8]) -> Option<(u32, u32)> {
+    if meta_bytes.len() < 4 {
+        return None;
+    }
+    let mut pos = 0;
+    let num_records = match meta_bytes[pos..pos + 4].try_into() {
+        Ok(arr) => u32::from_be_bytes(arr) as usize,
+        Err(_) => return None,
+    };
+    pos += 4;
+
+    let mut cropped_size = None;
+    let mut image_size = None;
+    let mut full_size = None;
+
+    for _ in 0..num_records {
+        if pos + 4 > meta_bytes.len() {
+            break;
+        }
+        let tag_id = match meta_bytes[pos..pos + 2].try_into() {
+            Ok(arr) => u16::from_be_bytes(arr),
+            Err(_) => break,
+        };
+        let tag_len = match meta_bytes[pos + 2..pos + 4].try_into() {
+            Ok(arr) => u16::from_be_bytes(arr) as usize,
+            Err(_) => break,
+        };
+        pos += 4;
+
+        let end = match pos.checked_add(tag_len) {
+            Some(end) if end <= meta_bytes.len() => end,
+            _ => break,
+        };
+        let tag_data = &meta_bytes[pos..end];
+        pos = end;
+
+        if tag_len >= 4 {
+            let h = match tag_data[0..2].try_into() {
+                Ok(arr) => u16::from_be_bytes(arr) as u32,
+                Err(_) => continue,
+            };
+            let w = match tag_data[2..4].try_into() {
+                Ok(arr) => u16::from_be_bytes(arr) as u32,
+                Err(_) => continue,
+            };
+            if w > 0 && h > 0 {
+                if tag_id == 0x0111 {
+                    cropped_size = Some((w, h));
+                } else if tag_id == 0x0121 {
+                    image_size = Some((w, h));
+                } else if tag_id == 0x0100 {
+                    full_size = Some((w, h));
+                }
+            }
+        }
+    }
+
+    cropped_size.or(image_size).or(full_size)
+}
+
 /// Decodes an image from already loaded memory bytes.
 pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedImage, String> {
     let file_size = match source {
@@ -450,8 +511,83 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
 
     let mut raw_width = None;
     let mut raw_height = None;
-    if is_raw_extension && let Ok(partial_bytes) = read_source_bytes_limited(source, 256 * 1024) {
-        let mut cursor = std::io::Cursor::new(&partial_bytes);
+    if is_raw_extension {
+        // Read the first 256 KB of the raw container file on disk to inspect its container format
+        if let Ok(partial_bytes) = read_source_bytes_limited(source, 256 * 1024) {
+            if partial_bytes.starts_with(b"FUJIFILM")
+                && let Some(meta_offset) = partial_bytes
+                    .get(92..96)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_be_bytes)
+                    .map(|x| x as u64)
+                && let Some(meta_length) = partial_bytes
+                    .get(96..100)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_be_bytes)
+                    .map(|x| x as u64)
+                && let Ok(meta_bytes) = read_source_range(source, meta_offset, meta_length)
+                && let Some((w, h)) = get_fuji_raf_dimensions(&meta_bytes)
+            {
+                // Get orientation from the JPEG preview (the bytes variable contains the preview JPEG!)
+                let orientation = get_exif_orientation(bytes);
+                let swaps = matches!(
+                    orientation,
+                    image::metadata::Orientation::Rotate90
+                        | image::metadata::Orientation::Rotate270
+                        | image::metadata::Orientation::Rotate90FlipH
+                        | image::metadata::Orientation::Rotate270FlipH
+                );
+                if swaps {
+                    raw_width = Some(h);
+                    raw_height = Some(w);
+                } else {
+                    raw_width = Some(w);
+                    raw_height = Some(h);
+                }
+            } else {
+                // If not Fuji RAF, try standard TIFF EXIF container check
+                let mut cursor = std::io::Cursor::new(&partial_bytes);
+                if let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor)
+                    && let Some((w, h)) = get_dimensions_from_exif(&exif)
+                {
+                    let orientation = exif
+                        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                        .and_then(|f| match f.value {
+                            exif::Value::Short(ref v) => v.first().copied(),
+                            _ => None,
+                        })
+                        .map(|val| match val {
+                            2 => image::metadata::Orientation::FlipHorizontal,
+                            3 => image::metadata::Orientation::Rotate180,
+                            4 => image::metadata::Orientation::FlipVertical,
+                            5 => image::metadata::Orientation::Rotate90FlipH,
+                            6 => image::metadata::Orientation::Rotate90,
+                            7 => image::metadata::Orientation::Rotate270FlipH,
+                            8 => image::metadata::Orientation::Rotate270,
+                            _ => image::metadata::Orientation::NoTransforms,
+                        })
+                        .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    let swaps = matches!(
+                        orientation,
+                        image::metadata::Orientation::Rotate90
+                            | image::metadata::Orientation::Rotate270
+                            | image::metadata::Orientation::Rotate90FlipH
+                            | image::metadata::Orientation::Rotate270FlipH
+                    );
+                    if swaps {
+                        raw_width = Some(h);
+                        raw_height = Some(w);
+                    } else {
+                        raw_width = Some(w);
+                        raw_height = Some(h);
+                    }
+                }
+            }
+        }
+    }
+
+    if is_raw_extension && (raw_width.is_none() || raw_height.is_none()) {
+        let mut cursor = std::io::Cursor::new(bytes);
         if let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor)
             && let Some((w, h)) = get_dimensions_from_exif(&exif)
         {
@@ -497,6 +633,12 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
         if let Ok(mut decoded) = decode_image_bytes(&jpeg_bytes, source) {
             decoded.format = Some(image::ImageFormat::Jpeg);
             decoded.disk_size = file_size;
+            if raw_width.is_some() {
+                decoded.raw_width = raw_width;
+            }
+            if raw_height.is_some() {
+                decoded.raw_height = raw_height;
+            }
             return Ok(decoded);
         }
     }
@@ -522,14 +664,16 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
             img.apply_orientation(orientation);
             let w = img.width();
             let h = img.height();
+            let final_raw_width = raw_width.unwrap_or(w);
+            let final_raw_height = raw_height.unwrap_or(h);
             return Ok(DecodedImage {
                 image: img,
                 width: w,
                 height: h,
                 format: Some(image::ImageFormat::Jpeg),
                 disk_size: file_size,
-                raw_width,
-                raw_height,
+                raw_width: Some(final_raw_width),
+                raw_height: Some(final_raw_height),
             });
         }
     }
@@ -558,14 +702,16 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
     let rgba_img = img.into_rgba8();
     let w = rgba_img.width();
     let h = rgba_img.height();
+    let final_raw_width = raw_width.unwrap_or(w);
+    let final_raw_height = raw_height.unwrap_or(h);
     Ok(DecodedImage {
         image: image::DynamicImage::ImageRgba8(rgba_img),
         width: w,
         height: h,
         format,
         disk_size: file_size,
-        raw_width,
-        raw_height,
+        raw_width: Some(final_raw_width),
+        raw_height: Some(final_raw_height),
     })
 }
 
@@ -1729,5 +1875,27 @@ mod tests {
         assert!(res.is_err());
 
         let _ = fs::remove_file(zip_path);
+    }
+
+    #[test]
+    fn test_fuji_raf_dimensions_parser() {
+        let mut mock_data = [0u8; 200];
+        mock_data[0..8].copy_from_slice(b"FUJIFILM");
+        // Meta container offset = 100, length = 100
+        mock_data[92..96].copy_from_slice(&100u32.to_be_bytes());
+        mock_data[96..100].copy_from_slice(&100u32.to_be_bytes());
+
+        // Inside Meta Container: offset 100
+        // num_records = 1
+        mock_data[100..104].copy_from_slice(&1u32.to_be_bytes());
+        // Record 0: tag_id = 0x0111, tag_len = 4
+        mock_data[104..106].copy_from_slice(&0x0111u16.to_be_bytes());
+        mock_data[106..108].copy_from_slice(&4u16.to_be_bytes());
+        // Data: height = 6192, width = 8256
+        mock_data[108..110].copy_from_slice(&6192u16.to_be_bytes());
+        mock_data[110..112].copy_from_slice(&8256u16.to_be_bytes());
+
+        let res = get_fuji_raf_dimensions(&mock_data[100..]);
+        assert_eq!(res, Some((8256, 6192)));
     }
 }

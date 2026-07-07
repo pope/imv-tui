@@ -99,7 +99,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             .get(app.queue.current_index)
             .map(|src| src.is_raw())
             .unwrap_or(false);
-        let pixels_str = format!("{} x {} px", app.img_width, app.img_height);
+        let mp = (app.img_width as f64 * app.img_height as f64) / 1_000_000.0;
+        let pixels_str = format!("{} x {} px ({:.1} MP)", app.img_width, app.img_height, mp);
 
         lines.push(Line::from(vec![
             " File: ".bold().cyan(),
@@ -137,7 +138,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let raw_dims_str = if let Some(w) = app.stats.raw_width
                 && let Some(h) = app.stats.raw_height
             {
-                format!("{} x {} px", w, h)
+                let raw_mp = (w as f64 * h as f64) / 1_000_000.0;
+                format!("{} x {} px ({:.1} MP)", w, h, raw_mp)
             } else {
                 "Unknown px".to_string()
             };
