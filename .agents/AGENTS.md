@@ -35,7 +35,7 @@ ______________________________________________________________________
    - Before finishing your task and reporting back to the user, always perform the following validation commands:
      - Run `cargo clippy` and address all errors/warnings.
      - Run `nix fmt` to auto-format code changes.
-     - Run `cargo build --release` to verify compilation and build a release candidate to test with.
+     - Run `cargo build` to verify compilation.
 
 5. **API Visibility & Documentation Coverage**:
 
