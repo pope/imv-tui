@@ -3,6 +3,17 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    llm-agents = {
+      url = "github:numtide/llm-agents.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    jailed-agents = {
+      url = "github:andersonjoseph/jailed-agents";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        llm-agents.follows = "llm-agents";
+      };
+    };
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -11,7 +22,9 @@
 
   outputs =
     {
+      jailed-agents,
       nixpkgs,
+      llm-agents,
       self,
       treefmt-nix,
       ...
@@ -52,6 +65,20 @@
               "target/*"
             ];
           });
+          packages = with pkgs; [
+            cargo
+            cargo-flamegraph
+            cargo-nextest
+            cargo-watch
+            clang
+            clippy
+            mold
+            rust-analyzer
+            rustc
+            rustfmt
+            samply
+            self.formatter.${system}
+          ];
         in
         {
           packages.${system} = rec {
@@ -77,17 +104,14 @@
             };
           };
           devShells.${system}.default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              cargo-flamegraph
-              clippy
-              rust-analyzer
-              rustc
-              rustfmt
-              samply
-              self.formatter.${system}
+            packages = packages ++ [
+              (jailed-agents.lib.${system}.makeJailedAgent {
+                name = "agy";
+                pkg = llm-agents.packages.${system}.antigravity-cli;
+                configPaths = [ "~/.gemini" ];
+                extraPkgs = packages;
+              })
             ];
-            RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-C target-cpu=x86-64-v3";
           };
           formatter.${system} = treefmt-eval.config.build.wrapper;
           checks.${system} = {
