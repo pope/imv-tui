@@ -95,20 +95,20 @@ pub fn list_cbz_pages(zip_path: &Path) -> Result<Vec<String>, String> {
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index(i)
             && entry.is_file()
+            && let Ok(name) = entry.name()
+            && let Some(ext) = Path::new(name.as_ref())
+                .extension()
+                .and_then(|e| e.to_str())
+            && (ext.eq_ignore_ascii_case("png")
+                || ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("gif")
+                || ext.eq_ignore_ascii_case("webp")
+                || ext.eq_ignore_ascii_case("bmp")
+                || ext.eq_ignore_ascii_case("tiff")
+                || ext.eq_ignore_ascii_case("ico"))
         {
-            let name = entry.name();
-            if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str())
-                && (ext.eq_ignore_ascii_case("png")
-                    || ext.eq_ignore_ascii_case("jpg")
-                    || ext.eq_ignore_ascii_case("jpeg")
-                    || ext.eq_ignore_ascii_case("gif")
-                    || ext.eq_ignore_ascii_case("webp")
-                    || ext.eq_ignore_ascii_case("bmp")
-                    || ext.eq_ignore_ascii_case("tiff")
-                    || ext.eq_ignore_ascii_case("ico"))
-            {
-                pages.push(name.to_string());
-            }
+            pages.push(name.into_owned());
         }
     }
 
@@ -415,7 +415,8 @@ pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedI
     if let Some(image::ImageFormat::Jpeg) = format {
         let options = zune_jpeg::zune_core::options::DecoderOptions::default()
             .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
-        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(bytes, options);
+        let cursor = zune_jpeg::zune_core::bytestream::ZCursor::new(bytes);
+        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
         if let Ok(pixels) = decoder.decode()
             && let Some(info) = decoder.info()
             && let Some(rgba_img) =

@@ -92,7 +92,7 @@
             };
             default = imv-tui;
           }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             imv-tui-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
               pname = "imv-tui";
               version = "0.1.0";
