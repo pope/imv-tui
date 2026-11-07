@@ -225,10 +225,10 @@ pub fn downscale_for_thumbnail(
     }
 
     let (target_w, target_h) = compute_scaled_dims(src_w, src_h, target_tier.max_dim());
-    let src_rgba = src_img.to_rgba8();
+    let src_rgba = crate::imaging::to_rgba8_fast(src_img);
 
     if target_w == src_w && target_h == src_h {
-        return Ok(src_rgba);
+        return Ok(src_rgba.into_owned());
     }
 
     let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x4);
@@ -238,7 +238,7 @@ pub fn downscale_for_thumbnail(
     options.mul_div_alpha = true;
 
     resizer
-        .resize(&src_rgba, &mut dst_image, Some(&options))
+        .resize(src_rgba.as_ref(), &mut dst_image, Some(&options))
         .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
 
     let dst_raw = dst_image.into_vec();

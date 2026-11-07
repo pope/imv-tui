@@ -28,14 +28,7 @@ pub fn fast_resize(
         FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
     };
 
-    let temp_rgba;
-    let rgba_src = match src_img {
-        DynamicImage::ImageRgba8(rgba) => rgba,
-        other => {
-            temp_rgba = other.to_rgba8();
-            &temp_rgba
-        }
-    };
+    let rgba_src = crate::imaging::to_rgba8_fast(src_img);
 
     let mut dst_image = FirImage::new(dst_w, dst_h, fir::PixelType::U8x4);
 
@@ -45,7 +38,7 @@ pub fn fast_resize(
         options = options.crop(left, top, width, height);
     }
 
-    resizer.resize(rgba_src, &mut dst_image, Some(&options))?;
+    resizer.resize(rgba_src.as_ref(), &mut dst_image, Some(&options))?;
 
     let buffer = dst_image.into_vec();
     let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
@@ -63,7 +56,7 @@ pub fn fast_resize(
             FilterType::Lanczos | FilterType::Mitchell | FilterType::Cubic
         )
     {
-        clamp_anti_ringing_rgba(&mut rgba_dst, rgba_src, crop_rect);
+        clamp_anti_ringing_rgba(&mut rgba_dst, &rgba_src, crop_rect);
     }
 
     Ok(DynamicImage::ImageRgba8(rgba_dst))

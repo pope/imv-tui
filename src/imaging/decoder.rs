@@ -538,7 +538,7 @@ pub fn decode_image_bytes_cancellable(
         img.apply_orientation(orientation);
     }
 
-    let rgba_img = img.into_rgba8();
+    let rgba_img = into_rgba8_fast(img);
     let w = rgba_img.width();
     let h = rgba_img.height();
     let final_raw_width = raw_width.unwrap_or(w);
@@ -552,6 +552,63 @@ pub fn decode_image_bytes_cancellable(
         raw_width: Some(final_raw_width),
         raw_height: Some(final_raw_height),
     })
+}
+
+/// Unpacks packed 24-bit RGB (`[R, G, B]`) bytes into 32-bit RGBA (`[R, G, B, 255]`) bytes
+/// using 4-pixel (12-byte -> 16-byte) unrolled block unpacking for SIMD auto-vectorization.
+pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
+    let num_pixels = rgb.len() / 3;
+    let mut rgba = vec![0u8; num_pixels * 4];
+    let (in_chunks, in_rem) = rgb[..num_pixels * 3].as_chunks::<12>();
+    let (out_chunks, out_rem) = rgba.as_chunks_mut::<16>();
+
+    for (src, dst) in in_chunks.iter().zip(out_chunks.iter_mut()) {
+        *dst = [
+            src[0], src[1], src[2], 0xFF, src[3], src[4], src[5], 0xFF, src[6], src[7], src[8],
+            0xFF, src[9], src[10], src[11], 0xFF,
+        ];
+    }
+
+    for (src, dst) in in_rem
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out_rem.as_chunks_mut::<4>().0.iter_mut())
+    {
+        *dst = [src[0], src[1], src[2], 0xFF];
+    }
+
+    rgba
+}
+
+/// Converts a `DynamicImage` into an `RgbaImage` by consuming it, utilizing SIMD-vectorized
+/// unpacking when the source is `DynamicImage::ImageRgb8` to avoid per-pixel allocations.
+pub fn into_rgba8_fast(img: DynamicImage) -> image::RgbaImage {
+    match img {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = unpack_rgb24_to_rgba32(rgb.as_raw());
+            image::RgbaImage::from_raw(w, h, raw).expect("valid RGBA dimensions")
+        }
+        other => other.into_rgba8(),
+    }
+}
+
+/// Converts a `DynamicImage` reference into a `Cow<RgbaImage>`, borrowing zero-copy when the image
+/// is already `DynamicImage::ImageRgba8` and using SIMD-vectorized unpacking for `DynamicImage::ImageRgb8`.
+pub fn to_rgba8_fast(img: &DynamicImage) -> std::borrow::Cow<'_, image::RgbaImage> {
+    match img {
+        DynamicImage::ImageRgba8(rgba) => std::borrow::Cow::Borrowed(rgba),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = unpack_rgb24_to_rgba32(rgb.as_raw());
+            std::borrow::Cow::Owned(
+                image::RgbaImage::from_raw(w, h, raw).expect("valid RGBA dimensions"),
+            )
+        }
+        other => std::borrow::Cow::Owned(other.to_rgba8()),
+    }
 }
 
 /// Decodes an image from already loaded memory bytes.
@@ -657,7 +714,11 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
             thumb_img
         };
 
-        return Some((cropped_thumb, raw_w, raw_h));
+        return Some((
+            DynamicImage::ImageRgba8(into_rgba8_fast(cropped_thumb)),
+            raw_w,
+            raw_h,
+        ));
     }
 
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -719,7 +780,11 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
         thumb_img
     };
 
-    Some((cropped_thumb, oriented_raw_w, oriented_raw_h))
+    Some((
+        DynamicImage::ImageRgba8(into_rgba8_fast(cropped_thumb)),
+        oriented_raw_w,
+        oriented_raw_h,
+    ))
 }
 
 #[cfg(test)]
@@ -918,5 +983,80 @@ mod tests {
         let source = ImageSource::Local(PathBuf::from("nonexistent.jpg"));
         assert!(decode_image_bytes(dummy_bytes, &source).is_err());
         assert!(decode_image_source(source).is_err());
+    }
+
+    #[test]
+    fn test_unpack_rgb24_to_rgba32_simd_and_tail_equivalence() {
+        // Test varying pixel counts:
+        // - Empty: 0
+        // - Tail-only: 1, 2, 3
+        // - Exact multiple of 4: 4, 16
+        // - Non-multiple of 4: 5, 7, 19, 33
+        let pixel_counts = [0, 1, 2, 3, 4, 5, 7, 16, 19, 33];
+
+        for &count in &pixel_counts {
+            let mut rgb_bytes = Vec::with_capacity(count * 3);
+            for i in 0..count {
+                rgb_bytes.push(((i * 7 + 13) % 256) as u8);
+                rgb_bytes.push(((i * 11 + 47) % 256) as u8);
+                rgb_bytes.push(((i * 13 + 89) % 256) as u8);
+            }
+
+            let rgba = unpack_rgb24_to_rgba32(&rgb_bytes);
+            assert_eq!(rgba.len(), count * 4);
+
+            for i in 0..count {
+                assert_eq!(rgba[i * 4], rgb_bytes[i * 3]);
+                assert_eq!(rgba[i * 4 + 1], rgb_bytes[i * 3 + 1]);
+                assert_eq!(rgba[i * 4 + 2], rgb_bytes[i * 3 + 2]);
+                assert_eq!(rgba[i * 4 + 3], 255);
+            }
+
+            if count > 0 {
+                let rgb_img =
+                    image::RgbImage::from_raw(count as u32, 1, rgb_bytes.clone()).unwrap();
+                let dynamic = DynamicImage::ImageRgb8(rgb_img);
+                let std_rgba = dynamic.clone().into_rgba8();
+                assert_eq!(rgba, std_rgba.into_raw());
+
+                let fast_rgba = into_rgba8_fast(dynamic.clone());
+                assert_eq!(fast_rgba.as_raw(), &rgba);
+
+                let cow_rgba = to_rgba8_fast(&dynamic);
+                assert_eq!(cow_rgba.as_raw(), &rgba);
+            }
+        }
+
+        // Test 2D dimensions equivalence (e.g., 7x5, 16x3)
+        let dimensions = [(7, 5), (16, 3), (1, 1), (4, 4), (13, 9)];
+        for (w, h) in dimensions {
+            let count = (w * h) as usize;
+            let mut rgb_bytes = Vec::with_capacity(count * 3);
+            for i in 0..count {
+                rgb_bytes.push(((i * 3 + 5) % 256) as u8);
+                rgb_bytes.push(((i * 5 + 17) % 256) as u8);
+                rgb_bytes.push(((i * 7 + 31) % 256) as u8);
+            }
+
+            let fast_unpacked = unpack_rgb24_to_rgba32(&rgb_bytes);
+            let rgb_img = image::RgbImage::from_raw(w, h, rgb_bytes).unwrap();
+            let dynamic = DynamicImage::ImageRgb8(rgb_img);
+            let std_rgba = dynamic.clone().into_rgba8();
+
+            assert_eq!(fast_unpacked, std_rgba.into_raw());
+
+            let fast_owned = into_rgba8_fast(dynamic.clone());
+            assert_eq!(fast_owned.as_raw(), &fast_unpacked);
+
+            let cow_borrowed_or_owned = to_rgba8_fast(&dynamic);
+            assert_eq!(cow_borrowed_or_owned.as_raw(), &fast_unpacked);
+
+            // Also test to_rgba8_fast on an existing DynamicImage::ImageRgba8 borrows directly
+            let dynamic_rgba = DynamicImage::ImageRgba8(fast_owned);
+            match to_rgba8_fast(&dynamic_rgba) {
+                std::borrow::Cow::Borrowed(_) => {}
+                std::borrow::Cow::Owned(_) => panic!("Expected Cow::Borrowed for ImageRgba8"),
+            }
+        }
     }
 }
