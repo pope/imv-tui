@@ -2,10 +2,9 @@
 
 use fast_image_resize as fir;
 use image::{DynamicImage, GenericImage};
-use ratatui_image::protocol::StatefulProtocol;
 
-use crate::imaging::ResizeRequest;
 use crate::imaging::types::*;
+use crate::imaging::{ResizeRequest, ViewportProtocol};
 
 /// Analytical single-sine Lanczos3 filter kernel.
 ///
@@ -311,20 +310,43 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
 pub fn process_resize(
     req: ResizeRequest,
     resizer: &mut fir::Resizer,
-) -> (StatefulProtocol, std::time::Duration, std::time::Duration) {
+) -> (ViewportProtocol, std::time::Duration, std::time::Duration) {
     let rendered_cells = req.rendered_size_cells;
     let start_process = std::time::Instant::now();
     let canvas = render_resize_canvas(&req, resizer);
     let process_duration = start_process.elapsed();
 
     let start_protocol = std::time::Instant::now();
-    let mut protocol = req.picker.new_resize_protocol(canvas);
     let target_size = ratatui::layout::Size::new(rendered_cells.0, rendered_cells.1);
-    ratatui_image::ResizeEncodeRender::resize_encode(
-        &mut protocol,
-        &ratatui_image::Resize::Crop(None),
-        target_size,
-    );
+    let protocol = if req.use_kitty_shm
+        && req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty
+    {
+        match crate::imaging::KittyShmProtocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+        ) {
+            Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
+            Err(_) => {
+                let mut p = req.picker.new_resize_protocol(canvas);
+                ratatui_image::ResizeEncodeRender::resize_encode(
+                    &mut p,
+                    &ratatui_image::Resize::Crop(None),
+                    target_size,
+                );
+                ViewportProtocol::Standard(p)
+            }
+        }
+    } else {
+        let mut p = req.picker.new_resize_protocol(canvas);
+        ratatui_image::ResizeEncodeRender::resize_encode(
+            &mut p,
+            &ratatui_image::Resize::Crop(None),
+            target_size,
+        );
+        ViewportProtocol::Standard(p)
+    };
     let protocol_duration = start_protocol.elapsed();
 
     (protocol, process_duration, protocol_duration)
@@ -626,6 +648,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (5, 3),
             sequence: 1,
+            use_kitty_shm: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -652,6 +675,57 @@ mod tests {
     }
 
     #[test]
+    fn test_process_resize_kitty_shm_branch_and_fallback() {
+        let mut resizer = fir::Resizer::new();
+        let src = Arc::new(make_test_image(80, 80));
+
+        // 1. Non-kitty picker with use_kitty_shm = true falls back to ViewportProtocol::Standard
+        let picker_halfblocks = Picker::halfblocks();
+        let req_fallback = ResizeRequest {
+            img: Arc::clone(&src),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_halfblocks,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 1,
+            use_kitty_shm: true,
+        };
+        let (proto_fallback, _, _) = process_resize(req_fallback, &mut resizer);
+        assert!(matches!(proto_fallback, ViewportProtocol::Standard(_)));
+
+        // 2. Kitty picker with use_kitty_shm = true produces ViewportProtocol::KittyShm
+        let mut picker_kitty = Picker::halfblocks();
+        picker_kitty.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let req_shm = ResizeRequest {
+            img: src,
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_kitty,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 2,
+            use_kitty_shm: true,
+        };
+        let (proto_shm, _, _) = process_resize(req_shm, &mut resizer);
+        assert!(matches!(proto_shm, ViewportProtocol::KittyShm(_)));
+
+        crate::imaging::cleanup_all_kitty_shm_segments();
+    }
+
+    #[test]
     fn test_process_resize_canvas_centering_and_margins() {
         let mut resizer = fir::Resizer::new();
         let src = Arc::new(make_test_image(40, 40));
@@ -673,6 +747,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (50, 50),
             sequence: 1,
+            use_kitty_shm: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -716,6 +791,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (40, 40),
             sequence: 1,
+            use_kitty_shm: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -756,6 +832,7 @@ mod tests {
             contrast: Contrast::new(20.0),
             rendered_size_cells: (30, 30),
             sequence: 1,
+            use_kitty_shm: false,
         };
         let canvas_pos = render_resize_canvas(&req_pos, &mut resizer);
         assert_eq!(canvas_pos.width(), 60);
@@ -785,6 +862,7 @@ mod tests {
             contrast: Contrast::new(-20.0),
             rendered_size_cells: (30, 30),
             sequence: 2,
+            use_kitty_shm: false,
         };
         let canvas_neg = render_resize_canvas(&req_neg, &mut resizer);
         assert_eq!(canvas_neg.width(), 60);
@@ -883,6 +961,7 @@ mod tests {
             contrast: Contrast::new(25.0),
             rendered_size_cells: (40, 40),
             sequence: 1,
+            use_kitty_shm: false,
         };
         let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
         // Margin pixel at (0, 0) was never touched by apply_adjustments_lut

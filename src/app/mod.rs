@@ -24,7 +24,6 @@ pub use queue::ImageQueue;
 use fast_image_resize as fir;
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -35,7 +34,7 @@ use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
     Brightness, CancellationToken, Contrast, DecodedImage, FilterType, ImageSource, LoaderRequest,
     LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ThumbnailSource,
-    ZoomFactor, process_resize,
+    ViewportProtocol, ZoomFactor, process_resize,
 };
 
 /// Threshold below which navigation is considered fast scrolling (60ms).
@@ -75,7 +74,7 @@ pub struct StatsForNerds {
 
 /// A response payload sent by the resizing worker thread.
 pub struct ResizeResponse {
-    pub protocol: StatefulProtocol,
+    pub protocol: ViewportProtocol,
     pub rendered_cells: (u16, u16),
     pub process_duration: std::time::Duration,
     pub protocol_duration: std::time::Duration,
@@ -158,7 +157,7 @@ pub struct App {
     /// If true, display the low-res thumbnail image placeholder only.
     pub show_thumbnail_only: bool,
     /// Active render state protocol (Kitty, Sixel, Halfblocks).
-    pub image_protocol: Option<StatefulProtocol>,
+    pub image_protocol: Option<ViewportProtocol>,
     /// Target terminal graphics protocol picker.
     pub picker: Picker,
 

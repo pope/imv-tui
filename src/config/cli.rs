@@ -138,6 +138,7 @@ where
     let mut filter = FilterType::Nearest;
     let mut raw_protocol: Option<ProtocolType> = None;
     let mut explicit_kitty_compress: Option<KittyCompression> = None;
+    let mut disable_kitty_shm = false;
     let mut scale = ScaleMode::Shrink;
     let mut slideshow = None;
     let mut check_magic = false;
@@ -232,6 +233,10 @@ where
                 no_thumbnail = true;
                 i += 1;
             }
+            "--no-kitty-shm" => {
+                disable_kitty_shm = true;
+                i += 1;
+            }
             "--kitty-compress" => {
                 let flag = args[i].clone();
                 let val = get_arg(&args, &mut i, &flag)?;
@@ -311,6 +316,9 @@ where
                     "      --kitty-compress <mode>  Kitty zlib compression mode: auto, always, never (defaults to auto)"
                 );
                 println!(
+                    "      --no-kitty-shm         Disable Kitty POSIX shared memory (t=s) image transmission"
+                );
+                println!(
                     "  -i, --import <file>        Import image classification/flagged states from a file (.json or prefix text)"
                 );
                 println!(
@@ -354,7 +362,8 @@ where
         export_path = Some(path);
     }
 
-    let protocol = ProtocolConfig::from_cli(raw_protocol, explicit_kitty_compress)?;
+    let protocol =
+        ProtocolConfig::from_cli(raw_protocol, explicit_kitty_compress, disable_kitty_shm)?;
 
     Ok(CliOptions {
         initial_path,
@@ -374,7 +383,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ActiveProtocol;
+    use crate::config::{ActiveProtocol, KittyTransferMode};
 
     #[test]
     fn test_sync_exclusion() {
@@ -547,6 +556,7 @@ mod tests {
             opts.protocol,
             ProtocolConfig::Kitty {
                 compression: KittyCompression::Auto,
+                disable_kitty_shm: false,
             }
         );
         assert_eq!(opts.scale, ScaleMode::Crop);
@@ -574,6 +584,7 @@ mod tests {
                 opts.protocol,
                 ProtocolConfig::Auto {
                     explicit_kitty_compress: Some(expected),
+                    disable_kitty_shm: false,
                 }
             );
         }
@@ -584,6 +595,7 @@ mod tests {
             default_opts.protocol,
             ProtocolConfig::Auto {
                 explicit_kitty_compress: None,
+                disable_kitty_shm: false,
             }
         );
 
@@ -642,12 +654,14 @@ mod tests {
             kitty_opts.protocol,
             ProtocolConfig::Kitty {
                 compression: KittyCompression::Always,
+                disable_kitty_shm: false,
             }
         );
 
         // 6. resolve_active_protocol enforcement
         let auto_explicit = ProtocolConfig::Auto {
             explicit_kitty_compress: Some(KittyCompression::Always),
+            disable_kitty_shm: false,
         };
         let err = auto_explicit
             .resolve_active_protocol(ProtocolType::Sixel, true)
@@ -657,6 +671,7 @@ mod tests {
 
         let auto_default = ProtocolConfig::Auto {
             explicit_kitty_compress: None,
+            disable_kitty_shm: false,
         };
         assert_eq!(
             auto_default
@@ -668,13 +683,13 @@ mod tests {
             auto_default
                 .resolve_active_protocol(ProtocolType::Kitty, true)
                 .unwrap(),
-            ActiveProtocol::Kitty { compressed: true }
+            ActiveProtocol::Kitty(KittyTransferMode::Compressed)
         );
 
         // 7. ActiveProtocol helpers
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Kitty, true),
-            ActiveProtocol::Kitty { compressed: true }
+            ActiveProtocol::Kitty(KittyTransferMode::Compressed)
         );
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Iterm2, false),
@@ -694,5 +709,78 @@ mod tests {
 
         assert!(!KittyCompression::Never.should_compress_for_env(false));
         assert!(!KittyCompression::Never.should_compress_for_env(true));
+    }
+
+    #[test]
+    fn test_no_kitty_shm_flag_parsing_and_validation() {
+        // 1. --no-kitty-shm parses cleanly with default (Auto)
+        let default_args = vec!["imv-tui".to_string(), "--no-kitty-shm".to_string()];
+        let opts_default = parse_cli_args_from(default_args).unwrap();
+        assert_eq!(
+            opts_default.protocol,
+            ProtocolConfig::Auto {
+                explicit_kitty_compress: None,
+                disable_kitty_shm: true,
+            }
+        );
+        assert!(!opts_default.protocol.should_probe_kitty_shm());
+
+        // 2. --no-kitty-shm parses cleanly with -p kitty
+        let kitty_args = vec![
+            "imv-tui".to_string(),
+            "-p".to_string(),
+            "kitty".to_string(),
+            "--no-kitty-shm".to_string(),
+        ];
+        let opts_kitty = parse_cli_args_from(kitty_args).unwrap();
+        assert_eq!(
+            opts_kitty.protocol,
+            ProtocolConfig::Kitty {
+                compression: KittyCompression::Auto,
+                disable_kitty_shm: true,
+            }
+        );
+        assert!(!opts_kitty.protocol.should_probe_kitty_shm());
+
+        // 3. Incompatible protocol combinations fail regardless of argument order
+        for proto in ["sixel", "iterm2", "halfblocks"] {
+            let args1 = vec![
+                "imv-tui".to_string(),
+                "-p".to_string(),
+                proto.to_string(),
+                "--no-kitty-shm".to_string(),
+            ];
+            let err1 = parse_cli_args_from(args1).err().unwrap();
+            assert!(err1.contains("--no-kitty-shm"));
+
+            let args2 = vec![
+                "imv-tui".to_string(),
+                "--no-kitty-shm".to_string(),
+                "-p".to_string(),
+                proto.to_string(),
+            ];
+            let err2 = parse_cli_args_from(args2).err().unwrap();
+            assert!(err2.contains("--no-kitty-shm"));
+        }
+
+        // 4. resolve_active_protocol enforcement on Auto with disable_kitty_shm
+        let auto_shm_disabled = ProtocolConfig::Auto {
+            explicit_kitty_compress: None,
+            disable_kitty_shm: true,
+        };
+        let err = auto_shm_disabled
+            .resolve_active_protocol(ProtocolType::Sixel, false)
+            .err()
+            .unwrap();
+        assert!(err.contains("--no-kitty-shm"));
+
+        // Kitty resolution succeeds and retains Direct transfer mode
+        let active_kitty = auto_shm_disabled
+            .resolve_active_protocol(ProtocolType::Kitty, false)
+            .unwrap();
+        assert_eq!(
+            active_kitty,
+            ActiveProtocol::Kitty(KittyTransferMode::Direct)
+        );
     }
 }

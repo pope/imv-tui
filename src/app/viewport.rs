@@ -166,6 +166,7 @@ impl App {
                 contrast: self.current_contrast(),
                 rendered_size_cells: rendered_cells,
                 sequence: self.current_sequence,
+                use_kitty_shm: self.active_protocol.uses_kitty_shm(),
             };
 
             let _ = self.resize_tx.send(req);

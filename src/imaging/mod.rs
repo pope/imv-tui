@@ -14,6 +14,9 @@ pub use worker::*;
 
 pub mod thumbcache;
 
+pub mod kitty_shm;
+pub use kitty_shm::*;
+
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 use std::path::PathBuf;
@@ -137,6 +140,8 @@ pub struct ResizeRequest {
     pub rendered_size_cells: (u16, u16),
     /// Sequence identifier to filter out stale requests.
     pub sequence: u64,
+    /// Whether POSIX shared memory (`t=s`) should be used for Kitty protocol rendering.
+    pub use_kitty_shm: bool,
 }
 
 /// A request sent to the persistent loader thread.

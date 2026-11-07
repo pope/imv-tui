@@ -146,17 +146,26 @@ mod tests {
         assert!(rendered.contains("Prefetch Cache:"));
         assert!(rendered.contains("Total Pipeline:"));
 
-        // Test Kitty compression display
-        app.active_protocol = crate::config::ActiveProtocol::Kitty { compressed: true };
+        // Test Kitty compression and SHM display
+        app.active_protocol =
+            crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::Compressed);
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let rendered_kitty_on = buffer_to_string(&terminal);
         assert!(rendered_kitty_on.contains("Kitty (Compressed)"));
 
-        app.active_protocol = crate::config::ActiveProtocol::Kitty { compressed: false };
+        app.active_protocol =
+            crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::Direct);
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let rendered_kitty_off = buffer_to_string(&terminal);
         assert!(rendered_kitty_off.contains("Kitty"));
         assert!(!rendered_kitty_off.contains("Compressed"));
+        assert!(!rendered_kitty_off.contains("(SHM)"));
+
+        app.active_protocol =
+            crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::SharedMemory);
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let rendered_kitty_shm = buffer_to_string(&terminal);
+        assert!(rendered_kitty_shm.contains("Kitty (SHM)"));
     }
 
     #[test]

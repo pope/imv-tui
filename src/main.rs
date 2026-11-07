@@ -38,6 +38,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        crate::imaging::cleanup_all_kitty_shm_segments();
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
@@ -129,6 +130,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup terminal using RAII guard
     let _guard = TerminalGuard::new()?;
+    let mut active_protocol = active_protocol;
+    if options.protocol.should_probe_kitty_shm()
+        && matches!(
+            active_protocol,
+            crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::Direct)
+        )
+        && !crate::config::KittyCompression::is_remote_ssh_session()
+    {
+        let shm_ok = crate::imaging::probe_kitty_shm_support(picker.tmux_detected());
+        active_protocol = active_protocol.with_kitty_shm(shm_ok);
+    }
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;

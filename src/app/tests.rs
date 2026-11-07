@@ -676,9 +676,10 @@ fn test_sequence_number_invalidation() {
 
     // 2. Stale ResizeResponse with sequence 9 (< 10)
     let stale_proto = ResizeResponse {
-        protocol: app
-            .picker
-            .new_resize_protocol(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10))),
+        protocol: crate::imaging::ViewportProtocol::Standard(
+            app.picker
+                .new_resize_protocol(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10))),
+        ),
         rendered_cells: (10, 10),
         process_duration: std::time::Duration::ZERO,
         protocol_duration: std::time::Duration::ZERO,
