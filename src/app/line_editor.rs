@@ -126,7 +126,7 @@ impl LineEditor {
     }
 
     /// Retrieves the current character index of the cursor.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn cursor_char_idx(&self) -> usize {
         self.cursor_char_idx
     }

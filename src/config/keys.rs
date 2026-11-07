@@ -1,7 +1,6 @@
 use crossterm::event;
 
 /// Abstract representation of keyboard keys and mouse actions for bindings.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyDef {
     /// A single character press (e.g. 'q', 'i').
@@ -20,7 +19,8 @@ pub enum KeyDef {
 
 impl KeyDef {
     /// Evaluates if an incoming crossterm Event matches the configured KeyDef shortcut.
-    pub fn matches(self, event: &event::Event) -> bool {
+    #[cfg(test)]
+    pub(crate) fn matches(self, event: &event::Event) -> bool {
         match event {
             event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
                 use event::{KeyCode, KeyModifiers};
@@ -79,6 +79,52 @@ impl KeyDef {
                 _ => false,
             },
             _ => false,
+        }
+    }
+
+    /// Extracts the canonical `KeyDef` shortcut representation corresponding to the given event,
+    /// with 100% behavioral parity with `KeyDef::matches`.
+    pub(crate) fn from_event(event: &event::Event) -> Option<Self> {
+        match event {
+            event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
+                use event::{KeyCode, KeyModifiers};
+                if key_event.modifiers.contains(KeyModifiers::ALT) {
+                    return None;
+                }
+                if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let KeyCode::Char(c) = key_event.code {
+                        return Some(Self::Ctrl(c));
+                    }
+                    return None;
+                }
+                match key_event.code {
+                    KeyCode::Char(c) => {
+                        if c.is_alphabetic() {
+                            if c.is_uppercase() || key_event.modifiers.contains(KeyModifiers::SHIFT)
+                            {
+                                Some(Self::Char(c.to_ascii_uppercase()))
+                            } else {
+                                Some(Self::Char(c))
+                            }
+                        } else {
+                            Some(Self::Char(c))
+                        }
+                    }
+                    code => {
+                        if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                            Some(Self::Shift(code))
+                        } else {
+                            Some(Self::Code(code))
+                        }
+                    }
+                }
+            }
+            event::Event::Mouse(mouse_event) => match mouse_event.kind {
+                event::MouseEventKind::ScrollUp => Some(Self::ScrollUp),
+                event::MouseEventKind::ScrollDown => Some(Self::ScrollDown),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -156,5 +202,66 @@ mod tests {
         // Shift(Right) should match Shift+Right, not exact Right
         assert!(key_shift_right.matches(&press_shift_right));
         assert!(!key_shift_right.matches(&press_right));
+    }
+
+    #[test]
+    fn test_keydef_from_event() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let press_a = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&press_a), Some(KeyDef::Char('a')));
+
+        let press_shift_a = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&press_shift_a), Some(KeyDef::Char('A')));
+
+        let press_ctrl_r = Event::Key(KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&press_ctrl_r), Some(KeyDef::Ctrl('r')));
+
+        let press_alt_x = Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&press_alt_x), None);
+
+        let release_q = Event::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&release_q), None);
+
+        let scroll_up = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&scroll_up), Some(KeyDef::ScrollUp));
+
+        let scroll_down = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(KeyDef::from_event(&scroll_down), Some(KeyDef::ScrollDown));
     }
 }

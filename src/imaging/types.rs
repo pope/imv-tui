@@ -277,7 +277,7 @@ impl PanOffset {
     pub const ZERO: Self = Self { x: 0, y: 0 };
 
     /// Constructor with starting coordinates.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(x: i64, y: i64) -> Self {
         Self { x, y }
     }
@@ -316,13 +316,12 @@ impl CropBox {
     }
 
     /// Calculates current width of the crop box.
-    #[allow(dead_code)]
     pub fn width(&self) -> u64 {
         (self.x2 - self.x1) as u64
     }
 
     /// Calculates current height of the crop box.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn height(&self) -> u64 {
         (self.y2 - self.y1) as u64
     }

@@ -21,16 +21,22 @@ use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
-    Brightness, Contrast, CropBox, DecodedImage, FilterType, ImageIntersection, ImageSource,
-    LoaderRequest, LoaderResponse, PanOffset, ResizeRequest, Rotation, ScaleMode, ZoomFactor,
-    list_cbz_pages, process_resize, scan_directory,
+    Brightness, CancellationToken, Contrast, CropBox, DecodedImage, FilterType, ImageIntersection,
+    ImageSource, LoaderRequest, LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest,
+    Rotation, ScaleMode, ZoomFactor, decode_image_bytes_cancellable,
+    decode_image_source_cancellable, list_cbz_pages, process_resize, scan_directory,
 };
+
+/// Threshold below which navigation is considered fast scrolling (60ms).
+/// Background prefetching is suspended while navigating faster than this rate.
+pub(crate) const FAST_SCROLL_THRESHOLD: Duration = Duration::from_millis(60);
 
 #[derive(Debug, Clone, Default)]
 pub struct StatsForNerds {
@@ -206,6 +212,12 @@ pub struct App {
     pub unmapped_classifications: HashMap<String, (Classification, ImageAdjustments)>,
     /// Configuration for directory/archive scanning.
     pub scan_config: ScanConfig,
+    /// Active sequence counter for cooperative cancellation in worker threads.
+    pub(crate) active_sequence: Arc<AtomicUsize>,
+    /// Timestamp of the last navigation action, used to detect fast scrolling.
+    pub(crate) last_nav_time: Option<Instant>,
+    /// Flag indicating whether background prefetching is currently suspended due to fast scrolling.
+    pub(crate) prefetch_suspended: bool,
 }
 
 impl App {
@@ -223,6 +235,10 @@ impl App {
         let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
         let (protocol_tx, protocol_rx) = mpsc::channel::<ResizeResponse>();
 
+        let active_sequence = Arc::new(AtomicUsize::new(0));
+        let resize_active_seq = Arc::clone(&active_sequence);
+        let active_seq = Arc::clone(&active_sequence);
+
         // Spawn background resizing worker thread
         std::thread::spawn(move || {
             let mut resizer = fir::Resizer::new();
@@ -231,20 +247,25 @@ impl App {
                 while let Ok(next_req) = resize_rx.try_recv() {
                     latest_req = next_req;
                 }
+                if (latest_req.sequence as usize) < resize_active_seq.load(Ordering::Acquire) {
+                    continue;
+                }
                 let rendered_cells = latest_req.rendered_size_cells;
                 let target_w = latest_req.target_w;
                 let target_h = latest_req.target_h;
                 let sequence = latest_req.sequence;
                 let (protocol, proc_dur, proto_dur) = process_resize(latest_req, &mut resizer);
-                let _ = protocol_tx.send(ResizeResponse {
-                    protocol,
-                    rendered_cells,
-                    process_duration: proc_dur,
-                    protocol_duration: proto_dur,
-                    target_width: target_w,
-                    target_height: target_h,
-                    sequence,
-                });
+                if (sequence as usize) >= resize_active_seq.load(Ordering::Acquire) {
+                    let _ = protocol_tx.send(ResizeResponse {
+                        protocol,
+                        rendered_cells,
+                        process_duration: proc_dur,
+                        protocol_duration: proto_dur,
+                        target_width: target_w,
+                        target_height: target_h,
+                        sequence,
+                    });
+                }
             }
         });
 
@@ -286,6 +307,11 @@ impl App {
 
                 let mut aborted = false;
                 for r in current_requests {
+                    let cancel = CancellationToken::with_sequence(r.sequence as usize, &active_seq);
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+
                     // Poll channel for newer sequence requests
                     let mut new_reqs = Vec::new();
                     while let Ok(nr) = loader_rx.try_recv() {
@@ -301,17 +327,33 @@ impl App {
                         }
                     }
 
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+
                     let start = std::time::Instant::now();
 
                     // Try to load limited bytes first and extract thumbnail if this is an active cold load
                     let mut bytes_opt = None;
-                    let limit = 256 * 1024; // 256 KB limit to avoid massive full-file reads for metadata/thumbnails
+                    let is_raw = r.source.is_raw();
+                    let limit = if is_raw {
+                        RAW_EXIF_PROBE_LIMIT
+                    } else {
+                        256 * 1024
+                    };
 
                     if !disable_thumbnail {
+                        if cancel.is_cancelled() {
+                            continue;
+                        }
                         let read_res = crate::imaging::read_source_bytes_limited(&r.source, limit);
                         if let Ok(partial_bytes) = read_res {
+                            if cancel.is_cancelled() {
+                                continue;
+                            }
                             if let Some((thumb_img, real_w, real_h)) =
                                 crate::imaging::decode_thumbnail_and_dimensions(&partial_bytes)
+                                && !cancel.is_cancelled()
                             {
                                 // Send thumbnail placeholder immediately
                                 let thumb_dur = start.elapsed();
@@ -339,6 +381,10 @@ impl App {
                         }
                     }
 
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+
                     // Decode the full resolution image
                     let final_bytes = if let Some(bytes) = bytes_opt {
                         Some(bytes)
@@ -346,21 +392,27 @@ impl App {
                         crate::imaging::read_source_bytes(&r.source).ok()
                     };
 
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+
                     let res = if let Some(ref bytes) = final_bytes {
-                        crate::imaging::decode_image_bytes(bytes, &r.source)
+                        decode_image_bytes_cancellable(bytes, &r.source, &cancel)
                     } else {
-                        crate::imaging::decode_image_source(r.source)
+                        decode_image_source_cancellable(r.source, &cancel)
                     };
 
-                    let decode_duration = start.elapsed();
-                    let _ = response_tx.send(LoaderResponse {
-                        idx: r.idx,
-                        result: res,
-                        is_prefetch: r.is_prefetch,
-                        sequence: r.sequence,
-                        decode_duration,
-                        is_thumbnail: false,
-                    });
+                    if !cancel.is_cancelled() {
+                        let decode_duration = start.elapsed();
+                        let _ = response_tx.send(LoaderResponse {
+                            idx: r.idx,
+                            result: res,
+                            is_prefetch: r.is_prefetch,
+                            sequence: r.sequence,
+                            decode_duration,
+                            is_thumbnail: false,
+                        });
+                    }
                 }
 
                 if aborted {
@@ -378,6 +430,7 @@ impl App {
             response_rx,
             resize_tx,
             protocol_rx,
+            active_sequence,
         );
 
         app.start_load_image();
@@ -395,6 +448,7 @@ impl App {
         response_rx: mpsc::Receiver<LoaderResponse>,
         resize_tx: mpsc::Sender<ResizeRequest>,
         protocol_rx: mpsc::Receiver<ResizeResponse>,
+        active_sequence: Arc<AtomicUsize>,
     ) -> Self {
         let num_images = queue.images.len();
         Self {
@@ -447,6 +501,9 @@ impl App {
             infobar: config.infobar,
             unmapped_classifications: HashMap::new(),
             scan_config,
+            active_sequence,
+            last_nav_time: None,
+            prefetch_suspended: false,
         }
     }
 
@@ -466,6 +523,7 @@ impl App {
         let (loader_tx, mock_loader_rx) = mpsc::channel::<LoaderRequest>();
         let (mock_response_tx, response_rx) = mpsc::channel::<LoaderResponse>();
 
+        let active_sequence = Arc::new(AtomicUsize::new(0));
         let mut app = Self::with_channels(
             queue,
             picker,
@@ -475,6 +533,7 @@ impl App {
             response_rx,
             resize_tx,
             protocol_rx,
+            active_sequence,
         );
         app.start_load_image();
         let channels = MockChannels {
@@ -541,6 +600,10 @@ impl App {
             }
         } else {
             // No visible images matching the filter
+            self.current_sequence += 1;
+            self.active_sequence
+                .store(self.current_sequence as usize, Ordering::Release);
+            self.is_loading = false;
             self.original_image = None;
             self.thumbnail_image = None;
             self.image_protocol = None;
@@ -1219,6 +1282,10 @@ impl App {
 
     pub fn start_load_image(&mut self) {
         if self.queue.is_empty() {
+            self.current_sequence += 1;
+            self.active_sequence
+                .store(self.current_sequence as usize, Ordering::Release);
+            self.is_loading = false;
             self.original_image = None;
             self.image_protocol = None;
             self.error_message = Some("No supported images found".to_string());
@@ -1244,6 +1311,8 @@ impl App {
         if let Some(cached_img) = cached {
             if let Some(ref img) = cached_img.image {
                 self.current_sequence += 1;
+                self.active_sequence
+                    .store(self.current_sequence as usize, Ordering::Release);
                 self.original_image = Some(img.clone()).map(|img| {
                     if let Some(rotated) = adj.rotate_image(&img) {
                         self.img_width = rotated.width();
@@ -1283,7 +1352,16 @@ impl App {
                 self.stats.raw_width = cached_img.raw_width;
                 self.stats.raw_height = cached_img.raw_height;
 
-                self.trigger_prefetch();
+                let now = Instant::now();
+                let is_fast_scroll = self
+                    .last_nav_time
+                    .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
+                self.last_nav_time = Some(now);
+                self.prefetch_suspended = is_fast_scroll;
+
+                if !is_fast_scroll {
+                    self.trigger_prefetch();
+                }
                 return;
             } else if let Some(ref thumb) = cached_img.thumbnail {
                 // If we only have a thumbnail, display it immediately as a fast placeholder,
@@ -1323,6 +1401,8 @@ impl App {
         self.is_loading = true;
         self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
+        self.active_sequence
+            .store(self.current_sequence as usize, Ordering::Release);
 
         self.zoom_factor = ZoomFactor::DEFAULT;
         self.pan_offset = PanOffset::ZERO;
@@ -1336,8 +1416,16 @@ impl App {
             sequence: self.current_sequence,
         });
 
-        // Trigger prefetching immediately under this new sequence
-        self.trigger_prefetch();
+        let now = Instant::now();
+        let is_fast_scroll = self
+            .last_nav_time
+            .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
+        self.last_nav_time = Some(now);
+        self.prefetch_suspended = is_fast_scroll;
+
+        if !is_fast_scroll {
+            self.trigger_prefetch();
+        }
     }
 
     pub fn update_channels(&mut self) -> bool {
@@ -1459,7 +1547,12 @@ impl App {
                             self.stats.raw_width = decoded.raw_width;
                             self.stats.raw_height = decoded.raw_height;
 
-                            self.trigger_prefetch();
+                            if self
+                                .last_nav_time
+                                .is_none_or(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
+                            {
+                                self.trigger_prefetch();
+                            }
                         }
                     }
                 }
@@ -1499,6 +1592,21 @@ impl App {
             self.stats.protocol_height = resp.target_height;
         }
         received
+    }
+
+    /// Periodic background tick called from the main event loop.
+    ///
+    /// Resumes suspended background prefetching once fast scrolling ceases
+    /// and the elapsed time exceeds `FAST_SCROLL_THRESHOLD`.
+    pub(crate) fn tick(&mut self) {
+        if self.prefetch_suspended
+            && self
+                .last_nav_time
+                .is_some_and(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
+        {
+            self.prefetch_suspended = false;
+            self.trigger_prefetch();
+        }
     }
 
     #[cfg(test)]
@@ -3353,5 +3461,64 @@ mod tests {
         app.needs_clear = false;
         app.execute_command(Command::ToggleSlideshowPause);
         assert!(app.needs_clear);
+    }
+
+    #[test]
+    fn test_fast_scroll_prefetch_throttling_and_tick() {
+        let (mut app, channels) = setup_test_app_with_channels();
+        // Drain initial requests from setup
+        while channels.loader_rx.try_recv().is_ok() {}
+
+        // 1. Initial state
+        assert!(!app.prefetch_suspended);
+        assert_eq!(
+            app.active_sequence.load(Ordering::Acquire),
+            app.current_sequence as usize
+        );
+
+        // 2. Trigger first navigation (isolated after threshold)
+        app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
+        app.next_image();
+        assert!(!app.prefetch_suspended);
+        // Drain requests
+        let mut reqs = Vec::new();
+        while let Ok(r) = channels.loader_rx.try_recv() {
+            reqs.push(r);
+        }
+        assert!(reqs.iter().any(|r| !r.is_prefetch));
+
+        // 3. Trigger rapid successive navigation (within FAST_SCROLL_THRESHOLD)
+        app.next_image();
+        assert!(app.prefetch_suspended);
+        assert_eq!(
+            app.active_sequence.load(Ordering::Acquire),
+            app.current_sequence as usize
+        );
+
+        // In fast scroll, active load is sent, but prefetch requests are skipped
+        let mut rapid_reqs = Vec::new();
+        while let Ok(r) = channels.loader_rx.try_recv() {
+            rapid_reqs.push(r);
+        }
+        // Active load was sent
+        assert_eq!(rapid_reqs.len(), 1);
+        assert!(!rapid_reqs[0].is_prefetch);
+
+        // 4. Tick before threshold does not resume prefetch
+        app.tick();
+        assert!(app.prefetch_suspended);
+        assert!(channels.loader_rx.try_recv().is_err());
+
+        // 5. Once elapsed time exceeds threshold, tick resumes prefetch
+        app.last_nav_time = Some(Instant::now() - Duration::from_millis(70));
+        app.tick();
+        assert!(!app.prefetch_suspended);
+
+        // Prefetch requests were dispatched by tick
+        let mut resumed_reqs = Vec::new();
+        while let Ok(r) = channels.loader_rx.try_recv() {
+            resumed_reqs.push(r);
+        }
+        assert!(resumed_reqs.iter().any(|r| r.is_prefetch));
     }
 }

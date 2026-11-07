@@ -3,7 +3,6 @@
 use fast_image_resize as fir;
 use image::{DynamicImage, GenericImage};
 use ratatui_image::protocol::StatefulProtocol;
-use std::sync::Arc;
 
 use crate::imaging::ResizeRequest;
 use crate::imaging::types::*;
@@ -62,7 +61,7 @@ pub(crate) fn render_resize_canvas(
 ) -> DynamicImage {
     // Map input crop/intersection coordinates from the full image space to the thumbnail space
     // if the loaded image buffer is a thumbnail placeholder of different dimensions.
-    let (img_to_resize, scale, crop, intersection) =
+    let (scale, crop, intersection) =
         if req.img.width() != req.original_size.0 || req.img.height() != req.original_size.1 {
             let factor_x = req.img.width() as f64 / req.original_size.0 as f64;
             let factor_y = req.img.height() as f64 / req.original_size.1 as f64;
@@ -85,10 +84,11 @@ pub(crate) fn render_resize_canvas(
 
             let new_scale = req.target_w as f64 / scaled_crop.width().max(1) as f64;
 
-            (Arc::clone(&req.img), new_scale, scaled_crop, scaled_inter)
+            (new_scale, scaled_crop, scaled_inter)
         } else {
-            (Arc::clone(&req.img), req.scale, req.crop, req.intersection)
+            (req.scale, req.crop, req.intersection)
         };
+    let img_to_resize: &DynamicImage = &req.img;
 
     let mut canvas = if intersection.x1 as i64 == crop.x1
         && intersection.x2 as i64 == crop.x2
@@ -103,7 +103,7 @@ pub(crate) fn render_resize_canvas(
         ));
         match fast_resize(
             resizer,
-            &img_to_resize,
+            img_to_resize,
             req.target_w,
             req.target_h,
             req.filter_type,
@@ -140,7 +140,7 @@ pub(crate) fn render_resize_canvas(
 
             let resized_part = match fast_resize(
                 resizer,
-                &img_to_resize,
+                img_to_resize,
                 target_inter_w,
                 target_inter_h,
                 req.filter_type,
@@ -224,6 +224,7 @@ mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
     use ratatui_image::picker::Picker;
+    use std::sync::Arc;
 
     fn make_test_image(width: u32, height: u32) -> DynamicImage {
         let mut img = RgbaImage::new(width, height);

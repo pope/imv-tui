@@ -82,25 +82,18 @@ impl ImageSource {
         }
     }
 
+    /// Returns the file extension of the image source as a string slice, if present.
+    pub(crate) fn extension(&self) -> Option<&str> {
+        let ext = match self {
+            Self::Local(path) => path.extension()?,
+            Self::Cbz { file_in_zip, .. } => std::path::Path::new(file_in_zip).extension()?,
+        };
+        ext.to_str()
+    }
+
     /// Returns true if the image source is a RAW format.
     pub fn is_raw(&self) -> bool {
-        let path = match self {
-            Self::Local(p) => p,
-            Self::Cbz { zip_path, .. } => zip_path,
-        };
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| {
-                ext.eq_ignore_ascii_case("dng")
-                    || ext.eq_ignore_ascii_case("cr2")
-                    || ext.eq_ignore_ascii_case("nef")
-                    || ext.eq_ignore_ascii_case("arw")
-                    || ext.eq_ignore_ascii_case("orf")
-                    || ext.eq_ignore_ascii_case("rw2")
-                    || ext.eq_ignore_ascii_case("pef")
-                    || ext.eq_ignore_ascii_case("raf")
-            })
-            .unwrap_or(false)
+        self.extension().is_some_and(is_raw_ext)
     }
 }
 

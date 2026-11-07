@@ -4,24 +4,37 @@ use std::io::{Read, Seek};
 
 use crate::imaging::ImageSource;
 
+/// Maximum probe limit in bytes for RAW EXIF metadata and preview extraction (2MB).
+/// RAW files often store IFD tags and JPEG preview offsets past 256KB while we
+/// still avoid reading 50MB+ sensor payloads into memory.
+pub(crate) const RAW_EXIF_PROBE_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Returns true if the lowercase file extension corresponds to a RAW camera format.
+pub(crate) fn is_raw_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("dng")
+        || ext.eq_ignore_ascii_case("cr2")
+        || ext.eq_ignore_ascii_case("nef")
+        || ext.eq_ignore_ascii_case("arw")
+        || ext.eq_ignore_ascii_case("orf")
+        || ext.eq_ignore_ascii_case("rw2")
+        || ext.eq_ignore_ascii_case("pef")
+        || ext.eq_ignore_ascii_case("raf")
+}
+
+/// Parses EXIF metadata from `bytes` using tolerant mode (`continue_on_error(true)`),
+/// returning partial results even when maker notes or vendor tags are malformed.
+pub(crate) fn parse_tolerant_exif(bytes: &[u8]) -> Option<exif::Exif> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    exif::Reader::new()
+        .continue_on_error(true)
+        .read_from_container(&mut cursor)
+        .or_else(|e| e.distill_partial_result(|_| ()))
+        .ok()
+}
+
 /// Reads the source raw bytes from local files or CBZ zip archives.
 pub fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
-    let is_raw_extension = match source {
-        ImageSource::Local(path) => path.extension(),
-        ImageSource::Cbz { zip_path, .. } => zip_path.extension(),
-    }
-    .and_then(|ext| ext.to_str())
-    .map(|ext| {
-        ext.eq_ignore_ascii_case("dng")
-            || ext.eq_ignore_ascii_case("cr2")
-            || ext.eq_ignore_ascii_case("nef")
-            || ext.eq_ignore_ascii_case("arw")
-            || ext.eq_ignore_ascii_case("orf")
-            || ext.eq_ignore_ascii_case("rw2")
-            || ext.eq_ignore_ascii_case("pef")
-            || ext.eq_ignore_ascii_case("raf")
-    })
-    .unwrap_or(false);
+    let is_raw_extension = source.is_raw();
 
     if is_raw_extension && let Some(preview_bytes) = read_raw_preview_bytes(source) {
         return Ok(preview_bytes);
@@ -159,7 +172,7 @@ pub fn read_source_range(
 
 /// Helper to read raw preview JPEG bytes.
 pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
-    let header_bytes = read_source_bytes_limited(source, 256 * 1024).ok()?;
+    let header_bytes = read_source_bytes_limited(source, RAW_EXIF_PROBE_LIMIT).ok()?;
 
     if header_bytes.starts_with(b"FUJIFILM") {
         if header_bytes.len() < 92 {
@@ -170,8 +183,7 @@ pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
         return read_source_range(source, offset, length).ok();
     }
 
-    let mut cursor = std::io::Cursor::new(&header_bytes);
-    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+    let exif = parse_tolerant_exif(&header_bytes)?;
 
     let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
     let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
@@ -314,10 +326,9 @@ pub fn get_fuji_raf_dimensions(meta_bytes: &[u8]) -> Option<(u32, u32)> {
 
 /// Helper to extract EXIF orientation from raw bytes.
 pub fn get_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
-    let mut cursor = std::io::Cursor::new(bytes);
-    let exif = match exif::Reader::new().read_from_container(&mut cursor) {
-        Ok(exif) => exif,
-        Err(_) => return image::metadata::Orientation::NoTransforms,
+    let exif = match parse_tolerant_exif(bytes) {
+        Some(exif) => exif,
+        None => return image::metadata::Orientation::NoTransforms,
     };
     let val = exif
         .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
@@ -356,8 +367,7 @@ pub fn extract_jpeg_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 
     // 2. Parse standard TIFF/EXIF structures for other formats
-    let mut cursor = std::io::Cursor::new(bytes);
-    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+    let exif = parse_tolerant_exif(bytes)?;
 
     let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
     let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
@@ -451,8 +461,7 @@ pub fn extract_jpeg_preview(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 
     // 2. Parse standard TIFF/EXIF structures for other formats
-    let mut cursor = std::io::Cursor::new(bytes);
-    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+    let exif = parse_tolerant_exif(bytes)?;
 
     let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
     let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);

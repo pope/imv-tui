@@ -170,6 +170,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if app.update_channels() {
             draw_needed = true;
         }
+        app.tick();
 
         // Automatic slideshow transition
         if app.slideshow_state.is_playing()

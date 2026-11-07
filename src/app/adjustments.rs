@@ -140,6 +140,8 @@ mod tests {
         assert_eq!(crop.x2, 100);
         assert_eq!(crop.y1, 100);
         assert_eq!(crop.y2, 200);
+        assert_eq!(crop.width(), 50);
+        assert_eq!(crop.height(), 100);
     }
 
     #[test]

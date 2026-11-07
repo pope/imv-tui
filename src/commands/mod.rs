@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use crossterm::event;
 use strum::IntoEnumIterator;
 
@@ -144,14 +147,60 @@ pub enum Command {
     ToggleSlideshowPause,
 }
 
+struct CommandLookup {
+    ascii: [Option<Command>; 128],
+    map: HashMap<KeyDef, Command>,
+}
+
+static LOOKUP: OnceLock<CommandLookup> = OnceLock::new();
+
+fn init_command_lookup() -> CommandLookup {
+    let mut ascii = [None; 128];
+    let mut map = HashMap::new();
+
+    for cmd in Command::iter() {
+        if let Some(shortcuts) = cmd.get_metadata().shortcuts {
+            for &bind in shortcuts {
+                map.entry(bind).or_insert(cmd);
+                if let KeyDef::Char(c) = bind {
+                    let idx = c as usize;
+                    if idx < 128 && ascii[idx].is_none() {
+                        ascii[idx] = Some(cmd);
+                    }
+                }
+            }
+        }
+    }
+
+    CommandLookup { ascii, map }
+}
+
 impl Command {
-    /// Matches an incoming Crossterm Event to find if it triggers any mapped keyboard/mouse shortcut command.
+    /// Matches an incoming Crossterm Event to find if it triggers any mapped keyboard/mouse shortcut command in O(1) time.
     pub fn from_event(event: &event::Event) -> Option<Self> {
-        Self::iter().find(|cmd| {
-            let def = cmd.get_metadata();
-            let bindings = def.shortcuts.unwrap_or(&[]);
-            bindings.iter().any(|bind| bind.matches(event))
-        })
+        let lookup = LOOKUP.get_or_init(init_command_lookup);
+
+        // Fast path for unshifted ASCII key presses (zero hashing, direct array lookup)
+        if let event::Event::Key(key_event) = event
+            && key_event.kind == event::KeyEventKind::Press
+            && key_event.modifiers.is_empty()
+            && let event::KeyCode::Char(c) = key_event.code
+        {
+            let idx = c as usize;
+            if idx < 128 {
+                return lookup.ascii[idx];
+            }
+        }
+
+        // Canonical KeyDef matching path (O(1) hash map lookup)
+        let key_def = KeyDef::from_event(event)?;
+        if let KeyDef::Char(c) = key_def {
+            let idx = c as usize;
+            if idx < 128 {
+                return lookup.ascii[idx];
+            }
+        }
+        lookup.map.get(&key_def).copied()
     }
 
     /// Retreives user-facing presentation metadata and shortcut keys configured for the command variant.
@@ -535,6 +584,144 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn linear_scan(event: &crossterm::event::Event) -> Option<Command> {
+        Command::iter().find(|cmd| {
+            let def = cmd.get_metadata();
+            let bindings = def.shortcuts.unwrap_or(&[]);
+            bindings.iter().any(|bind| bind.matches(event))
+        })
+    }
+
+    #[test]
+    fn test_from_event_equivalence_with_linear_scan() {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
+            MouseEvent, MouseEventKind,
+        };
+
+        let modifiers_to_test = [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ];
+
+        let kinds_to_test = [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ];
+
+        // 1. All ASCII characters (0..128) across modifier combinations
+        for b in 0..128u8 {
+            let c = b as char;
+            for &mods in &modifiers_to_test {
+                for &kind in &kinds_to_test {
+                    let event = Event::Key(KeyEvent {
+                        code: KeyCode::Char(c),
+                        modifiers: mods,
+                        kind,
+                        state: KeyEventState::empty(),
+                    });
+                    let fast = Command::from_event(&event);
+                    let linear = linear_scan(&event);
+                    assert_eq!(
+                        fast, linear,
+                        "Mismatch for ASCII char {:?} with mods {:?} and kind {:?}",
+                        c, mods, kind
+                    );
+                }
+            }
+        }
+
+        // 2. Non-character keys across modifier combinations
+        let non_char_codes = [
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::F(1),
+            KeyCode::F(2),
+            KeyCode::F(5),
+            KeyCode::F(12),
+        ];
+
+        for &code in &non_char_codes {
+            for &mods in &modifiers_to_test {
+                for &kind in &kinds_to_test {
+                    let event = Event::Key(KeyEvent {
+                        code,
+                        modifiers: mods,
+                        kind,
+                        state: KeyEventState::empty(),
+                    });
+                    let fast = Command::from_event(&event);
+                    let linear = linear_scan(&event);
+                    assert_eq!(
+                        fast, linear,
+                        "Mismatch for KeyCode {:?} with mods {:?} and kind {:?}",
+                        code, mods, kind
+                    );
+                }
+            }
+        }
+
+        // 3. Mouse events
+        let mouse_kinds = [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ];
+
+        for &mkind in &mouse_kinds {
+            for &mods in &modifiers_to_test {
+                let event = Event::Mouse(MouseEvent {
+                    kind: mkind,
+                    column: 10,
+                    row: 20,
+                    modifiers: mods,
+                });
+                let fast = Command::from_event(&event);
+                let linear = linear_scan(&event);
+                assert_eq!(
+                    fast, linear,
+                    "Mismatch for MouseEvent {:?} with mods {:?}",
+                    mkind, mods
+                );
+            }
+        }
+
+        // 4. Other crossterm events
+        let other_events = [
+            Event::Resize(100, 50),
+            Event::FocusGained,
+            Event::FocusLost,
+            Event::Paste("test".to_string()),
+        ];
+
+        for event in &other_events {
+            assert_eq!(Command::from_event(event), linear_scan(event));
         }
     }
 }
