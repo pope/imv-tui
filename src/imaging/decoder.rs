@@ -336,8 +336,7 @@ pub fn decode_image_bytes_with_header_cancellable(
     // Intercept RAW/TIFF files to extract and decode their embedded JPEG preview/thumbnail
     let is_raw_extension = source.is_raw();
 
-    let mut raw_width = None;
-    let mut raw_height = None;
+    let mut raw_dimensions = None;
     let mut raw_container_orientation = None;
     if is_raw_extension {
         let partial_bytes_owned;
@@ -375,11 +374,9 @@ pub fn decode_image_bytes_with_header_cancellable(
                         | image::metadata::Orientation::Rotate270FlipH
                 );
                 if swaps {
-                    raw_width = Some(h);
-                    raw_height = Some(w);
+                    raw_dimensions = Some((h, w));
                 } else {
-                    raw_width = Some(w);
-                    raw_height = Some(h);
+                    raw_dimensions = Some((w, h));
                 }
             } else if let Some(exif) = parse_tolerant_exif(partial_bytes) {
                 // If not Fuji RAF, try standard TIFF EXIF container check
@@ -394,11 +391,9 @@ pub fn decode_image_bytes_with_header_cancellable(
                             | image::metadata::Orientation::Rotate270FlipH
                     );
                     if swaps {
-                        raw_width = Some(h);
-                        raw_height = Some(w);
+                        raw_dimensions = Some((h, w));
                     } else {
-                        raw_width = Some(w);
-                        raw_height = Some(h);
+                        raw_dimensions = Some((w, h));
                     }
                 }
             }
@@ -406,7 +401,7 @@ pub fn decode_image_bytes_with_header_cancellable(
     }
 
     if is_raw_extension
-        && (raw_width.is_none() || raw_height.is_none())
+        && raw_dimensions.is_none()
         && let Some(exif) = parse_tolerant_exif(bytes)
         && let Some((w, h)) = get_dimensions_from_exif(&exif)
     {
@@ -419,11 +414,9 @@ pub fn decode_image_bytes_with_header_cancellable(
                 | image::metadata::Orientation::Rotate270FlipH
         );
         if swaps {
-            raw_width = Some(h);
-            raw_height = Some(w);
+            raw_dimensions = Some((h, w));
         } else {
-            raw_width = Some(w);
-            raw_height = Some(h);
+            raw_dimensions = Some((w, h));
         }
     }
 
@@ -437,11 +430,8 @@ pub fn decode_image_bytes_with_header_cancellable(
         {
             decoded.format = Some(image::ImageFormat::Jpeg);
             decoded.disk_size = file_size;
-            if raw_width.is_some() {
-                decoded.raw_width = raw_width;
-            }
-            if raw_height.is_some() {
-                decoded.raw_height = raw_height;
+            if raw_dimensions.is_some() {
+                decoded.raw_dimensions = raw_dimensions;
             }
             return Ok(decoded);
         }
@@ -481,16 +471,14 @@ pub fn decode_image_bytes_with_header_cancellable(
 
             let w = img.width();
             let h = img.height();
-            let final_raw_width = raw_width.unwrap_or(w);
-            let final_raw_height = raw_height.unwrap_or(h);
+            let final_raw_dims = raw_dimensions.unwrap_or((w, h));
             return Ok(DecodedImage {
                 image: img,
                 width: w,
                 height: h,
                 format: Some(image::ImageFormat::Jpeg),
                 disk_size: file_size,
-                raw_width: Some(final_raw_width),
-                raw_height: Some(final_raw_height),
+                raw_dimensions: Some(final_raw_dims),
             });
         }
     }
@@ -535,16 +523,14 @@ pub fn decode_image_bytes_with_header_cancellable(
     };
     let w = img.width();
     let h = img.height();
-    let final_raw_width = raw_width.unwrap_or(w);
-    let final_raw_height = raw_height.unwrap_or(h);
+    let final_raw_dims = raw_dimensions.unwrap_or((w, h));
     Ok(DecodedImage {
         image: img,
         width: w,
         height: h,
         format,
         disk_size: file_size,
-        raw_width: Some(final_raw_width),
-        raw_height: Some(final_raw_height),
+        raw_dimensions: Some(final_raw_dims),
     })
 }
 
@@ -1199,8 +1185,7 @@ mod tests {
         .expect("decode_image_bytes_with_header_cancellable must succeed");
 
         // Orientation Rotate90 swaps raw dimensions from 6000x4000 to 4000x6000
-        assert_eq!(decoded.raw_width, Some(4000));
-        assert_eq!(decoded.raw_height, Some(6000));
+        assert_eq!(decoded.raw_dimensions, Some((4000, 6000)));
         // Non-square 10x20 preview was rotated 90° clockwise into 20x10 using in-memory header orientation
         assert_eq!(decoded.width, 20);
         assert_eq!(decoded.height, 10);

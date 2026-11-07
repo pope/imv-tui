@@ -1,7 +1,7 @@
 //! Navigation, filtering, and classification management for `App`.
 
-use crate::app::App;
 use crate::app::classifications::{Classification, ViewMode, export_to_file, import_from_file};
+use crate::app::{App, ScanConfig};
 use crate::imaging::{ImageSource, list_cbz_pages, scan_directory};
 use std::sync::atomic::Ordering;
 
@@ -141,30 +141,31 @@ impl App {
 
     /// Re-scans the directory or CBZ archive to pick up any added or removed files, preserving existing classifications/adjustments.
     pub fn refresh_files(&mut self) -> Result<(), String> {
-        if self.scan_config.is_piped {
-            return Err("Refresh is not supported for piped stdin inputs".to_string());
-        }
-
-        // Scan the directory or archive again
-        let new_images = if self.scan_config.is_cbz {
-            let pages = list_cbz_pages(&self.scan_config.initial_scan_path)?;
-            pages
-                .into_iter()
-                .map(|page| ImageSource::Cbz {
-                    zip_path: self.scan_config.initial_scan_path.clone(),
-                    file_in_zip: page,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let (paths, _) = scan_directory(
-                &self.scan_config.initial_scan_path,
-                self.scan_config.check_magic,
-                self.scan_config.recursive,
-            )?;
-            paths
-                .into_iter()
-                .map(ImageSource::Local)
-                .collect::<Vec<_>>()
+        let new_images = match &self.scan_config {
+            ScanConfig::Piped => {
+                return Err("Refresh is not supported for piped stdin inputs".to_string());
+            }
+            ScanConfig::Cbz(zip_path) => {
+                let pages = list_cbz_pages(zip_path)?;
+                pages
+                    .into_iter()
+                    .map(|page| ImageSource::Cbz {
+                        zip_path: zip_path.clone(),
+                        file_in_zip: page,
+                    })
+                    .collect::<Vec<_>>()
+            }
+            ScanConfig::Directory {
+                path,
+                check_magic,
+                recursive,
+            } => {
+                let (paths, _) = scan_directory(path, *check_magic, *recursive)?;
+                paths
+                    .into_iter()
+                    .map(ImageSource::Local)
+                    .collect::<Vec<_>>()
+            }
         };
 
         if new_images.is_empty() {

@@ -151,9 +151,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             pixels_str.as_str().into(),
         ]));
         if is_raw {
-            let raw_dims_str = if let Some(w) = app.stats.raw_width
-                && let Some(h) = app.stats.raw_height
-            {
+            let raw_dims_str = if let Some((w, h)) = app.stats.raw_dimensions {
                 let raw_mp = (w as f64 * h as f64) / 1_000_000.0;
                 format!("{} x {} px ({:.1} MP)", w, h, raw_mp)
             } else {
@@ -203,6 +201,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             "No (Miss)".red()
         };
         let load_decode_val = match app.stats.load_duration {
+            Some(dur) if app.stats.is_prefetch_cache_hit => {
+                format!("{:.2} ms (Cached)", dur.as_secs_f64() * 1000.0).bold()
+            }
             Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
             None => "Loading...".yellow(),
         };
@@ -276,9 +277,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             "   Protocol Pixels: ".gray(),
             proto_pixels_str.as_str().bold(),
         ]));
-        let total_dur = app.stats.load_duration.unwrap_or_default()
-            + app.stats.process_duration
-            + app.stats.protocol_duration;
+        let total_dur = app.stats.total_pipeline_duration(app.show_thumbnail_only);
         lines.push(Line::from(vec![
             "   Total Pipeline: ".gray(),
             format!("{:.2} ms", total_dur.as_secs_f64() * 1000.0).bold(),

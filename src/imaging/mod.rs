@@ -201,10 +201,8 @@ pub struct DecodedImage {
     pub format: Option<image::ImageFormat>,
     /// The size of the raw source file in bytes.
     pub disk_size: u64,
-    /// The original raw/sensor width of the raw image, if any.
-    pub raw_width: Option<u32>,
-    /// The original raw/sensor height of the raw image, if any.
-    pub raw_height: Option<u32>,
+    /// Sensor dimensions of the raw container (`(width, height)`), if raw format.
+    pub raw_dimensions: Option<(u32, u32)>,
 }
 
 /// A response returned by the persistent loader thread.

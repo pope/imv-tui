@@ -26,10 +26,8 @@ pub struct CachedImage {
     pub thumbnail_decode_duration: std::time::Duration,
     /// Size of the raw source file on disk in bytes.
     pub disk_size: u64,
-    /// The original raw/sensor width of the raw image, if any.
-    pub raw_width: Option<u32>,
-    /// The original raw/sensor height of the raw image, if any.
-    pub raw_height: Option<u32>,
+    /// Un-cropped native raw/sensor dimensions (`(width, height)`), if available.
+    pub raw_dimensions: Option<(u32, u32)>,
 }
 
 pub type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;

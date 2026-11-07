@@ -101,10 +101,28 @@ pub struct StatsForNerds {
     pub disk_size: u64,
     /// Image format of the loaded image.
     pub format: Option<image::ImageFormat>,
-    /// The original raw/sensor width of the raw image, if any.
-    pub raw_width: Option<u32>,
-    /// The original raw/sensor height of the raw image, if any.
-    pub raw_height: Option<u32>,
+    /// The original raw/sensor dimensions of the raw image (`(width, height)`), if any.
+    pub raw_dimensions: Option<(u32, u32)>,
+}
+
+impl StatsForNerds {
+    /// Computes the active foreground pipeline duration (`decode + resize + protocol encode`)
+    /// for the currently displayed frame:
+    /// - On a prefetch cache hit (`is_prefetch_cache_hit == true`), decode already completed
+    ///   in the background prior to navigation (`0 ms` foreground decode wait), so only
+    ///   `process_duration + protocol_duration` is counted.
+    /// - When displaying a thumbnail placeholder (`show_thumbnail_only` or `load_duration.is_none()`),
+    ///   uses the thumbnail's `load_duration` instead of `0 ms` or the full image's `load_duration`.
+    pub fn total_pipeline_duration(&self, show_thumbnail_only: bool) -> std::time::Duration {
+        let active_decode_dur = if self.is_prefetch_cache_hit {
+            std::time::Duration::ZERO
+        } else if show_thumbnail_only || self.load_duration.is_none() {
+            self.thumbnail.map(|t| t.load_duration).unwrap_or_default()
+        } else {
+            self.load_duration.unwrap_or_default()
+        };
+        active_decode_dur + self.process_duration + self.protocol_duration
+    }
 }
 
 /// A response payload sent by the resizing worker thread.
@@ -141,14 +159,22 @@ impl Default for AppConfig {
     }
 }
 
-/// Configuration parameters for directory/archive scanning.
-#[derive(Debug, Clone)]
-pub struct ScanConfig {
-    pub initial_scan_path: std::path::PathBuf,
-    pub check_magic: bool,
-    pub recursive: bool,
-    pub is_cbz: bool,
-    pub is_piped: bool,
+/// Configuration parameters for directory, archive, or piped input scanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanConfig {
+    /// Input was piped via stdin; rescanning (`refresh_files`) is not supported.
+    Piped,
+    /// Input is a single CBZ/ZIP archive at the given path.
+    Cbz(std::path::PathBuf),
+    /// Input is a filesystem directory or file path scanned with magic-byte and recursion options.
+    Directory {
+        /// Initial file or directory path to scan.
+        path: std::path::PathBuf,
+        /// Whether to verify file magic headers in addition to extensions.
+        check_magic: bool,
+        /// Whether to traverse subdirectories recursively.
+        recursive: bool,
+    },
 }
 
 #[cfg(test)]
@@ -443,8 +469,7 @@ impl App {
                                         height: real_h,
                                         format: Some(image::ImageFormat::Jpeg),
                                         disk_size: 0, // Filled in by final high-res response
-                                        raw_width: Some(real_w),
-                                        raw_height: Some(real_h),
+                                        raw_dimensions: Some((real_w, real_h)),
                                     }),
                                     is_prefetch: r.mode.is_prefetch(),
                                     sequence: r.sequence,
@@ -487,8 +512,7 @@ impl App {
                                     height: real_h,
                                     format: Some(image::ImageFormat::Png),
                                     disk_size: 0,
-                                    raw_width: Some(real_w),
-                                    raw_height: Some(real_h),
+                                    raw_dimensions: Some((real_w, real_h)),
                                 }),
                                 is_prefetch: r.mode.is_prefetch(),
                                 sequence: r.sequence,
@@ -1166,12 +1190,10 @@ pub fn setup_test_app_with_channels() -> (App, MockChannels) {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: std::path::PathBuf::from("."),
+    let scan_config = ScanConfig::Directory {
+        path: std::path::PathBuf::from("."),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     App::new_mocked(images, 0, picker, app_config, scan_config).unwrap()
 }

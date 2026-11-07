@@ -32,12 +32,10 @@ fn test_import_export_text_and_json() {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: PathBuf::from("."),
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("."),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     let (mut app, _channels) =
         App::new_mocked(images.clone(), 0, picker, app_config, scan_config).unwrap();
@@ -171,12 +169,10 @@ fn test_unmapped_classifications_preservation() {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: PathBuf::from("."),
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("."),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     let (mut app, _channels) = App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
@@ -244,12 +240,10 @@ fn test_refresh_files_preservation() {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: PathBuf::from("target/tmp/refresh_test"),
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("target/tmp/refresh_test"),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     let (mut app, _channels) = App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
@@ -315,12 +309,10 @@ fn test_refresh_files_unmapped_migration() {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: PathBuf::from("target/tmp/refresh_unmapped_test"),
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("target/tmp/refresh_unmapped_test"),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     let (mut app, _channels) = App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
@@ -380,12 +372,10 @@ fn test_prefetch_cache_retention_and_hits() {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: PathBuf::from("."),
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("."),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     let (mut app, _channels) = App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
@@ -405,8 +395,7 @@ fn test_prefetch_cache_retention_and_hits() {
                 decode_duration: std::time::Duration::from_millis(5),
                 thumbnail_decode_duration: std::time::Duration::ZERO,
                 disk_size: 100,
-                raw_width: None,
-                raw_height: None,
+                raw_dimensions: None,
             },
         );
     }
@@ -449,8 +438,7 @@ fn test_sequence_number_protection() {
             height: 1,
             format: None,
             disk_size: 0,
-            raw_width: None,
-            raw_height: None,
+            raw_dimensions: None,
         }),
         decode_duration: std::time::Duration::ZERO,
     };
@@ -564,8 +552,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
             height: 120,
             format: Some(image::ImageFormat::Jpeg),
             disk_size: 1024,
-            raw_width: Some(1920),
-            raw_height: Some(1080),
+            raw_dimensions: Some((1920, 1080)),
         }),
         decode_duration: std::time::Duration::from_millis(5),
     };
@@ -611,8 +598,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
             height: 1080,
             format: Some(image::ImageFormat::Jpeg),
             disk_size: 20480,
-            raw_width: Some(1920),
-            raw_height: Some(1080),
+            raw_dimensions: Some((1920, 1080)),
         }),
         decode_duration: std::time::Duration::from_millis(25),
     };
@@ -665,8 +651,7 @@ fn test_sequence_number_invalidation() {
             height: 100,
             format: None,
             disk_size: 0,
-            raw_width: None,
-            raw_height: None,
+            raw_dimensions: None,
         }),
         decode_duration: std::time::Duration::ZERO,
     };
@@ -726,8 +711,7 @@ fn test_sequence_number_invalidation() {
             height: 50,
             format: None,
             disk_size: 0,
-            raw_width: None,
-            raw_height: None,
+            raw_dimensions: None,
         }),
         decode_duration: std::time::Duration::ZERO,
     };
@@ -823,12 +807,10 @@ fn setup_multi_image_app(count: usize) -> (App, MockChannels) {
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
-    let scan_config = ScanConfig {
-        initial_scan_path: PathBuf::from("."),
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("."),
         check_magic: false,
         recursive: false,
-        is_cbz: false,
-        is_piped: false,
     };
     App::new_mocked(images, 0, picker, app_config, scan_config).unwrap()
 }
@@ -1287,8 +1269,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
                 decode_duration: Duration::from_millis(15),
                 thumbnail_decode_duration: Duration::from_millis(3),
                 disk_size: 1024,
-                raw_width: None,
-                raw_height: None,
+                raw_dimensions: None,
             },
         );
     }
@@ -1324,8 +1305,7 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
                 decode_duration: std::time::Duration::from_millis(10),
                 thumbnail_decode_duration: std::time::Duration::from_millis(2),
                 disk_size: 500,
-                raw_width: None,
-                raw_height: None,
+                raw_dimensions: None,
             },
         );
     }
@@ -1343,5 +1323,59 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
     assert_eq!(
         crate::imaging::ThumbnailSource::XdgCache.display_label(),
         "XDG"
+    );
+}
+
+#[test]
+fn test_total_pipeline_duration_thumbnail_and_cache_hit_math() {
+    let mut stats = StatsForNerds {
+        thumbnail: Some(ThumbnailTelemetry {
+            load_duration: Duration::from_micros(1260),
+            dimensions: (160, 120),
+            source: crate::imaging::ThumbnailSource::Exif,
+        }),
+        process_duration: Duration::from_micros(500),
+        protocol_duration: Duration::from_micros(100),
+        is_prefetch_cache_hit: false,
+        ..Default::default()
+    };
+
+    // 1. Cold thumbnail phase (load_duration: None, thumbnail: Some(1.26ms), process: 0.5ms, protocol: 0.1ms) -> 1.86ms
+    assert_eq!(stats.load_duration, None);
+    assert_eq!(
+        stats.total_pipeline_duration(true),
+        Duration::from_micros(1860)
+    );
+    assert_eq!(
+        stats.total_pipeline_duration(false),
+        Duration::from_micros(1860)
+    );
+
+    // 2. Cold full-image phase (load_duration: Some(43ms), show_thumbnail_only: false) -> 43ms + 3ms + 0.5ms = 46.5ms
+    stats.load_duration = Some(Duration::from_millis(43));
+    stats.process_duration = Duration::from_millis(3);
+    stats.protocol_duration = Duration::from_micros(500);
+    assert_eq!(
+        stats.total_pipeline_duration(false),
+        Duration::from_micros(46_500)
+    );
+
+    // 3. Toggling show_thumbnail_only: true after full decode uses thumbnail.load_duration (1.26ms + 3ms + 0.5ms = 4.76ms)
+    assert_eq!(
+        stats.total_pipeline_duration(true),
+        Duration::from_micros(4760)
+    );
+
+    // 4. Prefetch cache hit (is_prefetch_cache_hit: true, load_duration: Some(43ms), process: 2ms, protocol: 0.2ms) -> 2.2ms
+    stats.is_prefetch_cache_hit = true;
+    stats.process_duration = Duration::from_millis(2);
+    stats.protocol_duration = Duration::from_micros(200);
+    assert_eq!(
+        stats.total_pipeline_duration(false),
+        Duration::from_micros(2200)
+    );
+    assert_eq!(
+        stats.total_pipeline_duration(true),
+        Duration::from_micros(2200)
     );
 }

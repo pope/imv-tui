@@ -153,12 +153,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         active_protocol,
     };
 
-    let scan_config = crate::app::ScanConfig {
-        initial_scan_path,
-        check_magic,
-        recursive: options.recursive,
-        is_cbz,
-        is_piped,
+    let scan_config = if is_piped {
+        crate::app::ScanConfig::Piped
+    } else if is_cbz {
+        crate::app::ScanConfig::Cbz(initial_scan_path)
+    } else {
+        crate::app::ScanConfig::Directory {
+            path: initial_scan_path,
+            check_magic,
+            recursive: options.recursive,
+        }
     };
 
     // Create app

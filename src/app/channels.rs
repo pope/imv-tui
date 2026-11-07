@@ -129,8 +129,7 @@ impl App {
                 self.stats.is_prefetch_cache_hit = true;
                 self.stats.disk_size = cached_img.disk_size;
                 self.stats.format = cached_img.format;
-                self.stats.raw_width = cached_img.raw_width;
-                self.stats.raw_height = cached_img.raw_height;
+                self.stats.raw_dimensions = cached_img.raw_dimensions;
 
                 let now = Instant::now();
                 let is_fast_scroll = self
@@ -176,8 +175,7 @@ impl App {
                 } else {
                     self.stats.thumbnail = None;
                 }
-                self.stats.raw_width = cached_img.raw_width;
-                self.stats.raw_height = cached_img.raw_height;
+                self.stats.raw_dimensions = cached_img.raw_dimensions;
             }
         }
 
@@ -188,8 +186,7 @@ impl App {
             self.show_thumbnail_only = false;
             self.stats.is_prefetch_cache_hit = false;
             self.stats.thumbnail = None;
-            self.stats.raw_width = None;
-            self.stats.raw_height = None;
+            self.stats.raw_dimensions = None;
         }
         self.stats.load_duration = None;
         self.image_protocol = None;
@@ -263,8 +260,7 @@ impl App {
                                 cached.thumbnail = Some(shared_img.clone());
                                 cached.thumbnail_source = resp.thumbnail_source;
                                 cached.thumbnail_decode_duration = resp.decode_duration;
-                                cached.raw_width = decoded.raw_width;
-                                cached.raw_height = decoded.raw_height;
+                                cached.raw_dimensions = decoded.raw_dimensions;
                             } else {
                                 cache.insert(
                                     resp.idx,
@@ -278,8 +274,7 @@ impl App {
                                         decode_duration: std::time::Duration::ZERO,
                                         thumbnail_decode_duration: resp.decode_duration,
                                         disk_size,
-                                        raw_width: decoded.raw_width,
-                                        raw_height: decoded.raw_height,
+                                        raw_dimensions: decoded.raw_dimensions,
                                     },
                                 );
                             }
@@ -291,8 +286,7 @@ impl App {
                                 cached.format = format;
                                 cached.decode_duration = resp.decode_duration;
                                 cached.disk_size = disk_size;
-                                cached.raw_width = decoded.raw_width;
-                                cached.raw_height = decoded.raw_height;
+                                cached.raw_dimensions = decoded.raw_dimensions;
                             } else {
                                 cache.insert(
                                     resp.idx,
@@ -306,8 +300,7 @@ impl App {
                                         decode_duration: resp.decode_duration,
                                         thumbnail_decode_duration: std::time::Duration::ZERO,
                                         disk_size,
-                                        raw_width: decoded.raw_width,
-                                        raw_height: decoded.raw_height,
+                                        raw_dimensions: decoded.raw_dimensions,
                                     },
                                 );
                             }
@@ -354,8 +347,7 @@ impl App {
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;
-                            self.stats.raw_width = decoded.raw_width;
-                            self.stats.raw_height = decoded.raw_height;
+                            self.stats.raw_dimensions = decoded.raw_dimensions;
                         } else {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();
@@ -370,8 +362,7 @@ impl App {
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;
-                            self.stats.raw_width = decoded.raw_width;
-                            self.stats.raw_height = decoded.raw_height;
+                            self.stats.raw_dimensions = decoded.raw_dimensions;
 
                             if self
                                 .last_nav_time
