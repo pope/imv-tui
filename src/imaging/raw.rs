@@ -9,16 +9,47 @@ use crate::imaging::ImageSource;
 /// still avoid reading 50MB+ sensor payloads into memory.
 pub const RAW_EXIF_PROBE_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Known file extensions for RAW camera image containers.
+pub const RAW_EXTENSIONS: &[&str] = &["dng", "cr2", "nef", "arw", "orf", "rw2", "pef", "raf"];
+
 /// Returns true if the lowercase file extension corresponds to a RAW camera format.
 pub fn is_raw_ext(ext: &str) -> bool {
-    ext.eq_ignore_ascii_case("dng")
-        || ext.eq_ignore_ascii_case("cr2")
-        || ext.eq_ignore_ascii_case("nef")
-        || ext.eq_ignore_ascii_case("arw")
-        || ext.eq_ignore_ascii_case("orf")
-        || ext.eq_ignore_ascii_case("rw2")
-        || ext.eq_ignore_ascii_case("pef")
-        || ext.eq_ignore_ascii_case("raf")
+    RAW_EXTENSIONS
+        .iter()
+        .any(|&raw_ext| ext.eq_ignore_ascii_case(raw_ext))
+}
+
+/// Returns true if `bytes` starts with a TIFF container header (`II*\0` or `MM\0*`).
+pub fn is_tiff_header(bytes: &[u8]) -> bool {
+    bytes.len() >= 4
+        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
+            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A))
+}
+
+/// Maps a raw EXIF orientation integer value (1..=8) to `image::metadata::Orientation`.
+pub const fn orientation_from_exif_value(val: u16) -> image::metadata::Orientation {
+    match val {
+        2 => image::metadata::Orientation::FlipHorizontal,
+        3 => image::metadata::Orientation::Rotate180,
+        4 => image::metadata::Orientation::FlipVertical,
+        5 => image::metadata::Orientation::Rotate90FlipH,
+        6 => image::metadata::Orientation::Rotate90,
+        7 => image::metadata::Orientation::Rotate270FlipH,
+        8 => image::metadata::Orientation::Rotate270,
+        _ => image::metadata::Orientation::NoTransforms,
+    }
+}
+
+/// Extracts orientation from an EXIF data structure, falling back to `NoTransforms` if absent or malformed.
+pub fn get_orientation_from_exif(exif: &exif::Exif) -> image::metadata::Orientation {
+    let val = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| match f.value {
+            exif::Value::Short(ref v) => v.first().copied(),
+            _ => None,
+        })
+        .unwrap_or(1);
+    orientation_from_exif_value(val)
 }
 
 /// Parses EXIF metadata from `bytes` using tolerant mode (`continue_on_error(true)`),
@@ -32,12 +63,23 @@ pub fn parse_tolerant_exif(bytes: &[u8]) -> Option<exif::Exif> {
         .ok()
 }
 
-/// Reads the source raw bytes from local files or CBZ zip archives.
-pub fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
-    let is_raw_extension = source.is_raw();
-
-    if is_raw_extension && let Some(preview_bytes) = read_raw_preview_bytes(source) {
-        return Ok(preview_bytes);
+/// Reads the source raw bytes from local files or CBZ zip archives, reusing `header_bytes` if supplied for RAW files.
+pub fn read_source_bytes_with_header(
+    source: &ImageSource,
+    header_bytes: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if source.is_raw() {
+        let preview = match header_bytes {
+            Some(hb) => read_raw_preview_bytes_with_header(source, hb),
+            None => read_raw_preview_bytes(source),
+        };
+        return match preview {
+            Some(preview_bytes) => Ok(preview_bytes),
+            None => Err(format!(
+                "Failed to extract embedded JPEG preview from RAW file:\n{}",
+                source.display_name()
+            )),
+        };
     }
 
     match source {
@@ -72,6 +114,12 @@ pub fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
             Ok(buffer)
         }
     }
+}
+
+/// Reads the source raw bytes from local files or CBZ zip archives.
+#[cfg(test)]
+pub fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
+    read_source_bytes_with_header(source, None)
 }
 
 /// Reads only the first `limit` bytes from local files or CBZ archives.
@@ -170,10 +218,11 @@ pub fn read_source_range(
     }
 }
 
-/// Helper to read raw preview JPEG bytes.
-pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
-    let header_bytes = read_source_bytes_limited(source, RAW_EXIF_PROBE_LIMIT).ok()?;
-
+/// Extracts embedded JPEG preview from RAW header bytes, reading remaining bytes via `read_source_range` if necessary.
+pub fn read_raw_preview_bytes_with_header(
+    source: &ImageSource,
+    header_bytes: &[u8],
+) -> Option<Vec<u8>> {
     if header_bytes.starts_with(b"FUJIFILM") {
         if header_bytes.len() < 92 {
             return None;
@@ -183,7 +232,7 @@ pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
         return read_source_range(source, offset, length).ok();
     }
 
-    let exif = parse_tolerant_exif(&header_bytes)?;
+    let exif = parse_tolerant_exif(header_bytes)?;
 
     let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
     let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
@@ -240,15 +289,7 @@ pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
     let offset = best_offset?;
     let length = best_length;
 
-    let is_tiff = header_bytes.len() >= 4
-        && ((header_bytes[0] == 0x49
-            && header_bytes[1] == 0x49
-            && header_bytes[2] == 0x2A
-            && header_bytes[3] == 0x00)
-            || (header_bytes[0] == 0x4D
-                && header_bytes[1] == 0x4D
-                && header_bytes[2] == 0x00
-                && header_bytes[3] == 0x2A));
+    let is_tiff = is_tiff_header(header_bytes);
 
     let tiff_start = if is_tiff {
         0
@@ -261,6 +302,12 @@ pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
 
     let start = tiff_start.checked_add(offset)?;
     read_source_range(source, start, length).ok()
+}
+
+/// Helper to read raw preview JPEG bytes.
+pub fn read_raw_preview_bytes(source: &ImageSource) -> Option<Vec<u8>> {
+    let header_bytes = read_source_bytes_limited(source, RAW_EXIF_PROBE_LIMIT).ok()?;
+    read_raw_preview_bytes_with_header(source, &header_bytes)
 }
 
 /// Extracts the original full raw image dimensions from the Fujifilm RAF metadata records container bytes.
@@ -330,24 +377,7 @@ pub fn get_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
         Some(exif) => exif,
         None => return image::metadata::Orientation::NoTransforms,
     };
-    let val = exif
-        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|f| match f.value {
-            exif::Value::Short(ref v) => v.first().copied(),
-            _ => None,
-        })
-        .unwrap_or(1);
-    match val {
-        1 => image::metadata::Orientation::NoTransforms,
-        2 => image::metadata::Orientation::FlipHorizontal,
-        3 => image::metadata::Orientation::Rotate180,
-        4 => image::metadata::Orientation::FlipVertical,
-        5 => image::metadata::Orientation::Rotate90FlipH,
-        6 => image::metadata::Orientation::Rotate90,
-        7 => image::metadata::Orientation::Rotate270FlipH,
-        8 => image::metadata::Orientation::Rotate270,
-        _ => image::metadata::Orientation::NoTransforms,
-    }
+    get_orientation_from_exif(&exif)
 }
 
 /// Tries to extract the smaller embedded JPEG thumbnail from EXIF APP1 metadata segment or TIFF/RAW container.
@@ -421,9 +451,7 @@ pub fn extract_jpeg_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
     candidates.sort_by_key(|&(_, len)| len);
 
     // TIFF magic headers: II*\0 or MM\0*
-    let is_tiff = bytes.len() >= 4
-        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
-            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A));
+    let is_tiff = is_tiff_header(bytes);
 
     let tiff_start = if is_tiff {
         0
@@ -519,9 +547,7 @@ pub fn extract_jpeg_preview(bytes: &[u8]) -> Option<Vec<u8>> {
     let length = best_length;
 
     // TIFF magic headers: II*\0 or MM\0*
-    let is_tiff = bytes.len() >= 4
-        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
-            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A));
+    let is_tiff = is_tiff_header(bytes);
 
     let tiff_start = if is_tiff {
         0

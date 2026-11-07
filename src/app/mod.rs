@@ -35,7 +35,7 @@ use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
     Brightness, CancellationToken, Contrast, DecodedImage, FilterType, ImageSource, LoaderRequest,
     LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ThumbnailSource,
-    ZoomFactor, decode_image_bytes_cancellable, decode_image_source_cancellable, process_resize,
+    ZoomFactor, process_resize,
 };
 
 /// Threshold below which navigation is considered fast scrolling (60ms).
@@ -369,6 +369,7 @@ impl App {
 
                     // Try to load limited bytes first and extract thumbnail if this is an active cold load
                     let mut bytes_opt = None;
+                    let mut raw_header_opt = None;
                     let is_raw = r.source.is_raw();
                     let limit = if is_raw {
                         RAW_EXIF_PROBE_LIMIT
@@ -417,9 +418,11 @@ impl App {
                                 });
                                 has_thumbnail = true;
                             }
-                            if partial_bytes.len() < limit {
+                            if !is_raw && partial_bytes.len() < limit {
                                 // If the file was smaller than the limit, we have already loaded it fully
                                 bytes_opt = Some(partial_bytes);
+                            } else if is_raw {
+                                raw_header_opt = Some(partial_bytes);
                             }
                         }
 
@@ -467,20 +470,29 @@ impl App {
 
                     // Decode the full resolution image
                     let decode_start = std::time::Instant::now();
-                    let final_bytes = if let Some(bytes) = bytes_opt {
-                        Some(bytes)
+                    let read_result = if let Some(bytes) = bytes_opt {
+                        Ok(bytes)
                     } else {
-                        crate::imaging::read_source_bytes(&r.source).ok()
+                        crate::imaging::read_source_bytes_with_header(
+                            &r.source,
+                            raw_header_opt.as_deref(),
+                        )
                     };
 
                     if cancel.is_cancelled() {
                         continue;
                     }
 
-                    let res = if let Some(ref bytes) = final_bytes {
-                        decode_image_bytes_cancellable(bytes, &r.source, &cancel)
-                    } else {
-                        decode_image_source_cancellable(r.source, &cancel)
+                    let res = match read_result {
+                        Ok(ref bytes) => {
+                            crate::imaging::decode_image_bytes_with_header_cancellable(
+                                bytes,
+                                &r.source,
+                                raw_header_opt.as_deref(),
+                                &cancel,
+                            )
+                        }
+                        Err(e) => Err(e),
                     };
                     let decode_duration = decode_start.elapsed();
 

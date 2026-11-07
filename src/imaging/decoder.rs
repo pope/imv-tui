@@ -303,9 +303,21 @@ pub fn scan_directory(
 }
 
 /// Decodes an image from already loaded memory bytes with cooperative cancellation support.
+#[cfg(test)]
 pub fn decode_image_bytes_cancellable(
     bytes: &[u8],
     source: &ImageSource,
+    cancel: &CancellationToken<'_>,
+) -> Result<DecodedImage, String> {
+    decode_image_bytes_with_header_cancellable(bytes, source, None, cancel)
+}
+
+/// Decodes an image from memory bytes with cooperative cancellation support, optionally reusing
+/// pre-probed `header_bytes` for RAW container parsing to avoid duplicate file I/O.
+pub fn decode_image_bytes_with_header_cancellable(
+    bytes: &[u8],
+    source: &ImageSource,
+    header_bytes: Option<&[u8]>,
     cancel: &CancellationToken<'_>,
 ) -> Result<DecodedImage, String> {
     if cancel.is_cancelled() {
@@ -326,9 +338,19 @@ pub fn decode_image_bytes_cancellable(
 
     let mut raw_width = None;
     let mut raw_height = None;
+    let mut raw_container_orientation = None;
     if is_raw_extension {
-        // Read the first RAW_EXIF_PROBE_LIMIT bytes of the raw container file on disk to inspect its container format
-        if let Ok(partial_bytes) = read_source_bytes_limited(source, RAW_EXIF_PROBE_LIMIT) {
+        let partial_bytes_owned;
+        let partial_bytes: Option<&[u8]> = match header_bytes {
+            Some(hb) => Some(hb),
+            None => {
+                partial_bytes_owned = read_source_bytes_limited(source, RAW_EXIF_PROBE_LIMIT).ok();
+                partial_bytes_owned.as_deref()
+            }
+        };
+
+        // Inspect raw container format for dimensions and orientation
+        if let Some(partial_bytes) = partial_bytes {
             if partial_bytes.starts_with(b"FUJIFILM")
                 && let Some(meta_offset) = partial_bytes
                     .get(92..96)
@@ -359,40 +381,25 @@ pub fn decode_image_bytes_cancellable(
                     raw_width = Some(w);
                     raw_height = Some(h);
                 }
-            } else if let Some(exif) = parse_tolerant_exif(&partial_bytes)
-                && let Some((w, h)) = get_dimensions_from_exif(&exif)
-            {
+            } else if let Some(exif) = parse_tolerant_exif(partial_bytes) {
                 // If not Fuji RAF, try standard TIFF EXIF container check
-                let orientation = exif
-                    .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                    .and_then(|f| match f.value {
-                        exif::Value::Short(ref v) => v.first().copied(),
-                        _ => None,
-                    })
-                    .map(|val| match val {
-                        2 => image::metadata::Orientation::FlipHorizontal,
-                        3 => image::metadata::Orientation::Rotate180,
-                        4 => image::metadata::Orientation::FlipVertical,
-                        5 => image::metadata::Orientation::Rotate90FlipH,
-                        6 => image::metadata::Orientation::Rotate90,
-                        7 => image::metadata::Orientation::Rotate270FlipH,
-                        8 => image::metadata::Orientation::Rotate270,
-                        _ => image::metadata::Orientation::NoTransforms,
-                    })
-                    .unwrap_or(image::metadata::Orientation::NoTransforms);
-                let swaps = matches!(
-                    orientation,
-                    image::metadata::Orientation::Rotate90
-                        | image::metadata::Orientation::Rotate270
-                        | image::metadata::Orientation::Rotate90FlipH
-                        | image::metadata::Orientation::Rotate270FlipH
-                );
-                if swaps {
-                    raw_width = Some(h);
-                    raw_height = Some(w);
-                } else {
-                    raw_width = Some(w);
-                    raw_height = Some(h);
+                let orientation = get_orientation_from_exif(&exif);
+                raw_container_orientation = Some(orientation);
+                if let Some((w, h)) = get_dimensions_from_exif(&exif) {
+                    let swaps = matches!(
+                        orientation,
+                        image::metadata::Orientation::Rotate90
+                            | image::metadata::Orientation::Rotate270
+                            | image::metadata::Orientation::Rotate90FlipH
+                            | image::metadata::Orientation::Rotate270FlipH
+                    );
+                    if swaps {
+                        raw_width = Some(h);
+                        raw_height = Some(w);
+                    } else {
+                        raw_width = Some(w);
+                        raw_height = Some(h);
+                    }
                 }
             }
         }
@@ -403,23 +410,7 @@ pub fn decode_image_bytes_cancellable(
         && let Some(exif) = parse_tolerant_exif(bytes)
         && let Some((w, h)) = get_dimensions_from_exif(&exif)
     {
-        let orientation = exif
-            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-            .and_then(|f| match f.value {
-                exif::Value::Short(ref v) => v.first().copied(),
-                _ => None,
-            })
-            .map(|val| match val {
-                2 => image::metadata::Orientation::FlipHorizontal,
-                3 => image::metadata::Orientation::Rotate180,
-                4 => image::metadata::Orientation::FlipVertical,
-                5 => image::metadata::Orientation::Rotate90FlipH,
-                6 => image::metadata::Orientation::Rotate90,
-                7 => image::metadata::Orientation::Rotate270FlipH,
-                8 => image::metadata::Orientation::Rotate270,
-                _ => image::metadata::Orientation::NoTransforms,
-            })
-            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let orientation = get_orientation_from_exif(&exif);
         let swaps = matches!(
             orientation,
             image::metadata::Orientation::Rotate90
@@ -441,7 +432,9 @@ pub fn decode_image_bytes_cancellable(
         && let Some(jpeg_bytes) = extract_jpeg_preview(bytes)
     {
         // Recurse using the extracted JPEG bytes
-        if let Ok(mut decoded) = decode_image_bytes_cancellable(&jpeg_bytes, source, cancel) {
+        if let Ok(mut decoded) =
+            decode_image_bytes_with_header_cancellable(&jpeg_bytes, source, header_bytes, cancel)
+        {
             decoded.format = Some(image::ImageFormat::Jpeg);
             decoded.disk_size = file_size;
             if raw_width.is_some() {
@@ -472,10 +465,8 @@ pub fn decode_image_bytes_cancellable(
         {
             let mut orientation = get_exif_orientation(bytes);
             if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
-                orientation = read_source_bytes_limited(source, RAW_EXIF_PROBE_LIMIT)
-                    .ok()
-                    .map(|pb| get_exif_orientation(&pb))
-                    .unwrap_or(image::metadata::Orientation::NoTransforms);
+                orientation =
+                    raw_container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
             }
 
             let mut img = image::DynamicImage::ImageRgba8(rgba_img);
@@ -625,6 +616,7 @@ pub fn decode_image_source(source: ImageSource) -> Result<DecodedImage, String> 
 }
 
 /// Decodes an image from local paths or comic book archives with cooperative cancellation support.
+#[cfg(test)]
 pub fn decode_image_source_cancellable(
     source: ImageSource,
     cancel: &CancellationToken<'_>,
@@ -640,9 +632,7 @@ pub fn decode_image_source_cancellable(
 /// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
 pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
     // Check if this is a TIFF/RAW container
-    let is_tiff = bytes.len() >= 4
-        && ((bytes[0] == 0x49 && bytes[1] == 0x49 && bytes[2] == 0x2A && bytes[3] == 0x00)
-            || (bytes[0] == 0x4D && bytes[1] == 0x4D && bytes[2] == 0x00 && bytes[3] == 0x2A));
+    let is_tiff = is_tiff_header(bytes);
 
     if is_tiff {
         let exif = parse_tolerant_exif(bytes)?;
@@ -650,23 +640,7 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
         let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
         let mut thumb_img = image::load_from_memory(&thumb_bytes).ok()?;
 
-        let orientation = exif
-            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-            .and_then(|f| match f.value {
-                exif::Value::Short(ref v) => v.first().copied(),
-                _ => None,
-            })
-            .map(|val| match val {
-                2 => image::metadata::Orientation::FlipHorizontal,
-                3 => image::metadata::Orientation::Rotate180,
-                4 => image::metadata::Orientation::FlipVertical,
-                5 => image::metadata::Orientation::Rotate90FlipH,
-                6 => image::metadata::Orientation::Rotate90,
-                7 => image::metadata::Orientation::Rotate270FlipH,
-                8 => image::metadata::Orientation::Rotate270,
-                _ => image::metadata::Orientation::NoTransforms,
-            })
-            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let orientation = get_orientation_from_exif(&exif);
 
         thumb_img.apply_orientation(orientation);
 
@@ -1058,5 +1032,149 @@ mod tests {
                 std::borrow::Cow::Owned(_) => panic!("Expected Cow::Borrowed for ImageRgba8"),
             }
         }
+    }
+
+    #[test]
+    fn test_raw_header_reuse_deduplicated_helpers_and_fail_fast() {
+        // 1. Verify is_tiff_header
+        assert!(is_tiff_header(&[0x49, 0x49, 0x2A, 0x00]));
+        assert!(is_tiff_header(&[0x4D, 0x4D, 0x00, 0x2A]));
+        assert!(!is_tiff_header(&[0x49, 0x49, 0x00, 0x2A]));
+        assert!(!is_tiff_header(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(!is_tiff_header(b"PNG"));
+        assert!(!is_tiff_header(&[]));
+
+        // 2. Verify orientation_from_exif_value
+        assert_eq!(
+            orientation_from_exif_value(1),
+            image::metadata::Orientation::NoTransforms
+        );
+        assert_eq!(
+            orientation_from_exif_value(2),
+            image::metadata::Orientation::FlipHorizontal
+        );
+        assert_eq!(
+            orientation_from_exif_value(3),
+            image::metadata::Orientation::Rotate180
+        );
+        assert_eq!(
+            orientation_from_exif_value(4),
+            image::metadata::Orientation::FlipVertical
+        );
+        assert_eq!(
+            orientation_from_exif_value(5),
+            image::metadata::Orientation::Rotate90FlipH
+        );
+        assert_eq!(
+            orientation_from_exif_value(6),
+            image::metadata::Orientation::Rotate90
+        );
+        assert_eq!(
+            orientation_from_exif_value(7),
+            image::metadata::Orientation::Rotate270FlipH
+        );
+        assert_eq!(
+            orientation_from_exif_value(8),
+            image::metadata::Orientation::Rotate270
+        );
+        assert_eq!(
+            orientation_from_exif_value(0),
+            image::metadata::Orientation::NoTransforms
+        );
+        assert_eq!(
+            orientation_from_exif_value(99),
+            image::metadata::Orientation::NoTransforms
+        );
+
+        // 3. Verify fail-fast behavior when preview is missing from .arw / .raf files
+        let test_dir = PathBuf::from("target/tmp/raw_fail_fast_test");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+
+        let arw_path = test_dir.join("corrupt.arw");
+        fs::write(&arw_path, b"corrupt raw sensor bytes without preview").unwrap();
+        let arw_source = ImageSource::Local(arw_path);
+        let arw_res = read_source_bytes(&arw_source);
+        assert!(arw_res.is_err());
+        assert!(
+            arw_res
+                .unwrap_err()
+                .contains("Failed to extract embedded JPEG preview from RAW file")
+        );
+
+        let raf_path = test_dir.join("corrupt.raf");
+        fs::write(&raf_path, b"corrupt fuji raw bytes without preview").unwrap();
+        let raf_source = ImageSource::Local(raf_path);
+        let raf_res = read_source_bytes(&raf_source);
+        assert!(raf_res.is_err());
+        assert!(
+            raf_res
+                .unwrap_err()
+                .contains("Failed to extract embedded JPEG preview from RAW file")
+        );
+
+        // Encode a non-square 10x20 JPEG preview
+        let mut jpeg_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(10, 20))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg_bytes),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+        // Test valid .raf preview extraction via read_source_bytes_with_header
+        let raf_valid_path = test_dir.join("valid.raf");
+        let mut raf_data = vec![0u8; 128 + jpeg_bytes.len()];
+        raf_data[0..8].copy_from_slice(b"FUJIFILM");
+        raf_data[84..88].copy_from_slice(&128u32.to_be_bytes());
+        raf_data[88..92].copy_from_slice(&(jpeg_bytes.len() as u32).to_be_bytes());
+        raf_data[128..].copy_from_slice(&jpeg_bytes);
+        fs::write(&raf_valid_path, &raf_data).unwrap();
+
+        let raf_valid_source = ImageSource::Local(raf_valid_path);
+        let raf_header_prefix = &raf_data[..128];
+        let extracted = read_source_bytes_with_header(&raf_valid_source, Some(raf_header_prefix))
+            .expect("read_source_bytes_with_header must extract valid preview");
+        assert_eq!(extracted, jpeg_bytes);
+
+        let _ = fs::remove_dir_all(&test_dir);
+
+        // 4. Verify decode_image_bytes_with_header_cancellable with pre-supplied header_bytes
+        // proving raw_container_orientation and dimension swap without filesystem access
+        let mut header = vec![0u8; 128];
+        // TIFF header: II*\0, offset to IFD0 = 8
+        header[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        // IFD0 count: 3 tags
+        header[8..10].copy_from_slice(&[0x03, 0x00]);
+        // Tag 1: ImageWidth (0x0100), Type 4 (LONG), Count 1, Value = 6000
+        header[10..22].copy_from_slice(&[
+            0x00, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x70, 0x17, 0x00, 0x00,
+        ]);
+        // Tag 2: ImageLength (0x0101), Type 4 (LONG), Count 1, Value = 4000
+        header[22..34].copy_from_slice(&[
+            0x01, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0xA0, 0x0F, 0x00, 0x00,
+        ]);
+        // Tag 3: Orientation (0x0112), Type 3 (SHORT), Count 1, Value = 6 (Rotate90)
+        header[34..46].copy_from_slice(&[
+            0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+        ]);
+        // Next IFD: 0
+        header[46..50].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let source = ImageSource::Local(PathBuf::from("synthetic_camera.arw"));
+        let decoded = decode_image_bytes_with_header_cancellable(
+            &jpeg_bytes,
+            &source,
+            Some(&header),
+            &CancellationToken::none(),
+        )
+        .expect("decode_image_bytes_with_header_cancellable must succeed");
+
+        // Orientation Rotate90 swaps raw dimensions from 6000x4000 to 4000x6000
+        assert_eq!(decoded.raw_width, Some(4000));
+        assert_eq!(decoded.raw_height, Some(6000));
+        // Non-square 10x20 preview was rotated 90° clockwise into 20x10 using in-memory header orientation
+        assert_eq!(decoded.width, 20);
+        assert_eq!(decoded.height, 10);
     }
 }
