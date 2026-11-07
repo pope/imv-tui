@@ -28,38 +28,68 @@ pub fn fast_resize(
         FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
     };
 
-    let rgba_src = crate::imaging::to_rgba8_fast(src_img);
-
-    let mut dst_image = FirImage::new(dst_w, dst_h, fir::PixelType::U8x4);
-
-    let mut options = fir::ResizeOptions::new();
-    options.algorithm = resize_alg;
-    if let Some((left, top, width, height)) = crop_rect {
-        options = options.crop(left, top, width, height);
-    }
-
-    resizer.resize(rgba_src.as_ref(), &mut dst_image, Some(&options))?;
-
-    let buffer = dst_image.into_vec();
-    let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
-        .ok_or("Failed to construct RgbaImage from resized buffer")?;
-
     let (crop_w, crop_h) = match crop_rect {
         Some((_, _, w, h)) => (w, h),
         None => (src_img.width() as f64, src_img.height() as f64),
     };
     let is_magnified = dst_w as f64 >= crop_w && dst_h as f64 >= crop_h;
-
-    if is_magnified
+    let needs_anti_ringing = is_magnified
         && matches!(
             filter_type,
             FilterType::Lanczos | FilterType::Mitchell | FilterType::Cubic
-        )
-    {
-        clamp_anti_ringing_rgba(&mut rgba_dst, &rgba_src, crop_rect);
-    }
+        );
 
-    Ok(DynamicImage::ImageRgba8(rgba_dst))
+    match src_img {
+        DynamicImage::ImageRgb8(rgb_src) => {
+            let mut dst_image = FirImage::new(dst_w, dst_h, fir::PixelType::U8x3);
+
+            let mut options = fir::ResizeOptions::new();
+            options.algorithm = resize_alg;
+            options.mul_div_alpha = false;
+            if let Some((left, top, width, height)) = crop_rect {
+                options = options.crop(left, top, width, height);
+            }
+
+            resizer.resize(rgb_src, &mut dst_image, Some(&options))?;
+
+            let rgb_dst = image::RgbImage::from_raw(dst_w, dst_h, dst_image.into_vec())
+                .ok_or("Failed to construct RgbImage from resized buffer")?;
+
+            let rgba_raw = crate::imaging::unpack_rgb24_to_rgba32(&rgb_dst);
+            let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, rgba_raw)
+                .ok_or("Failed to construct RgbaImage from unpacked buffer")?;
+
+            if needs_anti_ringing {
+                clamp_anti_ringing_rgb(&mut rgba_dst, rgb_src, crop_rect);
+            }
+
+            Ok(DynamicImage::ImageRgba8(rgba_dst))
+        }
+        _ => {
+            let rgba_src = crate::imaging::to_rgba8_fast(src_img);
+
+            let mut dst_image = FirImage::new(dst_w, dst_h, fir::PixelType::U8x4);
+
+            let mut options = fir::ResizeOptions::new();
+            options.algorithm = resize_alg;
+            options.mul_div_alpha = true;
+            if let Some((left, top, width, height)) = crop_rect {
+                options = options.crop(left, top, width, height);
+            }
+
+            resizer.resize(rgba_src.as_ref(), &mut dst_image, Some(&options))?;
+
+            let buffer = dst_image.into_vec();
+            let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
+                .ok_or("Failed to construct RgbaImage from resized buffer")?;
+
+            if needs_anti_ringing {
+                clamp_anti_ringing_rgba(&mut rgba_dst, &rgba_src, crop_rect);
+            }
+
+            Ok(DynamicImage::ImageRgba8(rgba_dst))
+        }
+    }
 }
 
 /// Renders the scaled and panned image onto the destination canvas, applying
@@ -305,10 +335,35 @@ pub fn clamp_anti_ringing_rgba(
     src: &image::RgbaImage,
     crop_rect: Option<(f64, f64, f64, f64)>,
 ) {
+    clamp_anti_ringing_impl(dst, src.width(), src.height(), crop_rect, |x, y| {
+        let p = src.get_pixel(x, y).0;
+        [p[0], p[1], p[2]]
+    });
+}
+
+/// Clamps destination pixel colors to the min/max bounding envelope of the corresponding
+/// 2x2 source texel neighborhood of an RGB source image to eliminate Gibbs ringing/overshoot artifacts.
+pub fn clamp_anti_ringing_rgb(
+    dst: &mut image::RgbaImage,
+    src: &image::RgbImage,
+    crop_rect: Option<(f64, f64, f64, f64)>,
+) {
+    clamp_anti_ringing_impl(dst, src.width(), src.height(), crop_rect, |x, y| {
+        src.get_pixel(x, y).0
+    });
+}
+
+fn clamp_anti_ringing_impl<F>(
+    dst: &mut image::RgbaImage,
+    src_w: u32,
+    src_h: u32,
+    crop_rect: Option<(f64, f64, f64, f64)>,
+    get_pixel: F,
+) where
+    F: Fn(u32, u32) -> [u8; 3],
+{
     let dst_w = dst.width();
     let dst_h = dst.height();
-    let src_w = src.width();
-    let src_h = src.height();
 
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
@@ -333,10 +388,10 @@ pub fn clamp_anti_ringing_rgba(
             let x0 = (src_x_f.floor() as i64).clamp(0, src_w as i64 - 1) as u32;
             let x1 = (x0 + 1).min(src_w - 1);
 
-            let p00 = src.get_pixel(x0, y0).0;
-            let p10 = src.get_pixel(x1, y0).0;
-            let p01 = src.get_pixel(x0, y1).0;
-            let p11 = src.get_pixel(x1, y1).0;
+            let p00 = get_pixel(x0, y0);
+            let p10 = get_pixel(x1, y0);
+            let p01 = get_pixel(x0, y1);
+            let p11 = get_pixel(x1, y1);
 
             let dst_pixel = dst.get_pixel_mut(x, y);
 
@@ -693,5 +748,106 @@ mod tests {
 
         // Clamping must not modify downscaled images
         assert_eq!(dst_down.get_pixel(0, 0), &image::Rgba([75, 75, 75, 255]));
+
+        // 3. Test clamp_anti_ringing_rgb overshoot elimination
+        let mut rgb_overshoot_src = image::RgbImage::new(4, 2);
+        for y in 0..2 {
+            rgb_overshoot_src.put_pixel(0, y, image::Rgb([0, 0, 0]));
+            rgb_overshoot_src.put_pixel(1, y, image::Rgb([0, 0, 0]));
+            rgb_overshoot_src.put_pixel(2, y, image::Rgb([255, 255, 255]));
+            rgb_overshoot_src.put_pixel(3, y, image::Rgb([255, 255, 255]));
+        }
+        let mut dst_rgb_clamped = image::RgbaImage::new(8, 4);
+        dst_rgb_clamped.put_pixel(0, 0, image::Rgba([75, 75, 75, 255]));
+        clamp_anti_ringing_rgb(&mut dst_rgb_clamped, &rgb_overshoot_src, None);
+        assert_eq!(
+            dst_rgb_clamped.get_pixel(0, 0),
+            &image::Rgba([0, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn test_fast_resize_rgb8_direct_and_no_alpha_buffer() {
+        let mut resizer = fir::Resizer::new();
+
+        // 1. Create a 100x100 ImageRgb8
+        let mut rgb_raw = image::RgbImage::new(100, 100);
+        for (x, y, pixel) in rgb_raw.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+        }
+        let src_rgb = DynamicImage::ImageRgb8(rgb_raw);
+
+        let filters = [
+            FilterType::Nearest,
+            FilterType::Linear,
+            FilterType::Cubic,
+            FilterType::Mitchell,
+            FilterType::Gaussian,
+            FilterType::Lanczos,
+            FilterType::Hamming,
+        ];
+
+        for filter in filters {
+            // Downscale
+            let downscaled = fast_resize(&mut resizer, &src_rgb, 40, 30, filter, None)
+                .expect("Downscale failed");
+            assert_eq!(downscaled.width(), 40);
+            assert_eq!(downscaled.height(), 30);
+            let down_rgba = downscaled.to_rgba8();
+            assert_eq!(down_rgba.get_pixel(0, 0)[3], 255);
+            assert_eq!(down_rgba.get_pixel(39, 29)[3], 255);
+
+            // Upscale (triggers clamp_anti_ringing_rgb on lobed filters)
+            let upscaled = fast_resize(&mut resizer, &src_rgb, 200, 150, filter, None)
+                .expect("Upscale failed");
+            assert_eq!(upscaled.width(), 200);
+            assert_eq!(upscaled.height(), 150);
+            let up_rgba = upscaled.to_rgba8();
+            assert_eq!(up_rgba.get_pixel(0, 0)[3], 255);
+            assert_eq!(up_rgba.get_pixel(199, 149)[3], 255);
+
+            // Cropped resize
+            let crop = Some((10.0, 10.0, 50.0, 50.0));
+            let cropped = fast_resize(&mut resizer, &src_rgb, 80, 80, filter, crop)
+                .expect("Cropped resize failed");
+            assert_eq!(cropped.width(), 80);
+            assert_eq!(cropped.height(), 80);
+            let crop_rgba = cropped.to_rgba8();
+            assert_eq!(crop_rgba.get_pixel(0, 0)[3], 255);
+            assert_eq!(crop_rgba.get_pixel(79, 79)[3], 255);
+        }
+
+        // 2. Verify that resizing ImageRgb8 does NOT allocate an alpha_buffer in resizer
+        // For a 500x500 image, an alpha_buffer would allocate at least 500 * 500 * 4 = 1,000,000 bytes.
+        let large_rgb = DynamicImage::ImageRgb8(image::RgbImage::new(500, 500));
+        let large_rgba = DynamicImage::ImageRgba8(image::RgbaImage::new(500, 500));
+
+        resizer.reset_internal_buffers();
+        assert_eq!(resizer.size_of_internal_buffers(), 0);
+
+        fast_resize(&mut resizer, &large_rgb, 50, 50, FilterType::Mitchell, None).unwrap();
+        let rgb_internal_buf_size = resizer.size_of_internal_buffers();
+
+        resizer.reset_internal_buffers();
+        fast_resize(
+            &mut resizer,
+            &large_rgba,
+            50,
+            50,
+            FilterType::Mitchell,
+            None,
+        )
+        .unwrap();
+        let rgba_internal_buf_size = resizer.size_of_internal_buffers();
+
+        // RGBA allocates 1 MB alpha_buffer, whereas RGB8 avoids alpha_buffer entirely
+        assert!(rgba_internal_buf_size >= 1_000_000);
+        assert!(rgb_internal_buf_size < 150_000);
+        assert!(rgba_internal_buf_size > rgb_internal_buf_size + 800_000);
+
+        // For Nearest, RGB8 requires 0 bytes of internal buffers
+        resizer.reset_internal_buffers();
+        fast_resize(&mut resizer, &large_rgb, 50, 50, FilterType::Nearest, None).unwrap();
+        assert_eq!(resizer.size_of_internal_buffers(), 0);
     }
 }

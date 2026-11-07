@@ -225,25 +225,55 @@ pub fn downscale_for_thumbnail(
     }
 
     let (target_w, target_h) = compute_scaled_dims(src_w, src_h, target_tier.max_dim());
-    let src_rgba = crate::imaging::to_rgba8_fast(src_img);
 
-    if target_w == src_w && target_h == src_h {
-        return Ok(src_rgba.into_owned());
+    match src_img {
+        DynamicImage::ImageRgb8(rgb_src) => {
+            if target_w == src_w && target_h == src_h {
+                let rgba_raw = crate::imaging::unpack_rgb24_to_rgba32(rgb_src);
+                return image::RgbaImage::from_raw(target_w, target_h, rgba_raw).ok_or_else(|| {
+                    "Failed to construct RgbaImage from unpacked buffer".to_string()
+                });
+            }
+
+            let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x3);
+
+            let mut options = fir::ResizeOptions::new();
+            options.algorithm = fir::ResizeAlg::Convolution(fir::FilterType::Mitchell);
+            options.mul_div_alpha = false;
+
+            resizer
+                .resize(rgb_src, &mut dst_image, Some(&options))
+                .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
+
+            let rgb_dst = image::RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
+                .ok_or_else(|| "Failed to construct RgbImage from resized buffer".to_string())?;
+
+            let rgba_raw = crate::imaging::unpack_rgb24_to_rgba32(&rgb_dst);
+            image::RgbaImage::from_raw(target_w, target_h, rgba_raw)
+                .ok_or_else(|| "Failed to construct RgbaImage from unpacked buffer".to_string())
+        }
+        _ => {
+            let src_rgba = crate::imaging::to_rgba8_fast(src_img);
+
+            if target_w == src_w && target_h == src_h {
+                return Ok(src_rgba.into_owned());
+            }
+
+            let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x4);
+
+            let mut options = fir::ResizeOptions::new();
+            options.algorithm = fir::ResizeAlg::Convolution(fir::FilterType::Mitchell);
+            options.mul_div_alpha = true;
+
+            resizer
+                .resize(src_rgba.as_ref(), &mut dst_image, Some(&options))
+                .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
+
+            let dst_raw = dst_image.into_vec();
+            image::RgbaImage::from_raw(target_w, target_h, dst_raw)
+                .ok_or_else(|| "Failed to construct RgbaImage from resized buffer".to_string())
+        }
     }
-
-    let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x4);
-
-    let mut options = fir::ResizeOptions::new();
-    options.algorithm = fir::ResizeAlg::Convolution(fir::FilterType::Mitchell);
-    options.mul_div_alpha = true;
-
-    resizer
-        .resize(src_rgba.as_ref(), &mut dst_image, Some(&options))
-        .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
-
-    let dst_raw = dst_image.into_vec();
-    image::RgbaImage::from_raw(target_w, target_h, dst_raw)
-        .ok_or_else(|| "Failed to construct RgbaImage from resized buffer".to_string())
 }
 
 /// Constructs a PNG `tEXt` chunk from a keyword and text value.
@@ -603,5 +633,45 @@ mod tests {
         let loaded_img = loaded.unwrap();
         assert_eq!(loaded_img.width(), 256);
         assert_eq!(loaded_img.height(), 171);
+    }
+
+    #[test]
+    fn test_downscale_for_thumbnail_rgb8_direct_and_no_alpha_buffer() {
+        let mut resizer = fir::Resizer::new();
+
+        // 1. Same size / smaller than target tier: identity pass-through unpacked to RGBA
+        let small_rgb = DynamicImage::ImageRgb8(image::RgbImage::new(100, 80));
+        let small_thumb =
+            downscale_for_thumbnail(&mut resizer, &small_rgb, ThumbTier::Normal).unwrap();
+        assert_eq!(small_thumb.width(), 100);
+        assert_eq!(small_thumb.height(), 80);
+        assert_eq!(small_thumb.get_pixel(0, 0)[3], 255);
+        assert_eq!(small_thumb.get_pixel(99, 79)[3], 255);
+        // Identity path does not call resizer at all
+        assert_eq!(resizer.size_of_internal_buffers(), 0);
+
+        // 2. Downscaling large RGB8 image: preserves aspect ratio, alpha is 255, and no alpha_buffer allocated
+        let large_rgb = DynamicImage::ImageRgb8(image::RgbImage::new(600, 400));
+        let large_thumb =
+            downscale_for_thumbnail(&mut resizer, &large_rgb, ThumbTier::Large).unwrap();
+        assert_eq!(large_thumb.width(), 256);
+        assert_eq!(large_thumb.height(), 171);
+        assert_eq!(large_thumb.get_pixel(0, 0)[3], 255);
+        assert_eq!(large_thumb.get_pixel(255, 170)[3], 255);
+
+        let rgb_buf_size = resizer.size_of_internal_buffers();
+
+        // 3. Contrast with ImageRgba8 of same dimensions: RGBA allocates a large alpha_buffer (600 * 400 * 4 = 960,000 bytes)
+        resizer.reset_internal_buffers();
+        let large_rgba = DynamicImage::ImageRgba8(image::RgbaImage::new(600, 400));
+        let rgba_thumb =
+            downscale_for_thumbnail(&mut resizer, &large_rgba, ThumbTier::Large).unwrap();
+        assert_eq!(rgba_thumb.width(), 256);
+        assert_eq!(rgba_thumb.height(), 171);
+
+        let rgba_buf_size = resizer.size_of_internal_buffers();
+        assert!(rgba_buf_size >= 600 * 400 * 4);
+        assert!(rgb_buf_size < 500_000);
+        assert!(rgba_buf_size > rgb_buf_size + 900_000);
     }
 }
