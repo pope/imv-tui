@@ -449,7 +449,7 @@ pub fn decode_image_bytes_with_header_cancellable(
 
     if let Some(image::ImageFormat::Jpeg) = format {
         let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
+            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGB);
         let cursor = zune_jpeg::zune_core::bytestream::ZCursor::new(bytes);
         let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
 
@@ -460,8 +460,8 @@ pub fn decode_image_bytes_with_header_cancellable(
 
         if let Ok(pixels) = decoder.decode()
             && let Some(info) = decoder.info()
-            && let Some(rgba_img) =
-                image::RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
+            && let Some(rgb_img) =
+                image::RgbImage::from_raw(info.width as u32, info.height as u32, pixels)
         {
             let mut orientation = get_exif_orientation(bytes);
             if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
@@ -469,7 +469,7 @@ pub fn decode_image_bytes_with_header_cancellable(
                     raw_container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
             }
 
-            let mut img = image::DynamicImage::ImageRgba8(rgba_img);
+            let mut img = image::DynamicImage::ImageRgb8(rgb_img);
 
             // Checkpoint 3 before JPEG orientation transforms
             if orientation != image::metadata::Orientation::NoTransforms {
@@ -529,13 +529,16 @@ pub fn decode_image_bytes_with_header_cancellable(
         img.apply_orientation(orientation);
     }
 
-    let rgba_img = into_rgba8_fast(img);
-    let w = rgba_img.width();
-    let h = rgba_img.height();
+    let img = match img {
+        image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageRgba8(_) => img,
+        other => image::DynamicImage::ImageRgba8(into_rgba8_fast(other)),
+    };
+    let w = img.width();
+    let h = img.height();
     let final_raw_width = raw_width.unwrap_or(w);
     let final_raw_height = raw_height.unwrap_or(h);
     Ok(DecodedImage {
-        image: image::DynamicImage::ImageRgba8(rgba_img),
+        image: img,
         width: w,
         height: h,
         format,
@@ -628,6 +631,29 @@ pub fn decode_image_source_cancellable(
     decode_image_bytes_cancellable(&bytes, &source, cancel)
 }
 
+/// Decodes embedded JPEG thumbnail bytes using `zune_jpeg` into `DynamicImage::ImageRgb8`,
+/// falling back to `image::load_from_memory` for non-standard/unusual formats.
+fn decode_jpeg_thumbnail_bytes(thumb_bytes: &[u8]) -> Option<DynamicImage> {
+    let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+        .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGB);
+    let cursor = zune_jpeg::zune_core::bytestream::ZCursor::new(thumb_bytes);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
+    if let Ok(pixels) = decoder.decode()
+        && let Some(info) = decoder.info()
+        && let Some(rgb_img) =
+            image::RgbImage::from_raw(info.width as u32, info.height as u32, pixels)
+    {
+        Some(DynamicImage::ImageRgb8(rgb_img))
+    } else {
+        image::load_from_memory(thumb_bytes)
+            .ok()
+            .map(|img| match img {
+                DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => img,
+                other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
+            })
+    }
+}
+
 /// Reads the image dimensions extremely quickly from header headers, and decodes/scales
 /// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
 pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
@@ -638,7 +664,7 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
         let exif = parse_tolerant_exif(bytes)?;
 
         let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
-        let mut thumb_img = image::load_from_memory(&thumb_bytes).ok()?;
+        let mut thumb_img = decode_jpeg_thumbnail_bytes(&thumb_bytes)?;
 
         let orientation = get_orientation_from_exif(&exif);
 
@@ -688,11 +714,12 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
             thumb_img
         };
 
-        return Some((
-            DynamicImage::ImageRgba8(into_rgba8_fast(cropped_thumb)),
-            raw_w,
-            raw_h,
-        ));
+        let final_thumb = match cropped_thumb {
+            DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => cropped_thumb,
+            other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
+        };
+
+        return Some((final_thumb, raw_w, raw_h));
     }
 
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -705,7 +732,7 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
     let (raw_w, raw_h) = decoder.dimensions();
 
     let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
-    let mut thumb_img = image::load_from_memory(&thumb_bytes).ok()?;
+    let mut thumb_img = decode_jpeg_thumbnail_bytes(&thumb_bytes)?;
 
     // Apply the exact same orientation transforms to the thumbnail
     thumb_img.apply_orientation(orientation);
@@ -754,11 +781,12 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
         thumb_img
     };
 
-    Some((
-        DynamicImage::ImageRgba8(into_rgba8_fast(cropped_thumb)),
-        oriented_raw_w,
-        oriented_raw_h,
-    ))
+    let final_thumb = match cropped_thumb {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => cropped_thumb,
+        other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
+    };
+
+    Some((final_thumb, oriented_raw_w, oriented_raw_h))
 }
 
 #[cfg(test)]
@@ -1252,5 +1280,76 @@ mod tests {
             .expect("read_raw_preview_bytes_with_header must extract in-memory SOF0 preview");
         assert_eq!(extracted_source.len(), 200);
         assert_eq!(&extracted_source[..baseline_jpeg.len()], &baseline_jpeg[..]);
+    }
+
+    #[test]
+    fn test_jpeg_and_rgb_decode_preserves_rgb8_format() {
+        // 1. Synthetic RGB image
+        let rgb_raw = image::RgbImage::from_fn(16, 16, |x, y| {
+            image::Rgb([(x * 16) as u8, (y * 16) as u8, 128])
+        });
+
+        // 2. Encode to JPEG
+        let mut jpeg_bytes = Vec::new();
+        DynamicImage::ImageRgb8(rgb_raw.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg_bytes),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+        // 3. Encode to RGB PNG
+        let mut rgb_png_bytes = Vec::new();
+        DynamicImage::ImageRgb8(rgb_raw)
+            .write_to(
+                &mut std::io::Cursor::new(&mut rgb_png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        // 4. Encode to RGBA PNG
+        let rgba_raw = image::RgbaImage::from_fn(16, 16, |x, y| {
+            image::Rgba([(x * 16) as u8, (y * 16) as u8, 128, 200])
+        });
+        let mut rgba_png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(rgba_raw)
+            .write_to(
+                &mut std::io::Cursor::new(&mut rgba_png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        // 5. Verify decode_image_bytes outputs DynamicImage::ImageRgb8 for JPEG and RGB PNG
+        let src_jpg = ImageSource::Local(PathBuf::from("test.jpg"));
+        let decoded_jpg = decode_image_bytes(&jpeg_bytes, &src_jpg).expect("JPEG decode failed");
+        assert!(
+            matches!(decoded_jpg.image, DynamicImage::ImageRgb8(_)),
+            "Expected JPEG to decode directly as DynamicImage::ImageRgb8"
+        );
+
+        let src_rgb_png = ImageSource::Local(PathBuf::from("test_rgb.png"));
+        let decoded_rgb_png =
+            decode_image_bytes(&rgb_png_bytes, &src_rgb_png).expect("RGB PNG decode failed");
+        assert!(
+            matches!(decoded_rgb_png.image, DynamicImage::ImageRgb8(_)),
+            "Expected RGB PNG to decode directly as DynamicImage::ImageRgb8"
+        );
+
+        // 6. Verify decode_image_bytes preserves DynamicImage::ImageRgba8 for RGBA PNG
+        let src_rgba_png = ImageSource::Local(PathBuf::from("test_rgba.png"));
+        let decoded_rgba_png =
+            decode_image_bytes(&rgba_png_bytes, &src_rgba_png).expect("RGBA PNG decode failed");
+        assert!(
+            matches!(decoded_rgba_png.image, DynamicImage::ImageRgba8(_)),
+            "Expected RGBA PNG to decode as DynamicImage::ImageRgba8"
+        );
+
+        // 7. Verify embedded JPEG thumbnail decoding uses zune_jpeg and preserves ImageRgb8
+        let decoded_thumb =
+            decode_jpeg_thumbnail_bytes(&jpeg_bytes).expect("thumbnail decode failed");
+        assert!(
+            matches!(decoded_thumb, DynamicImage::ImageRgb8(_)),
+            "Expected embedded JPEG thumbnail to decode directly as DynamicImage::ImageRgb8"
+        );
     }
 }
