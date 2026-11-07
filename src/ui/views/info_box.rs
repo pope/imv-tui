@@ -63,7 +63,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(palette_paragraph, popup_area);
     } else {
         let (filename, dir_str, disk_size_str, mem_size_str) =
-            match &app.queue.images[app.queue.current_index] {
+            match &app.queue.images()[app.queue.current_index] {
                 crate::imaging::ImageSource::Local(path) => {
                     let filename = path
                         .file_name()
@@ -102,12 +102,21 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             };
         let is_raw = app
             .queue
-            .images
+            .images()
             .get(app.queue.current_index)
             .map(|src| src.is_raw())
             .unwrap_or(false);
-        let mp = (app.img_width as f64 * app.img_height as f64) / 1_000_000.0;
-        let pixels_str = format!("{} x {} px ({:.1} MP)", app.img_width, app.img_height, mp);
+        let dims = crate::imaging::types::PixelDimensions::new(app.img_width, app.img_height);
+        let pixels_str = if dims.is_empty() {
+            "0 x 0 px (0.0 MP)".to_string()
+        } else {
+            format!(
+                "{} x {} px ({:.1} MP)",
+                dims.width,
+                dims.height,
+                dims.megapixels()
+            )
+        };
 
         lines.push(Line::from(vec![
             " File: ".bold().cyan(),
@@ -175,10 +184,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             format!("{:+}%", app.current_contrast().value().round() as i32).into(),
         ]));
         let rotation = app
-            .adjustments
-            .get(app.queue.current_index)
-            .map(|adj| adj.rotation.to_degrees())
-            .unwrap_or(0);
+            .queue
+            .adjustment(app.queue.current_index)
+            .rotation
+            .to_degrees();
         lines.push(Line::from(vec![
             " Rotation: ".bold().cyan(),
             format!("{}°", rotation).into(),

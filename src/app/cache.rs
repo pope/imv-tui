@@ -1,3 +1,5 @@
+use crate::app::classifications::ViewMode;
+use crate::app::queue::MediaList;
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,7 +31,83 @@ pub struct CachedImage {
 
 pub type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;
 
-pub fn get_sliding_window_indices(
+/// Zero-allocation, stack-allocated sliding window of up to 5 visible image indices (`current`, `±1`, `±2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct VisibleWindow {
+    indices: [usize; 5],
+    len: usize,
+}
+
+impl VisibleWindow {
+    /// Returns the sliding window indices as a slice.
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[usize] {
+        &self.indices[..self.len]
+    }
+
+    /// Returns true if the window contains the given index.
+    #[inline]
+    pub(crate) fn contains(&self, idx: usize) -> bool {
+        self.as_slice().contains(&idx)
+    }
+
+    /// Returns true if the window contains no indices.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the number of indices in the window.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns an iterator over the indices in the window.
+    #[inline]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, usize> {
+        self.as_slice().iter()
+    }
+
+    /// Computes the sliding prefetch window for the active queue and view mode with zero heap allocations.
+    pub(crate) fn compute(queue: &MediaList, view_mode: ViewMode) -> Self {
+        let total_visible = queue.visible_count(view_mode);
+        if total_visible == 0 || queue.is_empty() {
+            return Self::default();
+        }
+
+        let current = queue.current_index;
+        if !queue.is_visible(current, view_mode) {
+            return Self::default();
+        }
+
+        // Gather up to 5 candidates: current, prev_1, prev_2, next_1, next_2
+        let prev_1 = queue.prev_visible(current, view_mode).unwrap_or(current);
+        let prev_2 = queue.prev_visible(prev_1, view_mode).unwrap_or(prev_1);
+        let next_1 = queue.next_visible(current, view_mode).unwrap_or(current);
+        let next_2 = queue.next_visible(next_1, view_mode).unwrap_or(next_1);
+
+        let raw = [current, prev_1, next_1, prev_2, next_2];
+        let mut indices = [0usize; 5];
+        let mut len = 0;
+
+        for &idx in &raw {
+            if !indices[..len].contains(&idx) {
+                indices[len] = idx;
+                len += 1;
+            }
+        }
+
+        indices[..len].sort_unstable();
+
+        Self { indices, len }
+    }
+}
+
+/// Helper function to compute sliding window indices as a heap-allocated vector.
+#[cfg(test)]
+pub(crate) fn get_sliding_window_indices(
     current_index: usize,
     total_images: usize,
     is_visible: impl Fn(usize) -> bool,
@@ -66,6 +144,9 @@ pub fn get_sliding_window_indices(
 #[cfg(test)]
 mod cache_sliding_window_tests {
     use super::*;
+    use crate::app::classifications::Classification;
+    use crate::imaging::ImageSource;
+    use std::path::PathBuf;
 
     #[test]
     fn test_sliding_window_wrapping_and_filtering() {
@@ -84,5 +165,47 @@ mod cache_sliding_window_tests {
         // total 1, current 0, visible
         let win_single = get_sliding_window_indices(0, 1, |_| true);
         assert_eq!(win_single, vec![0]);
+    }
+
+    #[test]
+    fn test_visible_window_stack_computation() {
+        let sources: Vec<ImageSource> = (0..5)
+            .map(|i| ImageSource::Local(PathBuf::from(format!("{}.png", i))))
+            .collect();
+        let mut queue = MediaList::new(sources, 0).unwrap();
+
+        // 1. All 5 visible, current 0
+        let win = VisibleWindow::compute(&queue, ViewMode::All);
+        assert_eq!(win.as_slice(), &[0, 1, 2, 3, 4]);
+        assert_eq!(win.len(), 5);
+        assert!(!win.is_empty());
+        assert!(win.contains(0));
+        assert!(win.contains(4));
+        assert!(!win.contains(5));
+
+        // 2. Filtered: index 1 and 3 hidden (marked Reject)
+        queue.set_classification(1, Classification::Reject);
+        queue.set_classification(3, Classification::Reject);
+        queue.current_index = 2;
+
+        let win = VisibleWindow::compute(&queue, ViewMode::Default);
+        assert_eq!(win.as_slice(), &[0, 2, 4]);
+        assert_eq!(win.len(), 3);
+        assert!(win.contains(2));
+        assert!(!win.contains(1));
+        assert!(!win.contains(3));
+
+        // 3. Single item queue
+        let single_source = vec![ImageSource::Local(PathBuf::from("solo.png"))];
+        let single_queue = MediaList::new(single_source, 0).unwrap();
+        let win = VisibleWindow::compute(&single_queue, ViewMode::All);
+        assert_eq!(win.as_slice(), &[0]);
+        assert_eq!(win.len(), 1);
+
+        // 4. Current index not visible -> empty window
+        queue.current_index = 1; // 1 is Reject, not visible under Default
+        let win = VisibleWindow::compute(&queue, ViewMode::Default);
+        assert!(win.is_empty());
+        assert_eq!(win.as_slice(), &[] as &[usize]);
     }
 }

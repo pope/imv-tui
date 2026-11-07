@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(app.current_classification(), Classification::Pick);
         // Marking as reject hides it from default view and advances to next visible image
         app.handle_key_event(make_key(KeyCode::Char('x'), KeyModifiers::NONE), 24);
-        assert_eq!(app.classifications[0], Classification::Reject);
+        assert_eq!(app.classifications()[0], Classification::Reject);
         app.handle_key_event(make_key(KeyCode::Char('u'), KeyModifiers::NONE), 24);
         assert_eq!(app.current_classification(), Classification::Unflagged);
 
@@ -290,7 +290,7 @@ mod tests {
         app.palette_mode = PaletteMode::Closed;
 
         // Reset classification and index for navigation testing
-        app.classifications[0] = Classification::Unflagged;
+        app.queue.set_classification(0, Classification::Unflagged);
         app.queue.current_index = 0;
 
         // 'n' next image

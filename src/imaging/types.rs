@@ -395,3 +395,75 @@ impl Default for ZoomFactor {
         Self::DEFAULT
     }
 }
+
+/// Terminal cell grid dimensions (columns and rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CellDimensions {
+    /// Width in terminal columns/cells.
+    pub(crate) cols: u16,
+    /// Height in terminal rows/cells.
+    pub(crate) rows: u16,
+}
+
+impl CellDimensions {
+    /// Creates a new cell dimension struct.
+    pub(crate) const fn new(cols: u16, rows: u16) -> Self {
+        Self { cols, rows }
+    }
+
+    /// Returns true if either columns or rows are zero.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.cols == 0 || self.rows == 0
+    }
+}
+
+/// Image pixel dimensions (width and height).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PixelDimensions {
+    /// Width in pixels.
+    pub(crate) width: u32,
+    /// Height in pixels.
+    pub(crate) height: u32,
+}
+
+impl PixelDimensions {
+    /// Creates a new pixel dimension struct.
+    pub(crate) const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    /// Calculates megapixels as a floating-point count.
+    pub(crate) fn megapixels(self) -> f64 {
+        (self.width as f64 * self.height as f64) / 1_000_000.0
+    }
+
+    /// Returns true if either width or height is zero.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dimensions_newtypes() {
+        let cells = CellDimensions::new(80, 24);
+        assert_eq!(cells.cols, 80);
+        assert_eq!(cells.rows, 24);
+        assert!(!cells.is_empty());
+
+        let empty_cells = CellDimensions::new(0, 24);
+        assert!(empty_cells.is_empty());
+
+        let pixels = PixelDimensions::new(1920, 1080);
+        assert_eq!(pixels.width, 1920);
+        assert_eq!(pixels.height, 1080);
+        assert!(!pixels.is_empty());
+        assert!((pixels.megapixels() - 2.0736).abs() < 1e-4);
+
+        let empty_pixels = PixelDimensions::new(1920, 0);
+        assert!(empty_pixels.is_empty());
+    }
+}

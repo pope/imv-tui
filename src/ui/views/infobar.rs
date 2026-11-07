@@ -98,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
         let is_raw = app
             .queue
-            .images
+            .images()
             .get(app.queue.current_index)
             .map(|src| src.is_raw())
             .unwrap_or(false);

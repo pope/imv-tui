@@ -32,12 +32,14 @@ pub enum ImageSource {
 }
 
 impl ImageSource {
-    /// Returns a unique absolute identifier string for the image source (local path or cbz path + page).
-    pub fn identifier(&self) -> String {
+    /// Returns a unique identifier string for the image source, using the provided current working directory.
+    pub(crate) fn identifier_with_cwd(&self, cwd: Option<&std::path::Path>) -> String {
         match self {
             Self::Local(path) => {
                 let abs = if path.is_absolute() {
                     path.clone()
+                } else if let Some(curr) = cwd {
+                    curr.join(path)
                 } else if let Ok(curr) = std::env::current_dir() {
                     curr.join(path)
                 } else {
@@ -51,6 +53,8 @@ impl ImageSource {
             } => {
                 let abs_zip = if zip_path.is_absolute() {
                     zip_path.clone()
+                } else if let Some(curr) = cwd {
+                    curr.join(zip_path)
                 } else if let Ok(curr) = std::env::current_dir() {
                     curr.join(zip_path)
                 } else {
@@ -59,6 +63,11 @@ impl ImageSource {
                 format!("{}::{}", abs_zip.to_string_lossy(), file_in_zip)
             }
         }
+    }
+
+    /// Returns a unique absolute identifier string for the image source (local path or cbz path + page).
+    pub fn identifier(&self) -> String {
+        self.identifier_with_cwd(std::env::current_dir().ok().as_deref())
     }
 
     /// Generates a display name for listing the image source in the status bar/palettes.

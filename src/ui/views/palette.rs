@@ -66,11 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 let orig_idx = item.0;
                 let filename = &item.1;
                 let display_path = shorten_path(filename, max_path_len);
-                let class = app
-                    .classifications
-                    .get(orig_idx)
-                    .cloned()
-                    .unwrap_or(crate::app::Classification::Unflagged);
+                let class = app.queue.classification(orig_idx);
                 let class_prefix = class.search_prefix();
                 let line = if i == app.palette_selected_index {
                     Line::from(vec![

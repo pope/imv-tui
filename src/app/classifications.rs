@@ -85,7 +85,9 @@ pub struct ClassificationJsonItem {
     pub rotation: Rotation,
 }
 
-pub fn is_image_visible(
+/// Returns true if an image at `index` with `classifications` is visible under `view_mode`.
+#[cfg(test)]
+pub(crate) fn is_image_visible(
     index: usize,
     classifications: &[Classification],
     view_mode: ViewMode,
@@ -169,8 +171,11 @@ pub fn export_to_file(
 ) -> Result<(), String> {
     let mut text_lines = Vec::new();
     let mut json_items = Vec::new();
-    let active_idents: std::collections::HashSet<String> =
-        images.iter().map(|img| img.identifier()).collect();
+    let cwd = std::env::current_dir().ok();
+    let active_idents: std::collections::HashSet<String> = images
+        .iter()
+        .map(|img| img.identifier_with_cwd(cwd.as_deref()))
+        .collect();
 
     for (idx, img) in images.iter().enumerate() {
         let class = classifications
@@ -184,13 +189,13 @@ pub fn export_to_file(
             continue;
         }
 
-        let ident = img.identifier();
+        let ident = img.identifier_with_cwd(cwd.as_deref());
 
         let (archive, filename) = match img {
             ImageSource::Local(path) => {
                 let abs = if path.is_absolute() {
                     path.clone()
-                } else if let Ok(curr) = std::env::current_dir() {
+                } else if let Some(curr) = cwd.as_deref() {
                     curr.join(path)
                 } else {
                     path.clone()
@@ -203,7 +208,7 @@ pub fn export_to_file(
             } => {
                 let abs_zip = if zip_path.is_absolute() {
                     zip_path.clone()
-                } else if let Ok(curr) = std::env::current_dir() {
+                } else if let Some(curr) = cwd.as_deref() {
                     curr.join(zip_path)
                 } else {
                     zip_path.clone()

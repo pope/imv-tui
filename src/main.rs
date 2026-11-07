@@ -245,13 +245,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.export_classifications(path).map_err(io::Error::other)?;
     } else {
         // Output flagged files to stdout using tab-separated format
-        for (idx, img) in app.queue.images.iter().enumerate() {
-            let class = app
-                .classifications
-                .get(idx)
-                .cloned()
-                .unwrap_or(Classification::Unflagged);
+        for (idx, &class) in app.classifications().iter().enumerate() {
             if class != Classification::Unflagged {
+                let img = &app.queue.images()[idx];
                 println!("{}\t{}", class.export_prefix(), img.identifier());
             }
         }
