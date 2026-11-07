@@ -1,5 +1,6 @@
 use crate::app::classifications::ViewMode;
 use crate::app::queue::MediaList;
+use crate::imaging::ThumbnailSource;
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,8 @@ pub struct CachedImage {
     pub image: Option<Arc<DynamicImage>>,
     /// The cached low-resolution thumbnail image, if loaded.
     pub thumbnail: Option<Arc<DynamicImage>>,
+    /// Source of the thumbnail placeholder, if any.
+    pub thumbnail_source: Option<ThumbnailSource>,
     /// The width of the image.
     pub width: u32,
     /// The height of the image.

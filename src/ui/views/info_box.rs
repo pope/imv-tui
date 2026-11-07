@@ -218,18 +218,39 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 app.stats.thumbnail_load_duration,
                 app.stats.thumbnail_dimensions,
             ) {
-                (Some(dur), Some((tw, th))) => Line::from(vec![
-                    "   Thumbnail Load: ".gray(),
-                    format!("{:.2} ms @ {} x {} px", dur.as_secs_f64() * 1000.0, tw, th).bold(),
-                ]),
+                (Some(dur), Some((tw, th))) => {
+                    let src_label = app
+                        .stats
+                        .thumbnail_source
+                        .map(|s| s.display_label())
+                        .unwrap_or("Thumb");
+                    Line::from(vec![
+                        "   Thumbnail Load: ".gray(),
+                        format!(
+                            "{:.2} ms @ {} x {} px ({})",
+                            dur.as_secs_f64() * 1000.0,
+                            tw,
+                            th,
+                            src_label
+                        )
+                        .bold(),
+                    ])
+                }
                 _ => Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()]),
             }
         };
         lines.push(thumb_load_line);
 
+        let (warm_count, warm_bytes) = app.prefetch_cache_stats();
         lines.push(Line::from(vec![
-            "   Prefetch Cache Hit: ".gray(),
+            "   Prefetch Cache: ".gray(),
             cache_hit_str,
+            Span::raw(format!(
+                " ({} warm, {})",
+                warm_count,
+                format_size(warm_bytes)
+            ))
+            .gray(),
         ]));
         lines.push(Line::from(vec![
             "   Uncompressed Mem: ".gray(),
@@ -238,8 +259,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             "   Resize / Filter: ".gray(),
             format!(
-                "{:.2} ms",
-                app.stats.process_duration.as_secs_f64() * 1000.0
+                "{:.2} ms ({} @ {}%)",
+                app.stats.process_duration.as_secs_f64() * 1000.0,
+                app.filter_name(),
+                app.current_zoom_pct.round() as i64
             )
             .bold(),
         ]));
@@ -249,7 +272,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             proto_str.bold(),
         ]));
         lines.push(Line::from(vec![
-            "   Terminal API Write: ".gray(),
+            "   Protocol Encode: ".gray(),
             format!(
                 "{:.2} ms",
                 app.stats.protocol_duration.as_secs_f64() * 1000.0
@@ -263,6 +286,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             "   Protocol Pixels: ".gray(),
             proto_pixels_str.as_str().bold(),
+        ]));
+        let total_dur = app.stats.load_duration.unwrap_or_default()
+            + app.stats.process_duration
+            + app.stats.protocol_duration;
+        lines.push(Line::from(vec![
+            "   Total Pipeline: ".gray(),
+            format!("{:.2} ms", total_dur.as_secs_f64() * 1000.0).bold(),
         ]));
 
         let palette_block = Block::default()

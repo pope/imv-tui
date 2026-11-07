@@ -33,7 +33,7 @@ impl App {
 
         let new_h = match self.palette_mode {
             PaletteMode::Prompt => 4.min(term_height.saturating_sub(1)),
-            PaletteMode::Info => 22.min(term_height.saturating_sub(1)),
+            PaletteMode::Info => 23.min(term_height.saturating_sub(1)),
             PaletteMode::File | PaletteMode::Command => {
                 let total_items = match self.palette_mode {
                     PaletteMode::File => self.get_filtered_files().len(),

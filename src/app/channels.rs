@@ -117,6 +117,7 @@ impl App {
 
                 // Set stats for cache hit
                 self.stats.load_duration = Some(cached_img.decode_duration);
+                self.stats.thumbnail_source = cached_img.thumbnail_source;
                 self.stats.is_prefetch_cache_hit = true;
                 self.stats.disk_size = cached_img.disk_size;
                 self.stats.format = cached_img.format;
@@ -157,6 +158,7 @@ impl App {
                     .as_ref()
                     .map_or((thumb.width(), thumb.height()), |t| (t.width(), t.height()));
                 self.stats.thumbnail_dimensions = Some((tw, th));
+                self.stats.thumbnail_source = cached_img.thumbnail_source;
                 self.stats.raw_width = cached_img.raw_width;
                 self.stats.raw_height = cached_img.raw_height;
             }
@@ -169,6 +171,7 @@ impl App {
             self.show_thumbnail_only = false;
             self.stats.thumbnail_load_duration = None;
             self.stats.thumbnail_dimensions = None;
+            self.stats.thumbnail_source = None;
             self.stats.raw_width = None;
             self.stats.raw_height = None;
         }
@@ -227,6 +230,7 @@ impl App {
                         if resp.is_thumbnail {
                             if let Some(cached) = cache.get_mut(&resp.idx) {
                                 cached.thumbnail = Some(shared_img.clone());
+                                cached.thumbnail_source = resp.thumbnail_source;
                                 cached.thumbnail_decode_duration = resp.decode_duration;
                                 cached.raw_width = decoded.raw_width;
                                 cached.raw_height = decoded.raw_height;
@@ -236,6 +240,7 @@ impl App {
                                     CachedImage {
                                         image: None,
                                         thumbnail: Some(shared_img.clone()),
+                                        thumbnail_source: resp.thumbnail_source,
                                         width: w,
                                         height: h,
                                         format,
@@ -263,6 +268,7 @@ impl App {
                                     CachedImage {
                                         image: Some(shared_img.clone()),
                                         thumbnail: None,
+                                        thumbnail_source: None,
                                         width: w,
                                         height: h,
                                         format,
@@ -303,6 +309,7 @@ impl App {
 
                             self.stats.thumbnail_load_duration = Some(resp.decode_duration);
                             self.stats.thumbnail_dimensions = Some((thumb_w, thumb_h));
+                            self.stats.thumbnail_source = resp.thumbnail_source;
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;

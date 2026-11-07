@@ -135,12 +135,16 @@ mod tests {
         assert!(rendered.contains("Go to Image"));
 
         // 4. Stats / Info dialog overlay (show_stats)
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         app.palette_mode = PaletteMode::Info;
-        app.palette_height = 22;
+        app.palette_height = 23;
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("Image Details"));
         assert!(rendered.contains("Halfblocks"));
+        assert!(rendered.contains("Protocol Encode:"));
+        assert!(rendered.contains("Prefetch Cache:"));
+        assert!(rendered.contains("Total Pipeline:"));
 
         // Test Kitty compression display
         app.active_protocol = crate::config::ActiveProtocol::Kitty { compressed: true };

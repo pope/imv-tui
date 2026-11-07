@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use crate::commands::{Command, PaletteCommand, get_commands};
 use crate::imaging::{
     Brightness, CancellationToken, Contrast, DecodedImage, FilterType, ImageSource, LoaderRequest,
-    LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ZoomFactor,
-    decode_image_bytes_cancellable, decode_image_source_cancellable, process_resize,
+    LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ThumbnailSource,
+    ZoomFactor, decode_image_bytes_cancellable, decode_image_source_cancellable, process_resize,
 };
 
 /// Threshold below which navigation is considered fast scrolling (60ms).
@@ -51,6 +51,8 @@ pub struct StatsForNerds {
     pub thumbnail_load_duration: Option<std::time::Duration>,
     /// Dimensions of the decoded thumbnail placeholder, if any.
     pub thumbnail_dimensions: Option<(u32, u32)>,
+    /// Source of the thumbnail placeholder, if any.
+    pub thumbnail_source: Option<ThumbnailSource>,
     /// Was it loaded from the prefetch cache.
     pub is_prefetch_cache_hit: bool,
     /// Time taken to resize, apply filters, adjustments, etc.
@@ -411,6 +413,7 @@ impl App {
                                     sequence: r.sequence,
                                     decode_duration: thumb_dur,
                                     is_thumbnail: true,
+                                    thumbnail_source: Some(ThumbnailSource::Exif),
                                 });
                                 has_thumbnail = true;
                             }
@@ -452,6 +455,7 @@ impl App {
                                 sequence: r.sequence,
                                 decode_duration: thumb_dur,
                                 is_thumbnail: true,
+                                thumbnail_source: Some(ThumbnailSource::XdgCache),
                             });
                             has_thumbnail = true;
                         }
@@ -502,6 +506,7 @@ impl App {
                             sequence: r.sequence,
                             decode_duration,
                             is_thumbnail: false,
+                            thumbnail_source: None,
                         });
                     }
                 }
@@ -662,6 +667,21 @@ impl App {
         self.original_image = None;
         self.thumbnail_image = None;
         self.image_protocol = None;
+    }
+
+    /// Returns the number of cached entries and their total uncompressed memory footprint in bytes.
+    pub fn prefetch_cache_stats(&self) -> (usize, u64) {
+        let cache = self.prefetch_cache.lock().unwrap();
+        let mut total_bytes = 0u64;
+        for entry in cache.values() {
+            if let Some(ref img) = entry.image {
+                total_bytes = total_bytes.saturating_add(img.as_bytes().len() as u64);
+            }
+            if let Some(ref thumb) = entry.thumbnail {
+                total_bytes = total_bytes.saturating_add(thumb.as_bytes().len() as u64);
+            }
+        }
+        (cache.len(), total_bytes)
     }
 
     /// Returns cached filtered files matching the current search query.
@@ -871,7 +891,7 @@ impl App {
                     }
                 } else {
                     self.palette_mode = PaletteMode::Info;
-                    self.palette_height = 19;
+                    self.palette_height = 23;
                     self.needs_clear = true;
                     self.last_info_toggle = Some(std::time::Instant::now());
                 }

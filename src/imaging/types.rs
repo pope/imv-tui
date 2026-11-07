@@ -59,6 +59,25 @@ impl ScaleMode {
     }
 }
 
+/// Source of a fast thumbnail placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailSource {
+    /// Embedded EXIF/Preview IFD thumbnail extracted from the image header.
+    Exif,
+    /// Freedesktop.org XDG shared thumbnail cache (`~/.cache/thumbnails`).
+    XdgCache,
+}
+
+impl ThumbnailSource {
+    /// Returns the short human-readable label for the thumbnail source.
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Exif => "EXIF",
+            Self::XdgCache => "XDG",
+        }
+    }
+}
+
 /// Represents an image brightness adjustment value restricted to [-255, 255].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
 #[serde(transparent)]

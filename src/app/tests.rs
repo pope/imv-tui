@@ -398,6 +398,7 @@ fn test_prefetch_cache_retention_and_hits() {
             CachedImage {
                 image: Some(shared_img.clone()),
                 thumbnail: None,
+                thumbnail_source: None,
                 width: 10,
                 height: 10,
                 format: Some(image::ImageFormat::Png),
@@ -440,6 +441,7 @@ fn test_sequence_number_protection() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: 9,
         result: Ok(DecodedImage {
             image: dummy_img,
@@ -471,6 +473,7 @@ fn test_error_propagation_boundary() {
         idx: 1,
         is_prefetch: true,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: app.current_sequence,
         result: Err("Failed to load prefetch".to_string()),
         decode_duration: std::time::Duration::ZERO,
@@ -484,6 +487,7 @@ fn test_error_propagation_boundary() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: app.current_sequence,
         result: Err("Corrupt image file".to_string()),
         decode_duration: std::time::Duration::ZERO,
@@ -552,6 +556,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: true,
+        thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
         sequence: app.current_sequence,
         result: Ok(DecodedImage {
             image: thumb_img,
@@ -573,6 +578,10 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     assert!(app.thumbnail_image.is_some());
     assert_eq!(app.img_width, 160);
     assert_eq!(app.img_height, 120);
+    assert_eq!(
+        app.stats.thumbnail_source,
+        Some(crate::imaging::ThumbnailSource::Exif)
+    );
     assert_eq!(app.stats.thumbnail_dimensions, Some((160, 120)));
     assert!(
         app.stats.load_duration.is_none(),
@@ -593,6 +602,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: app.current_sequence,
         result: Ok(DecodedImage {
             image: full_img,
@@ -646,6 +656,7 @@ fn test_sequence_number_invalidation() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: 9,
         result: Ok(DecodedImage {
             image: dummy_img,
@@ -705,6 +716,7 @@ fn test_sequence_number_invalidation() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: seq_before,
         result: Ok(DecodedImage {
             image: DynamicImage::ImageRgb8(image::RgbImage::new(50, 50)),
@@ -737,6 +749,7 @@ fn test_decode_error_handling() {
         idx: 0,
         is_prefetch: false,
         is_thumbnail: false,
+        thumbnail_source: None,
         sequence: app.current_sequence,
         result: Err("Corrupt image data: decode failed".to_string()),
         decode_duration: std::time::Duration::from_millis(2),
@@ -1193,4 +1206,50 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
         resumed_reqs.push(r);
     }
     assert!(resumed_reqs.iter().any(|r| r.is_prefetch));
+}
+
+#[test]
+fn test_prefetch_cache_stats_and_thumbnail_sources() {
+    let app = setup_test_app();
+    let (count, bytes) = app.prefetch_cache_stats();
+    assert_eq!(count, 0);
+    assert_eq!(bytes, 0);
+
+    // Insert cached image with image (10x10) and thumbnail (5x5)
+    let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+    let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(5, 5)));
+    {
+        let mut cache = app.prefetch_cache.lock().unwrap();
+        cache.insert(
+            0,
+            CachedImage {
+                image: Some(img),
+                thumbnail: Some(thumb),
+                thumbnail_source: Some(crate::imaging::ThumbnailSource::XdgCache),
+                width: 10,
+                height: 10,
+                format: Some(image::ImageFormat::Png),
+                decode_duration: std::time::Duration::from_millis(10),
+                thumbnail_decode_duration: std::time::Duration::from_millis(2),
+                disk_size: 500,
+                raw_width: None,
+                raw_height: None,
+            },
+        );
+    }
+
+    let (count, bytes) = app.prefetch_cache_stats();
+    assert_eq!(count, 1);
+    // 10*10*3 + 5*5*3 = 300 + 75 = 375 bytes
+    assert_eq!(bytes, 375);
+
+    // Test thumbnail source label
+    assert_eq!(
+        crate::imaging::ThumbnailSource::Exif.display_label(),
+        "EXIF"
+    );
+    assert_eq!(
+        crate::imaging::ThumbnailSource::XdgCache.display_label(),
+        "XDG"
+    );
 }
