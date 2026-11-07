@@ -185,7 +185,7 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
         };
     let img_to_resize: &DynamicImage = &req.img;
 
-    let mut canvas = if intersection.x1 as i64 == crop.x1
+    if intersection.x1 as i64 == crop.x1
         && intersection.x2 as i64 == crop.x2
         && intersection.y1 as i64 == crop.y1
         && intersection.y2 as i64 == crop.y2
@@ -196,7 +196,7 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
             intersection.width() as f64,
             intersection.height() as f64,
         ));
-        match fast_resize(
+        let mut canvas = match fast_resize(
             resizer,
             img_to_resize,
             req.target_w,
@@ -218,7 +218,16 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
                     req.filter_type.to_image_filter(),
                 )
             }
+        };
+
+        if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
+            apply_adjustments_lut(
+                rgba_canvas.as_mut(),
+                req.brightness.value(),
+                req.contrast.value(),
+            );
         }
+        canvas
     } else {
         let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
 
@@ -269,32 +278,32 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
             let copy_h = target_inter_h.min(req.target_h.saturating_sub(paste_y));
 
             if copy_w > 0 && copy_h > 0 {
-                let part_to_copy = if copy_w < target_inter_w || copy_h < target_inter_h {
+                let mut part_to_copy = if copy_w < target_inter_w || copy_h < target_inter_h {
                     resized_part.crop_imm(0, 0, copy_w, copy_h)
                 } else {
                     resized_part
                 };
 
-                if let Some(rgba_part) = part_to_copy.as_rgba8() {
+                if let Some(rgba_part) = part_to_copy.as_mut_rgba8() {
+                    apply_adjustments_lut(
+                        rgba_part.as_mut(),
+                        req.brightness.value(),
+                        req.contrast.value(),
+                    );
                     let _ = screen_canvas.copy_from(rgba_part, paste_x, paste_y);
                 } else {
-                    let _ = screen_canvas.copy_from(&part_to_copy.to_rgba8(), paste_x, paste_y);
+                    let mut rgba_part = part_to_copy.to_rgba8();
+                    apply_adjustments_lut(
+                        rgba_part.as_mut(),
+                        req.brightness.value(),
+                        req.contrast.value(),
+                    );
+                    let _ = screen_canvas.copy_from(&rgba_part, paste_x, paste_y);
                 }
             }
         }
         DynamicImage::ImageRgba8(screen_canvas)
-    };
-
-    if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
-        if !req.brightness.is_zero() {
-            apply_brightness_simd(rgba_canvas.as_mut(), req.brightness.value());
-        }
-        if !req.contrast.is_zero() {
-            apply_contrast_lut(rgba_canvas.as_mut(), req.contrast.value());
-        }
     }
-
-    canvas
 }
 
 /// Processes a scaling and panning request in the background, creating/rendering
@@ -343,16 +352,27 @@ pub fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
     }
 }
 
-/// Numerically stable continuous rational highlight soft-knee curve from `peng`.
+/// Computes the dynamic soft-knee compression threshold based on the maximum highlight peak.
 ///
-/// Smoothly compresses highlight values above `knee = 0.75` towards an asymptote of `1.0`,
-/// preventing harsh clipping transitions while ensuring $C^1$ continuity and complete
-/// numerical stability (free of NaN, Inf, or overflow even for extreme inputs).
+/// Matches `peng`'s `mix(1.0, 0.75, min(overshoot * 0.75, 1.0))` (`image.frag.glsl:746-757`):
+/// when `overshoot == 0.0`, `knee == 1.0` (no highlight compression); as `overshoot` increases,
+/// `knee` smoothly transitions from `1.0` down to `0.75`.
 #[inline]
-pub fn soft_knee_highlight(x: f32) -> f32 {
-    let knee = 0.75f32;
-    let w = 0.25f32;
-    if x <= knee {
+pub fn compute_dynamic_knee(peak: f32) -> f32 {
+    let overshoot = (peak - 1.0).max(0.0);
+    let t = (overshoot * 0.75).min(1.0);
+    1.0 - 0.25 * t
+}
+
+/// Numerically stable continuous rational highlight soft-knee curve with parameterized knee threshold.
+///
+/// Smoothly compresses highlight values above `knee` towards an asymptote of `1.0`,
+/// preventing harsh clipping transitions while ensuring $C^1$ continuity and numerical stability.
+#[inline]
+pub fn soft_knee_highlight_with_knee(x: f32, knee: f32) -> f32 {
+    let knee = knee.clamp(0.75, 1.0);
+    let w = 1.0 - knee;
+    if w <= 1e-5 || x <= knee {
         x.max(0.0)
     } else {
         let excess = x - knee;
@@ -360,22 +380,44 @@ pub fn soft_knee_highlight(x: f32) -> f32 {
     }
 }
 
-/// Applies contrast adjustment to an RGBA pixel buffer using a 256-byte stack LUT incorporating
-/// `peng`'s photometric contrast curve and soft-knee shoulder compression while preserving Alpha.
-pub fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
+/// Numerically stable continuous rational highlight soft-knee curve from `peng` with fixed `knee = 0.75`.
+///
+/// Smoothly compresses highlight values above `knee = 0.75` towards an asymptote of `1.0`,
+/// preventing harsh clipping transitions while ensuring $C^1$ continuity and complete
+/// numerical stability (free of NaN, Inf, or overflow even for extreme inputs).
+#[inline]
+pub fn soft_knee_highlight(x: f32) -> f32 {
+    soft_knee_highlight_with_knee(x, 0.75)
+}
+
+/// Applies fused brightness and contrast adjustments to an RGBA pixel buffer in a single memory pass
+/// using a 256-byte stack LUT, incorporating `peng`'s dynamic soft-knee highlight compression while
+/// strictly preserving Alpha.
+pub fn apply_adjustments_lut(pixels: &mut [u8], brightness: i32, contrast: f32) {
+    if brightness == 0 && contrast == 0.0 {
+        return;
+    }
     if contrast == 0.0 {
+        apply_brightness_simd(pixels, brightness);
         return;
     }
 
+    let b_offset = brightness as f32 / 255.0;
     let factor = ((100.0 + contrast) / 100.0).max(0.0);
     let factor = factor * factor;
+    let peak = (1.0 + b_offset - 0.5) * factor + 0.5;
+    let knee = compute_dynamic_knee(peak);
 
     let mut lut = [0u8; 256];
     for (i, slot) in lut.iter_mut().enumerate() {
-        let normalized = i as f32 / 255.0;
+        let normalized = i as f32 / 255.0 + b_offset;
         let mut val = (normalized - 0.5) * factor + 0.5;
-        if contrast > 0.0 {
-            val = soft_knee_highlight(val);
+        if peak > 1.0 {
+            val = if (knee - 0.75).abs() < 1e-5 {
+                soft_knee_highlight(val)
+            } else {
+                soft_knee_highlight_with_knee(val, knee)
+            };
         }
         *slot = (val.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
@@ -385,6 +427,13 @@ pub fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
         chunk[1] = lut[chunk[1] as usize];
         chunk[2] = lut[chunk[2] as usize];
     }
+}
+
+/// Applies contrast adjustment to an RGBA pixel buffer using a 256-byte stack LUT incorporating
+/// `peng`'s photometric contrast curve and soft-knee shoulder compression while preserving Alpha.
+#[cfg(test)]
+pub fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
+    apply_adjustments_lut(pixels, 0, contrast);
 }
 
 /// Clamps destination pixel colors to the min/max bounding envelope of the corresponding
@@ -781,6 +830,66 @@ mod tests {
         assert_eq!(pixels[3], 0);
         assert_eq!(pixels[7], 128);
         assert_eq!(pixels[11], 255);
+    }
+
+    #[test]
+    fn test_dynamic_knee_and_fused_adjustments_lut() {
+        // 1. Verify dynamic knee calculation
+        assert_eq!(compute_dynamic_knee(1.0), 1.0);
+        assert_eq!(compute_dynamic_knee(3.0), 0.75);
+
+        // 2. Small contrast nudge keeps white at 255
+        let mut white_pixel = vec![255, 255, 255, 255];
+        apply_adjustments_lut(&mut white_pixel, 0, 1.0);
+        assert_eq!(white_pixel[0], 255);
+        assert_eq!(white_pixel[1], 255);
+        assert_eq!(white_pixel[2], 255);
+        assert_eq!(white_pixel[3], 255);
+
+        // 3. Fused brightness (+40) and contrast (+30.0) maintains highlight differentiation
+        // Under separate passes, 220 and 250 would both clip to 255 at the brightness stage.
+        let mut pixels = vec![
+            220, 220, 220, 100, // pixel 1
+            250, 250, 250, 200, // pixel 2
+        ];
+        apply_adjustments_lut(&mut pixels, 40, 30.0);
+
+        let out_220 = pixels[0];
+        let out_250 = pixels[4];
+        assert!(
+            out_250 > out_220,
+            "Expected smooth differentiation between bright highlights: out_250 = {}, out_220 = {}",
+            out_250,
+            out_220
+        );
+        // Alpha channels must be strictly preserved
+        assert_eq!(pixels[3], 100);
+        assert_eq!(pixels[7], 200);
+
+        // 4. Verify render_resize_canvas skips offscreen transparent margins during LUT adjustments
+        let mut resizer = fir::Resizer::new();
+        let src = Arc::new(make_gray_test_image(40, 40, 120));
+        let req = ResizeRequest {
+            img: src,
+            original_size: (40, 40),
+            scale: 1.0,
+            crop: CropBox::new(-20, -20, 60, 60),
+            intersection: ImageIntersection::new(0, 0, 40, 40),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: Picker::halfblocks(),
+            brightness: Brightness::new(50),
+            contrast: Contrast::new(25.0),
+            rendered_size_cells: (40, 40),
+            sequence: 1,
+        };
+        let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
+        // Margin pixel at (0, 0) was never touched by apply_adjustments_lut
+        assert_eq!(*canvas.get_pixel(0, 0), Rgba([0, 0, 0, 0]));
+        // Active image pixel at (30, 30) was brightened and contrasted
+        assert!(canvas.get_pixel(30, 30)[0] > 120);
+        assert_eq!(canvas.get_pixel(30, 30)[3], 255);
     }
 
     #[test]
