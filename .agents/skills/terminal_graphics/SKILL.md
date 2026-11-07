@@ -14,7 +14,7 @@ description: Guidelines and learnings for foot/sixel/kitty terminal graphic rend
 ### 2. Selective Clearing (Anti-Flicker)
 
 - **Selective Clears**: Never clear the screen globally on continuous updates (zoom/pan) to avoid flicker.
-- **Centralized Clears**: Set a centralized `needs_clear_once` flag when opening/closing dialog overlays or rotating/swapping images.
+- **Centralized Clears**: Set a centralized `needs_clear` flag when opening/closing dialog overlays or rotating/swapping images.
 - **Clear Condition**: Call `terminal.clear()?` only on Sixel-protocol terminals (`picker.protocol_type() == ProtocolType::Sixel`) when the new graphic is received:
   ```rust
   pub fn should_clear_on_update(&self) -> bool {

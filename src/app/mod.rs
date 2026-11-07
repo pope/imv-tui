@@ -141,13 +141,10 @@ pub struct App {
     pub last_widget_size: (u16, u16),
     /// If true, triggers a resize worker dispatch.
     pub needs_update: bool,
-    /// Triggers a visual clearing of the terminal screen, but only if the active protocol requires it (e.g. Sixel).
-    /// Used to clean Sixel cells on discrete updates (like image loads) without causing constant Kitty/Halfblocks flicker.
+    /// Triggers a visual clearing of the terminal screen, gated on `should_clear_on_update()` (e.g. Sixel).
+    /// Used to clean obsolete graphic cells on discrete updates (like image loads or dismissed dialogues)
+    /// without causing constant Kitty/Halfblocks flicker.
     pub needs_clear: bool,
-    /// Triggers an unconditional visual clearing of the terminal text grid on the next frame.
-    /// Primarily used to cleanly erase text characters of dismissed dialogues (Help, search palettes) from the image region
-    /// in terminals using the Kitty graphics protocol (like WezTerm), where double buffering would otherwise skip/freeze them.
-    pub needs_clear_once: bool,
     /// Cell dimensions of the actual rendered Sixel/Kitty image.
     pub rendered_size_cells: (u16, u16),
     /// Percentage display value of the current scaling.
@@ -418,7 +415,6 @@ impl App {
             last_widget_size: (0, 0),
             needs_update: true,
             needs_clear: true,
-            needs_clear_once: false,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
             palette_mode: PaletteMode::Closed,
@@ -550,7 +546,7 @@ impl App {
             self.image_protocol = None;
             self.error_message = Some("No images match the current view filter".to_string());
             self.needs_update = true;
-            self.needs_clear_once = true;
+            self.needs_clear = true;
         }
     }
 
@@ -960,23 +956,23 @@ impl App {
                 if self.thumbnail_image.is_some() {
                     self.show_thumbnail_only = !self.show_thumbnail_only;
                     self.needs_update = true;
-                    self.needs_clear_once = true;
+                    self.needs_clear = true;
                 }
             }
             Command::ShowInfo => {
                 if self.palette_mode == PaletteMode::Info {
-                    if self.last_info_toggle.is_none()
-                        || self.last_info_toggle.unwrap().elapsed()
-                            > std::time::Duration::from_millis(200)
+                    if self
+                        .last_info_toggle
+                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(200))
                     {
                         self.palette_mode = PaletteMode::Closed;
-                        self.needs_clear_once = true;
+                        self.needs_clear = true;
                         self.last_info_toggle = Some(std::time::Instant::now());
                     }
                 } else {
                     self.palette_mode = PaletteMode::Info;
                     self.palette_height = 19;
-                    self.needs_clear_once = true;
+                    self.needs_clear = true;
                     self.last_info_toggle = Some(std::time::Instant::now());
                 }
             }
@@ -1024,7 +1020,7 @@ impl App {
                     SlideshowState::Paused { delay } => SlideshowState::Playing { delay },
                     SlideshowState::Stopped => SlideshowState::Stopped,
                 };
-                self.needs_clear_once = true;
+                self.needs_clear = true;
             }
         }
     }
@@ -1178,7 +1174,7 @@ impl App {
         })();
         self.palette_mode = PaletteMode::Closed;
         self.prompt_type = None;
-        self.needs_clear_once = true;
+        self.needs_clear = true;
     }
 
     pub fn get_sliding_window_indices(&self) -> Vec<usize> {
@@ -1495,7 +1491,7 @@ impl App {
                 self.needs_clear = true;
             }
             if self.palette_mode != PaletteMode::Closed {
-                self.needs_clear_once = true;
+                self.needs_clear = true;
             }
             self.stats.process_duration = resp.process_duration;
             self.stats.protocol_duration = resp.protocol_duration;
@@ -1557,7 +1553,7 @@ impl App {
 
         if self.palette_height != new_h {
             self.palette_height = new_h;
-            self.needs_clear_once = true;
+            self.needs_clear = true;
         }
     }
 
@@ -3311,5 +3307,51 @@ mod tests {
         assert_eq!(app.adjustments[curr].rotation, Rotation::D0);
         assert_eq!(app.adjustments[curr].brightness, Brightness::ZERO);
         assert_eq!(app.adjustments[curr].contrast, Contrast::ZERO);
+    }
+
+    #[test]
+    fn test_should_clear_on_update_and_dismiss_needs_clear() {
+        let (mut app, _channels) = setup_test_app_with_channels();
+
+        // 1. Check ProtocolType gating on should_clear_on_update
+        app.picker.set_protocol_type(ProtocolType::Halfblocks);
+        assert!(!app.should_clear_on_update());
+
+        app.picker.set_protocol_type(ProtocolType::Kitty);
+        assert!(!app.should_clear_on_update());
+
+        app.picker.set_protocol_type(ProtocolType::Iterm2);
+        assert!(!app.should_clear_on_update());
+
+        app.picker.set_protocol_type(ProtocolType::Sixel);
+        assert!(app.should_clear_on_update());
+
+        // 2. Overlay dismissal sets needs_clear = true
+        // Open and close prompt
+        app.needs_clear = false;
+        app.open_prompt(PromptType::GoToImage);
+        assert!(app.needs_clear);
+
+        app.needs_clear = false;
+        app.execute_prompt(PromptType::GoToImage);
+        assert!(app.needs_clear);
+
+        // Open and close Info overlay
+        app.needs_clear = false;
+        app.execute_command(Command::ShowInfo);
+        assert!(app.needs_clear);
+        assert_eq!(app.palette_mode, PaletteMode::Info);
+
+        app.needs_clear = false;
+        app.last_info_toggle =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
+        app.execute_command(Command::ShowInfo);
+        assert!(app.needs_clear);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+
+        // Slideshow pause toggle sets needs_clear
+        app.needs_clear = false;
+        app.execute_command(Command::ToggleSlideshowPause);
+        assert!(app.needs_clear);
     }
 }

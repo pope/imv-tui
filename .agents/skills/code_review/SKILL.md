@@ -17,4 +17,4 @@ description: Guidelines and checklists for performing architectural and Rust cod
 - **Zero-Allocation Hot Paths**: Strictly avoid heap allocations (like `String` formatting or `Vec` insertions) and unnecessary `.clone()` calls inside performance hot loops (e.g. layout rendering, event repeat coalescing, and interactive search filters).
 - **Async Thread I/O Boundaries**: Main UI thread must remain non-blocking. Disk operations, image decodes, resizing, and protocol writes must happen on background workers.
 - **Cache Pruning & Shared References**: Prefetch cache must be pruned based on sliding window bounds and hold `Arc<DynamicImage>` for zero-copy sharing.
-- **Double-Buffering Clear Protocol**: Trigger `needs_clear_once` when overlays/dialogs are active or changing state to prevent text-overlay clipping on WezTerm/Kitty/Foot protocol redraws.
+- **Double-Buffering Clear Protocol**: Trigger `needs_clear` when overlays/dialogs are active or changing state to clear obsolete cells on Sixel redraws without double-buffering flashes.

@@ -18,16 +18,16 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.palette_mode = PaletteMode::Closed;
-                    self.needs_clear_once = true;
+                    self.needs_clear = true;
                     return;
                 }
                 KeyCode::Char('d') => {
-                    if self.last_info_toggle.is_none()
-                        || self.last_info_toggle.unwrap().elapsed()
-                            > std::time::Duration::from_millis(200)
+                    if self
+                        .last_info_toggle
+                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(200))
                     {
                         self.palette_mode = PaletteMode::Closed;
-                        self.needs_clear_once = true;
+                        self.needs_clear = true;
                         self.last_info_toggle = Some(std::time::Instant::now());
                     }
                     return;
@@ -59,7 +59,7 @@ impl App {
                     KeyCode::Esc => {
                         self.palette_mode = PaletteMode::Closed;
                         self.needs_update = true;
-                        self.needs_clear_once = true;
+                        self.needs_clear = true;
                     }
                     KeyCode::Enter => match self.palette_mode {
                         PaletteMode::File => {
@@ -70,7 +70,7 @@ impl App {
                             }
                             self.palette_mode = PaletteMode::Closed;
                             self.needs_update = true;
-                            self.needs_clear_once = true;
+                            self.needs_clear = true;
                         }
                         PaletteMode::Command => {
                             let cmds = self.get_filtered_commands();
@@ -81,7 +81,7 @@ impl App {
                             if self.palette_mode == PaletteMode::Command {
                                 self.palette_mode = PaletteMode::Closed;
                                 self.needs_update = true;
-                                self.needs_clear_once = true;
+                                self.needs_clear = true;
                             }
                         }
                         PaletteMode::Prompt => {

@@ -11,11 +11,11 @@ use std::time::Duration;
 /// Renders the main image viewport, handling loading spinners, error details, and empty states.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_loading = app.is_loading
-        && (app.image_protocol.is_none()
-            || (app.thumbnail_image.is_none()
-                && app
-                    .loading_start_time
-                    .is_some_and(|t| t.elapsed() > Duration::from_millis(150))));
+        && app.image_protocol.is_none()
+        && app.thumbnail_image.is_none()
+        && app
+            .loading_start_time
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(150));
 
     if show_loading {
         let loading_paragraph = Paragraph::new("\n\nLoading Image...")

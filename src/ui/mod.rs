@@ -143,6 +143,47 @@ mod tests {
     }
 
     #[test]
+    fn test_loading_spinner_debounce() {
+        let mut app = setup_test_app();
+        app.img_width = 800;
+        app.img_height = 600;
+        app.is_loading = true;
+        app.image_protocol = None;
+        app.thumbnail_image = None;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        // 1. Loading started immediately (< 150ms debounce) -> "Loading Image..." must NOT be rendered
+        app.loading_start_time = Some(std::time::Instant::now());
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let rendered_early = buffer_to_string(&terminal);
+        assert!(
+            !rendered_early.contains("Loading Image..."),
+            "Loading text should be debounced under 150ms"
+        );
+
+        // 2. Loading exceeded 150ms (simulated 200ms ago) -> "Loading Image..." IS rendered
+        app.loading_start_time =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(200));
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let rendered_late = buffer_to_string(&terminal);
+        assert!(
+            rendered_late.contains("Loading Image..."),
+            "Loading text should be rendered when loading exceeds 150ms"
+        );
+
+        // 3. When thumbnail_image is Some, "Loading Image..." is NOT rendered even after 200ms
+        app.thumbnail_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(100, 100),
+        )));
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let rendered_thumb = buffer_to_string(&terminal);
+        assert!(
+            !rendered_thumb.contains("Loading Image..."),
+            "Loading text should not be rendered if thumbnail is available"
+        );
+    }
+
+    #[test]
     fn test_tiny_terminal_rendering_defensive_clamping() {
         let mut app = setup_test_app();
         app.img_width = 800;

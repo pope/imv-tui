@@ -74,20 +74,30 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
             }
             buf.clear();
         }
-
-        // Reopen stdin from /dev/tty so crossterm can read keyboard inputs!
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
-                let fd = tty.as_raw_fd();
-                unsafe {
-                    let _ = libc::dup2(fd, libc::STDIN_FILENO);
-                }
-            }
-        }
     }
     piped_files
+}
+
+/// Reopens STDIN from `/dev/tty` so crossterm can read interactive keyboard inputs in piped mode.
+pub(crate) fn reopen_tty_stdin() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/tty")
+            .map_err(|e| {
+                format!("Error: Failed to reopen /dev/tty for interactive input in piped mode: {e}")
+            })?;
+        let fd = tty.as_raw_fd();
+        let res = unsafe { libc::dup2(fd, libc::STDIN_FILENO) };
+        if res < 0 {
+            return Err(
+                "Error: Failed to reopen /dev/tty for interactive input in piped mode".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Helper function to retrieve flag value and avoid argument hijacking.

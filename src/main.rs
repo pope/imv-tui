@@ -21,7 +21,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
 use crate::app::{App, Classification, PaletteMode};
-use crate::config::cli::{parse_cli_args, read_piped_stdin};
+use crate::config::cli::{parse_cli_args, read_piped_stdin, reopen_tty_stdin};
 use crate::imaging::{ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory};
 use crate::ui::ui;
 
@@ -30,8 +30,9 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         enable_raw_mode()?;
+        let guard = Self;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(Self)
+        Ok(guard)
     }
 }
 
@@ -90,6 +91,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Get the image file list and current starting index
     let (images, current_index) = if is_piped {
         let sources = collect_sources(&piped_files, check_magic)?;
+        reopen_tty_stdin()?;
         (sources, 0)
     } else {
         if is_cbz {
@@ -188,12 +190,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         app.update_layout(term_size.width, term_size.height);
-
-        if app.needs_clear_once {
-            app.needs_clear_once = false;
-            terminal.clear()?;
-            draw_needed = true;
-        }
 
         if app.needs_clear {
             app.needs_clear = false;
