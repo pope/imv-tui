@@ -2,8 +2,8 @@
 
 use crate::app::cache::{CachedImage, VisibleWindow};
 use crate::app::palette::PaletteMode;
-use crate::app::{App, FAST_SCROLL_THRESHOLD};
-use crate::imaging::{LoaderRequest, PanOffset, Rotation, ZoomFactor};
+use crate::app::{App, FAST_SCROLL_THRESHOLD, LoadPhase, ThumbnailTelemetry};
+use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -51,9 +51,7 @@ impl App {
             let _ = self.loader_tx.send(LoaderRequest {
                 idx,
                 source,
-                is_prefetch: true,
-                thumb_only: false,
-                skip_thumbnail: false,
+                mode: LoaderMode::Prefetch,
                 sequence: self.current_sequence,
             });
         }
@@ -70,7 +68,7 @@ impl App {
         }
 
         self.resize_in_flight = false;
-        self.full_image_pending = false;
+        self.load_phase = LoadPhase::Complete;
         self.error_message = None;
         self.clear_on_protocol_receive = true;
         self.slideshow_last_transition = std::time::Instant::now();
@@ -106,13 +104,18 @@ impl App {
                     .thumbnail
                     .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
                 self.show_thumbnail_only = false;
+                self.load_phase = LoadPhase::Complete;
 
-                if let Some(ref thumb) = self.thumbnail_image {
-                    self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
-                    self.stats.thumbnail_dimensions = Some((thumb.width(), thumb.height()));
+                if let (Some(thumb), Some(src)) =
+                    (&self.thumbnail_image, cached_img.thumbnail_source)
+                {
+                    self.stats.thumbnail = Some(ThumbnailTelemetry {
+                        load_duration: cached_img.thumbnail_decode_duration,
+                        dimensions: (thumb.width(), thumb.height()),
+                        source: src,
+                    });
                 } else {
-                    self.stats.thumbnail_load_duration = None;
-                    self.stats.thumbnail_dimensions = None;
+                    self.stats.thumbnail = None;
                 }
 
                 self.zoom_factor = ZoomFactor::DEFAULT;
@@ -123,7 +126,6 @@ impl App {
 
                 // Set stats for cache hit
                 self.stats.load_duration = Some(cached_img.decode_duration);
-                self.stats.thumbnail_source = cached_img.thumbnail_source;
                 self.stats.is_prefetch_cache_hit = true;
                 self.stats.disk_size = cached_img.disk_size;
                 self.stats.format = cached_img.format;
@@ -161,13 +163,19 @@ impl App {
                 self.needs_update = true;
                 loaded_cached_thumb = true;
                 self.stats.is_prefetch_cache_hit = true;
-                self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
                 let (tw, th) = self
                     .thumbnail_image
                     .as_ref()
                     .map_or((thumb.width(), thumb.height()), |t| (t.width(), t.height()));
-                self.stats.thumbnail_dimensions = Some((tw, th));
-                self.stats.thumbnail_source = cached_img.thumbnail_source;
+                if let Some(src) = cached_img.thumbnail_source {
+                    self.stats.thumbnail = Some(ThumbnailTelemetry {
+                        load_duration: cached_img.thumbnail_decode_duration,
+                        dimensions: (tw, th),
+                        source: src,
+                    });
+                } else {
+                    self.stats.thumbnail = None;
+                }
                 self.stats.raw_width = cached_img.raw_width;
                 self.stats.raw_height = cached_img.raw_height;
             }
@@ -179,9 +187,7 @@ impl App {
             self.thumbnail_image = None;
             self.show_thumbnail_only = false;
             self.stats.is_prefetch_cache_hit = false;
-            self.stats.thumbnail_load_duration = None;
-            self.stats.thumbnail_dimensions = None;
-            self.stats.thumbnail_source = None;
+            self.stats.thumbnail = None;
             self.stats.raw_width = None;
             self.stats.raw_height = None;
         }
@@ -206,16 +212,23 @@ impl App {
 
         let thumb_only = is_fast_scroll && !self.disable_thumbnail;
         if loaded_cached_thumb && thumb_only {
-            self.full_image_pending = true;
+            self.load_phase = LoadPhase::FullDeferred;
         } else {
-            self.full_image_pending = thumb_only;
+            let mode = if thumb_only {
+                self.load_phase = LoadPhase::ThumbnailInFlightDeferred;
+                LoaderMode::ThumbnailOnly
+            } else if loaded_cached_thumb {
+                self.load_phase = LoadPhase::FullInFlight;
+                LoaderMode::FullOnly
+            } else {
+                self.load_phase = LoadPhase::FullInFlight;
+                LoaderMode::ThumbnailAndFull
+            };
             let source = self.queue.images()[self.queue.current_index].clone();
             let _ = self.loader_tx.send(LoaderRequest {
                 idx: self.queue.current_index,
                 source,
-                is_prefetch: false,
-                thumb_only,
-                skip_thumbnail: loaded_cached_thumb,
+                mode,
                 sequence: self.current_sequence,
             });
         }
@@ -309,6 +322,9 @@ impl App {
                             .unwrap_or(shared_img);
 
                         if resp.is_thumbnail {
+                            if self.load_phase == LoadPhase::ThumbnailInFlightDeferred {
+                                self.load_phase = LoadPhase::FullDeferred;
+                            }
                             let (orig_w, orig_h) = if adj.rotation == Rotation::D90
                                 || adj.rotation == Rotation::D270
                             {
@@ -326,9 +342,15 @@ impl App {
                             self.error_message = None;
                             self.needs_update = true;
 
-                            self.stats.thumbnail_load_duration = Some(resp.decode_duration);
-                            self.stats.thumbnail_dimensions = Some((thumb_w, thumb_h));
-                            self.stats.thumbnail_source = resp.thumbnail_source;
+                            if let Some(src) = resp.thumbnail_source {
+                                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                                    load_duration: resp.decode_duration,
+                                    dimensions: (thumb_w, thumb_h),
+                                    source: src,
+                                });
+                            } else {
+                                self.stats.thumbnail = None;
+                            }
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;
@@ -339,7 +361,7 @@ impl App {
                             self.img_height = rotated_img.height();
                             self.original_image = Some(rotated_img);
                             self.show_thumbnail_only = false;
-                            self.full_image_pending = false;
+                            self.load_phase = LoadPhase::Complete;
                             self.error_message = None;
                             self.is_loading = false;
                             self.needs_update = true;
@@ -408,15 +430,18 @@ impl App {
                 .is_some_and(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
         {
             self.prefetch_suspended = false;
-            if self.full_image_pending && !self.queue.is_empty() {
-                self.full_image_pending = false;
+            if self.load_phase.needs_promotion() && !self.queue.is_empty() {
+                self.load_phase = LoadPhase::FullInFlight;
+                let mode = if self.thumbnail_image.is_some() {
+                    LoaderMode::FullOnly
+                } else {
+                    LoaderMode::ThumbnailAndFull
+                };
                 let source = self.queue.images()[self.queue.current_index].clone();
                 let _ = self.loader_tx.send(LoaderRequest {
                     idx: self.queue.current_index,
                     source,
-                    is_prefetch: false,
-                    thumb_only: false,
-                    skip_thumbnail: self.thumbnail_image.is_some(),
+                    mode,
                     sequence: self.current_sequence,
                 });
             }
@@ -427,15 +452,14 @@ impl App {
     /// Returns true if any foreground load, full-resolution decode, resize, or deferred fast-scroll
     /// promotion is currently in flight, signaling the event loop to poll at 1ms instead of 33ms.
     pub fn has_pending_work(&self) -> bool {
-        if self.error_message.is_some() {
+        if self.error_message.is_some() || self.queue.is_empty() {
             return false;
         }
         self.is_loading
             || self.needs_update
             || self.resize_in_flight
             || self.prefetch_suspended
-            || self.full_image_pending
-            || (!self.queue.is_empty() && self.stats.load_duration.is_none())
+            || self.load_phase.is_pending()
     }
 
     /// Pumps background worker channels and layout updates for up to `budget` while waiting

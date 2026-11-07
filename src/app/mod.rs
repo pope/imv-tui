@@ -41,17 +41,52 @@ use crate::imaging::{
 /// Background prefetching is suspended while navigating faster than this rate.
 pub const FAST_SCROLL_THRESHOLD: Duration = Duration::from_millis(60);
 
+/// Tracks the background loader lifecycle for the currently selected image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadPhase {
+    /// Full-resolution image is resident (or queue is empty / errored); no foreground loader work pending.
+    #[default]
+    Complete,
+    /// Fast-scroll `ThumbnailOnly` request is in flight on the loader worker; full decode is deferred.
+    ThumbnailInFlightDeferred,
+    /// Thumbnail is resident in memory; waiting for fast-scroll settle (`tick()`) to dispatch `FullOnly`.
+    FullDeferred,
+    /// Full-resolution decode (`ThumbnailAndFull` or `FullOnly`) is in flight on the loader worker.
+    FullInFlight,
+}
+
+impl LoadPhase {
+    /// Returns true if the active image still has pending or in-flight work on the loader pipeline.
+    #[inline]
+    pub fn is_pending(self) -> bool {
+        !matches!(self, Self::Complete)
+    }
+
+    /// Returns true if full-resolution decoding was deferred during fast scrolling and awaits promotion.
+    #[inline]
+    pub fn needs_promotion(self) -> bool {
+        matches!(self, Self::ThumbnailInFlightDeferred | Self::FullDeferred)
+    }
+}
+
+/// Telemetry metadata for a decoded thumbnail placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailTelemetry {
+    /// Time taken to extract and decode the thumbnail.
+    pub load_duration: std::time::Duration,
+    /// Dimensions of the decoded thumbnail placeholder (`(width, height)`).
+    pub dimensions: (u32, u32),
+    /// Source of the thumbnail placeholder (EXIF or XDG cache).
+    pub source: ThumbnailSource,
+}
+
 /// Diagnostic and telemetry instrumentation for image decoding, resizing, and protocol delivery.
 #[derive(Debug, Clone, Default)]
 pub struct StatsForNerds {
     /// Time taken to load (decode) the photo from disk or zip, or None while loading.
     pub load_duration: Option<std::time::Duration>,
-    /// Time taken to extract and decode the thumbnail.
-    pub thumbnail_load_duration: Option<std::time::Duration>,
-    /// Dimensions of the decoded thumbnail placeholder, if any.
-    pub thumbnail_dimensions: Option<(u32, u32)>,
-    /// Source of the thumbnail placeholder, if any.
-    pub thumbnail_source: Option<ThumbnailSource>,
+    /// Telemetry metadata for the decoded thumbnail placeholder, if any.
+    pub thumbnail: Option<ThumbnailTelemetry>,
     /// Was it loaded from the prefetch cache.
     pub is_prefetch_cache_hit: bool,
     /// Time taken to resize, apply filters, adjustments, etc.
@@ -182,8 +217,8 @@ pub struct App {
     pub needs_update: bool,
     /// Tracks whether a resize request for `current_sequence` is currently in flight on the worker thread.
     pub resize_in_flight: bool,
-    /// Tracks whether full-resolution decoding was deferred during fast scrolling.
-    pub full_image_pending: bool,
+    /// Lifecycle state of background loading for the currently selected image.
+    pub load_phase: LoadPhase,
     /// Triggers a visual clearing of the terminal screen, gated on `should_clear_on_update()` (e.g. Sixel).
     /// Used to clean obsolete graphic cells on discrete updates (like image loads or dismissed dialogues)
     /// without causing constant Kitty/Halfblocks flicker.
@@ -202,8 +237,6 @@ pub struct App {
     pub palette_width: u16,
     /// Dynamic height of the popup dialogue.
     pub palette_height: u16,
-    /// The active prompt configuration details.
-    pub prompt_type: Option<PromptType>,
     /// Desired scaling filter.
     pub filter_type: FilterType,
     /// Desired image layout scaling behavior.
@@ -340,7 +373,7 @@ impl App {
                     .collect();
 
                 // Sort current_requests so that the active load (is_prefetch == false) is processed first
-                current_requests.sort_by_key(|r| r.is_prefetch);
+                current_requests.sort_by_key(|r| r.mode.is_prefetch());
 
                 let mut aborted = false;
                 for r in current_requests {
@@ -387,7 +420,7 @@ impl App {
 
                     let mut has_thumbnail = false;
 
-                    if !disable_thumbnail && !r.skip_thumbnail {
+                    if r.mode.should_extract_thumbnail(disable_thumbnail) {
                         if cancel.is_cancelled() {
                             continue;
                         }
@@ -413,7 +446,7 @@ impl App {
                                         raw_width: Some(real_w),
                                         raw_height: Some(real_h),
                                     }),
-                                    is_prefetch: r.is_prefetch,
+                                    is_prefetch: r.mode.is_prefetch(),
                                     sequence: r.sequence,
                                     decode_duration: thumb_dur,
                                     is_thumbnail: true,
@@ -457,7 +490,7 @@ impl App {
                                     raw_width: Some(real_w),
                                     raw_height: Some(real_h),
                                 }),
-                                is_prefetch: r.is_prefetch,
+                                is_prefetch: r.mode.is_prefetch(),
                                 sequence: r.sequence,
                                 decode_duration: thumb_dur,
                                 is_thumbnail: true,
@@ -467,7 +500,7 @@ impl App {
                         }
                     }
 
-                    if r.thumb_only && has_thumbnail {
+                    if r.mode.is_thumbnail_only() && has_thumbnail {
                         continue;
                     }
 
@@ -506,8 +539,7 @@ impl App {
                     if !cancel.is_cancelled() {
                         if let Ok(ref decoded) = res
                             && !has_thumbnail
-                            && !r.skip_thumbnail
-                            && !disable_thumbnail
+                            && r.mode.should_extract_thumbnail(disable_thumbnail)
                             && let Some(ref path) = local_path
                             && let Some(ref cache_root) = thumb_cache_root
                         {
@@ -522,7 +554,7 @@ impl App {
                         let _ = response_tx.send(LoaderResponse {
                             idx: r.idx,
                             result: res,
-                            is_prefetch: r.is_prefetch,
+                            is_prefetch: r.mode.is_prefetch(),
                             sequence: r.sequence,
                             decode_duration,
                             is_thumbnail: false,
@@ -584,7 +616,7 @@ impl App {
             last_widget_size: (0, 0),
             needs_update: true,
             resize_in_flight: false,
-            full_image_pending: false,
+            load_phase: LoadPhase::Complete,
             needs_clear: true,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
@@ -593,7 +625,6 @@ impl App {
             palette_selected_index: 0,
             palette_width: 0,
             palette_height: 0,
-            prompt_type: None,
             filter_type: config.filter_type,
             scale_mode: config.scale_mode,
             matcher: nucleo::Matcher::new(nucleo::Config::DEFAULT),
@@ -690,7 +721,7 @@ impl App {
         self.thumbnail_image = None;
         self.image_protocol = None;
         self.resize_in_flight = false;
-        self.full_image_pending = false;
+        self.load_phase = LoadPhase::Complete;
         self.needs_update = false;
     }
 
@@ -1005,8 +1036,7 @@ impl App {
 
     /// Opens a single-line input prompt for value entry.
     pub fn open_prompt(&mut self, prompt_type: PromptType) {
-        self.palette_mode = PaletteMode::Prompt;
-        self.prompt_type = Some(prompt_type);
+        self.palette_mode = PaletteMode::Prompt(prompt_type);
         self.palette_query.clear();
         self.palette_selected_index = 0;
         self.palette_width = 45;
@@ -1117,7 +1147,6 @@ impl App {
             }
         })();
         self.palette_mode = PaletteMode::Closed;
-        self.prompt_type = None;
         self.needs_clear = true;
     }
 }

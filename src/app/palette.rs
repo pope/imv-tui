@@ -22,8 +22,8 @@ pub enum PaletteMode {
     Command,
     /// Fuzzy search files in local queue.
     File,
-    /// Prompt value input box is open.
-    Prompt,
+    /// Prompt value input box is open with the given prompt type.
+    Prompt(PromptType),
     /// Image metadata and statistics dialog is open.
     Info,
 }

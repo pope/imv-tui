@@ -213,31 +213,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
         let thumb_load_line = if app.disable_thumbnail {
             Line::from(vec!["   Thumbnail Load: ".gray(), "N/A (Disabled)".gray()])
+        } else if let Some(ref thumb) = app.stats.thumbnail {
+            Line::from(vec![
+                "   Thumbnail Load: ".gray(),
+                format!(
+                    "{:.2} ms @ {} x {} px ({})",
+                    thumb.load_duration.as_secs_f64() * 1000.0,
+                    thumb.dimensions.0,
+                    thumb.dimensions.1,
+                    thumb.source.display_label()
+                )
+                .bold(),
+            ])
         } else {
-            match (
-                app.stats.thumbnail_load_duration,
-                app.stats.thumbnail_dimensions,
-            ) {
-                (Some(dur), Some((tw, th))) => {
-                    let src_label = app
-                        .stats
-                        .thumbnail_source
-                        .map(|s| s.display_label())
-                        .unwrap_or("Thumb");
-                    Line::from(vec![
-                        "   Thumbnail Load: ".gray(),
-                        format!(
-                            "{:.2} ms @ {} x {} px ({})",
-                            dur.as_secs_f64() * 1000.0,
-                            tw,
-                            th,
-                            src_label
-                        )
-                        .bold(),
-                    ])
-                }
-                _ => Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()]),
-            }
+            Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()])
         };
         lines.push(thumb_load_line);
 

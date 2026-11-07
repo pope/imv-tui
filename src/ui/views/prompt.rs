@@ -9,24 +9,22 @@ use ratatui::{
 };
 
 /// Renders the confirm or value input prompt box (for delays, indexes, biases).
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw(frame: &mut Frame, app: &App, area: Rect, prompt_type: PromptType) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let prompt_title = match app.prompt_type {
-        Some(PromptType::GoToImage) => " Go to Image ",
-        Some(PromptType::SetBrightness) => " Set Brightness ",
-        Some(PromptType::SetContrast) => " Set Contrast ",
-        Some(PromptType::SetSlideshow) => " Set Slideshow ",
-        None => " Input ",
+    let prompt_title = match prompt_type {
+        PromptType::GoToImage => " Go to Image ",
+        PromptType::SetBrightness => " Set Brightness ",
+        PromptType::SetContrast => " Set Contrast ",
+        PromptType::SetSlideshow => " Set Slideshow ",
     };
-    let prompt_label = match app.prompt_type {
-        Some(PromptType::GoToImage) => "Enter index (e.g. 40, +10, -10):",
-        Some(PromptType::SetBrightness) => "Enter brightness (e.g. 50, +10, -10):",
-        Some(PromptType::SetContrast) => "Enter contrast % (e.g. 20, +5, -5):",
-        Some(PromptType::SetSlideshow) => "Enter slideshow delay in seconds (e.g. 5, +1, -1):",
-        None => "Enter value:",
+    let prompt_label = match prompt_type {
+        PromptType::GoToImage => "Enter index (e.g. 40, +10, -10):",
+        PromptType::SetBrightness => "Enter brightness (e.g. 50, +10, -10):",
+        PromptType::SetContrast => "Enter contrast % (e.g. 20, +5, -5):",
+        PromptType::SetSlideshow => "Enter slideshow delay in seconds (e.g. 5, +1, -1):",
     };
 
     let lines = vec![

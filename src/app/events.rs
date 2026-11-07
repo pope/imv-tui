@@ -84,10 +84,8 @@ impl App {
                                 self.needs_clear = true;
                             }
                         }
-                        PaletteMode::Prompt => {
-                            if let Some(prompt_type) = self.prompt_type {
-                                self.execute_prompt(prompt_type);
-                            }
+                        PaletteMode::Prompt(prompt_type) => {
+                            self.execute_prompt(prompt_type);
                         }
                         _ => {}
                     },
@@ -276,8 +274,7 @@ mod tests {
 
         // Command::GoToImage opens Goto prompt
         app.execute_command(Command::GoToImage);
-        assert_eq!(app.palette_mode, PaletteMode::Prompt);
-        assert_eq!(app.prompt_type, Some(PromptType::GoToImage));
+        assert_eq!(app.palette_mode, PaletteMode::Prompt(PromptType::GoToImage));
         app.palette_mode = PaletteMode::Closed;
 
         // 'd' opens Info dialog
@@ -374,8 +371,7 @@ mod tests {
 
         // 1. Open GoToImage prompt
         app.open_prompt(PromptType::GoToImage);
-        assert_eq!(app.palette_mode, PaletteMode::Prompt);
-        assert_eq!(app.prompt_type, Some(PromptType::GoToImage));
+        assert_eq!(app.palette_mode, PaletteMode::Prompt(PromptType::GoToImage));
 
         // 2. Type '2'
         app.handle_key_event(make_key(KeyCode::Char('2'), KeyModifiers::NONE), 24);
@@ -384,7 +380,6 @@ mod tests {
         // 3. Press Enter -> execute prompt and close
         app.handle_key_event(make_key(KeyCode::Enter, KeyModifiers::NONE), 24);
         assert_eq!(app.palette_mode, PaletteMode::Closed);
-        assert_eq!(app.prompt_type, None);
         assert_eq!(app.queue.current_index, 1);
 
         // 4. Open prompt again and cancel with Esc

@@ -144,19 +144,47 @@ pub struct ResizeRequest {
     pub use_kitty_shm: bool,
 }
 
+/// Specifies the decoding strategy and priority for a `LoaderRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderMode {
+    /// Active foreground load: extract fast thumbnail placeholder first, then decode full resolution.
+    ThumbnailAndFull,
+    /// Fast-scroll foreground load: extract only the thumbnail placeholder (falling back to full decode only if no thumbnail exists).
+    ThumbnailOnly,
+    /// Promotion foreground load: thumbnail is already resident; skip thumbnail extraction and decode only full resolution.
+    FullOnly,
+    /// Background neighbor prefetch load.
+    Prefetch,
+}
+
+impl LoaderMode {
+    /// Returns true if this request is a background neighbor prefetch.
+    #[inline]
+    pub fn is_prefetch(self) -> bool {
+        matches!(self, Self::Prefetch)
+    }
+
+    /// Returns true if the loader should attempt EXIF/XDG thumbnail extraction.
+    #[inline]
+    pub fn should_extract_thumbnail(self, disable_thumbnail: bool) -> bool {
+        !disable_thumbnail && !matches!(self, Self::FullOnly)
+    }
+
+    /// Returns true if the loader should stop after extracting a valid thumbnail.
+    #[inline]
+    pub fn is_thumbnail_only(self) -> bool {
+        matches!(self, Self::ThumbnailOnly)
+    }
+}
+
 /// A request sent to the persistent loader thread.
 pub struct LoaderRequest {
     /// File index inside the App source list.
     pub idx: usize,
     /// The ImageSource identifier.
     pub source: ImageSource,
-    /// Whether this is a background prefetch request.
-    pub is_prefetch: bool,
-    /// Whether to restrict loading to the fast low-res thumbnail placeholder (during fast scrolling).
-    pub thumb_only: bool,
-    /// Whether to skip thumbnail extraction and decode only the full-resolution image
-    /// (used when promoting an already-displayed thumbnail placeholder to full resolution).
-    pub skip_thumbnail: bool,
+    /// Decoding strategy and priority mode.
+    pub mode: LoaderMode,
     /// Navigation sequence identifier to discard outdated loads.
     pub sequence: u64,
 }

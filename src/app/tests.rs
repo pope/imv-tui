@@ -3,7 +3,7 @@ use crate::app::cache::CachedImage;
 use crate::app::classifications::ClassificationJsonItem;
 use crate::config::InfoBarPosition;
 use crate::imaging::types::{Brightness, Contrast, Rotation};
-use crate::imaging::{ImageSource, ScaleMode};
+use crate::imaging::{ImageSource, LoaderMode, ScaleMode};
 use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use std::fs;
@@ -509,7 +509,7 @@ fn test_start_load_image_channel_dispatch() {
         .try_recv()
         .expect("Expected active LoaderRequest on loader_rx");
     assert_eq!(active_req.idx, 0);
-    assert!(!active_req.is_prefetch);
+    assert!(!active_req.mode.is_prefetch());
     assert_eq!(active_req.sequence, 1);
     assert_eq!(
         active_req.source,
@@ -522,7 +522,7 @@ fn test_start_load_image_channel_dispatch() {
         .try_recv()
         .expect("Expected prefetch LoaderRequest on loader_rx");
     assert_eq!(prefetch_req.idx, 1);
-    assert!(prefetch_req.is_prefetch);
+    assert!(prefetch_req.mode.is_prefetch());
     assert_eq!(prefetch_req.sequence, 1);
 
     // No additional requests pending
@@ -537,7 +537,7 @@ fn test_start_load_image_channel_dispatch() {
         .try_recv()
         .expect("Expected new active LoaderRequest after next_image()");
     assert_eq!(next_active_req.idx, 1);
-    assert!(!next_active_req.is_prefetch);
+    assert!(!next_active_req.mode.is_prefetch());
     assert_eq!(next_active_req.sequence, 2);
 }
 
@@ -578,11 +578,12 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     assert!(app.thumbnail_image.is_some());
     assert_eq!(app.img_width, 160);
     assert_eq!(app.img_height, 120);
+    let thumb_telemetry = app.stats.thumbnail.expect("Expected thumbnail telemetry");
     assert_eq!(
-        app.stats.thumbnail_source,
-        Some(crate::imaging::ThumbnailSource::Exif)
+        thumb_telemetry.source,
+        crate::imaging::ThumbnailSource::Exif
     );
-    assert_eq!(app.stats.thumbnail_dimensions, Some((160, 120)));
+    assert_eq!(thumb_telemetry.dimensions, (160, 120));
     assert!(
         app.stats.load_duration.is_none(),
         "load_duration must be None during thumbnail placeholder phase"
@@ -842,7 +843,6 @@ fn test_execute_prompt_goto_image() {
     app.execute_prompt(PromptType::GoToImage);
     assert_eq!(app.queue.current_index, 1);
     assert_eq!(app.palette_mode, PaletteMode::Closed);
-    assert_eq!(app.prompt_type, None);
 
     // 2. Absolute "0" -> ignored via checked_sub(1), stays at index 1
     app.palette_query.set("0");
@@ -1167,45 +1167,48 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
     app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
     app.next_image();
     assert!(!app.prefetch_suspended);
-    assert!(!app.full_image_pending);
+    assert_eq!(app.load_phase, LoadPhase::FullInFlight);
+    assert!(!app.load_phase.needs_promotion());
     // Drain requests
     let mut reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         reqs.push(r);
     }
-    let non_prefetch = reqs.iter().find(|r| !r.is_prefetch).unwrap();
-    assert!(!non_prefetch.thumb_only);
+    let non_prefetch = reqs.iter().find(|r| !r.mode.is_prefetch()).unwrap();
+    assert_eq!(non_prefetch.mode, LoaderMode::ThumbnailAndFull);
 
     // 3. Trigger rapid successive navigation (within FAST_SCROLL_THRESHOLD)
     app.next_image();
     assert!(app.prefetch_suspended);
-    assert!(app.full_image_pending);
+    assert_eq!(app.load_phase, LoadPhase::ThumbnailInFlightDeferred);
+    assert!(app.load_phase.needs_promotion());
     assert_eq!(
         app.active_sequence.load(Ordering::Acquire),
         app.current_sequence as usize
     );
 
-    // In fast scroll, active load is sent with thumb_only = true, and prefetch requests are skipped
+    // In fast scroll, active load is sent with ThumbnailOnly, and prefetch requests are skipped
     let mut rapid_reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         rapid_reqs.push(r);
     }
     // Active load was sent
     assert_eq!(rapid_reqs.len(), 1);
-    assert!(!rapid_reqs[0].is_prefetch);
-    assert!(rapid_reqs[0].thumb_only);
+    assert!(!rapid_reqs[0].mode.is_prefetch());
+    assert_eq!(rapid_reqs[0].mode, LoaderMode::ThumbnailOnly);
 
     // 4. Tick before threshold does not resume prefetch
     app.tick();
     assert!(app.prefetch_suspended);
-    assert!(app.full_image_pending);
+    assert_eq!(app.load_phase, LoadPhase::ThumbnailInFlightDeferred);
     assert!(channels.loader_rx.try_recv().is_err());
 
     // 5. Once elapsed time exceeds threshold, tick resumes prefetch and dispatches full-resolution promotion
     app.last_nav_time = Some(Instant::now() - Duration::from_millis(70));
     app.tick();
     assert!(!app.prefetch_suspended);
-    assert!(!app.full_image_pending);
+    assert_eq!(app.load_phase, LoadPhase::FullInFlight);
+    assert!(!app.load_phase.needs_promotion());
 
     // Requests dispatched by tick: promotion request + prefetch requests
     let mut resumed_reqs = Vec::new();
@@ -1214,12 +1217,18 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
     }
     let promo_req = resumed_reqs
         .iter()
-        .find(|r| !r.is_prefetch)
+        .find(|r| !r.mode.is_prefetch())
         .expect("Expected full-resolution promotion request");
     assert_eq!(promo_req.idx, app.queue.current_index);
-    assert!(!promo_req.thumb_only);
-    assert_eq!(promo_req.skip_thumbnail, app.thumbnail_image.is_some());
-    assert!(resumed_reqs.iter().any(|r| r.is_prefetch));
+    assert_eq!(
+        promo_req.mode,
+        if app.thumbnail_image.is_some() {
+            LoaderMode::FullOnly
+        } else {
+            LoaderMode::ThumbnailAndFull
+        }
+    );
+    assert!(resumed_reqs.iter().any(|r| r.mode.is_prefetch()));
 }
 
 #[test]
@@ -1232,9 +1241,11 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     app.thumbnail_image = Some(fake_thumb.clone());
     app.original_image = Some(fake_thumb);
     app.show_thumbnail_only = true;
-    app.stats.thumbnail_dimensions = Some((16, 16));
-    app.stats.thumbnail_load_duration = Some(Duration::from_millis(2));
-    app.stats.thumbnail_source = Some(crate::imaging::ThumbnailSource::Exif);
+    app.stats.thumbnail = Some(ThumbnailTelemetry {
+        load_duration: Duration::from_millis(2),
+        dimensions: (16, 16),
+        source: crate::imaging::ThumbnailSource::Exif,
+    });
     app.stats.is_prefetch_cache_hit = true;
 
     assert!(app.thumbnail_image.is_some());
@@ -1250,9 +1261,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     assert!(app.original_image.is_none());
     assert!(!app.show_thumbnail_only);
     assert!(!app.stats.is_prefetch_cache_hit);
-    assert!(app.stats.thumbnail_dimensions.is_none());
-    assert!(app.stats.thumbnail_load_duration.is_none());
-    assert!(app.stats.thumbnail_source.is_none());
+    assert!(app.stats.thumbnail.is_none());
 
     // 3. Verify has_pending_work() is true while loading or resizing
     assert!(app.is_loading);
@@ -1288,7 +1297,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     assert!(app.thumbnail_image.is_some());
     assert!(app.show_thumbnail_only);
     assert!(app.stats.is_prefetch_cache_hit);
-    assert_eq!(app.stats.thumbnail_dimensions, Some((24, 24)));
+    assert_eq!(app.stats.thumbnail.map(|t| t.dimensions), Some((24, 24)));
 }
 
 #[test]

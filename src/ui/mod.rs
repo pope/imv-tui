@@ -41,8 +41,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     // Render active overlay widgets
     if app.palette_mode != PaletteMode::Closed {
         match app.palette_mode {
-            PaletteMode::Prompt => {
-                views::prompt::draw(frame, app, viewport_area);
+            PaletteMode::Prompt(prompt_type) => {
+                views::prompt::draw(frame, app, viewport_area, prompt_type);
             }
             PaletteMode::Info => {
                 views::info_box::draw(frame, app, viewport_area);
@@ -216,19 +216,18 @@ mod tests {
         app.img_height = 600;
 
         let modes = [
-            (PaletteMode::Closed, None),
-            (PaletteMode::Command, None),
-            (PaletteMode::File, None),
-            (PaletteMode::Prompt, Some(PromptType::GoToImage)),
-            (PaletteMode::Info, None),
+            PaletteMode::Closed,
+            PaletteMode::Command,
+            PaletteMode::File,
+            PaletteMode::Prompt(PromptType::GoToImage),
+            PaletteMode::Info,
         ];
 
         let sizes = [(10, 4), (1, 1), (0, 0)];
 
         for &(width, height) in &sizes {
-            for (mode, prompt) in &modes {
+            for mode in &modes {
                 app.palette_mode = *mode;
-                app.prompt_type = *prompt;
                 app.palette_width = width;
                 app.palette_height = height;
 
@@ -245,7 +244,6 @@ mod tests {
 
             // Also verify paused slideshow overlay defensively renders without panics
             app.palette_mode = PaletteMode::Closed;
-            app.prompt_type = None;
             app.slideshow_state = crate::config::SlideshowState::Paused {
                 delay: std::time::Duration::from_secs(5),
             };
