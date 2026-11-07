@@ -12,6 +12,8 @@ pub use decoder::*;
 mod worker;
 pub use worker::*;
 
+pub(crate) mod thumbcache;
+
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 use std::path::PathBuf;

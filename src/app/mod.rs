@@ -290,6 +290,8 @@ impl App {
         let disable_thumbnail = config.disable_thumbnail;
         std::thread::spawn(move || {
             let mut pending_requests = Vec::new();
+            let mut thumb_resizer = fir::Resizer::new();
+            let thumb_cache_root = crate::imaging::thumbcache::default_thumbnail_cache_root();
 
             loop {
                 // If we don't have any pending requests, block until we receive one
@@ -356,6 +358,13 @@ impl App {
                         256 * 1024
                     };
 
+                    let local_path = match &r.source {
+                        ImageSource::Local(p) => Some(p.clone()),
+                        _ => None,
+                    };
+
+                    let mut has_thumbnail = false;
+
                     if !disable_thumbnail {
                         if cancel.is_cancelled() {
                             continue;
@@ -387,11 +396,48 @@ impl App {
                                     decode_duration: thumb_dur,
                                     is_thumbnail: true,
                                 });
+                                has_thumbnail = true;
                             }
                             if partial_bytes.len() < limit {
                                 // If the file was smaller than the limit, we have already loaded it fully
                                 bytes_opt = Some(partial_bytes);
                             }
+                        }
+
+                        // If EXIF thumbnail was not found, check Freedesktop thumbnail cache
+                        if !has_thumbnail
+                            && !cancel.is_cancelled()
+                            && let Some(ref path) = local_path
+                            && let Some(ref cache_root) = thumb_cache_root
+                            && let Some(cached_thumb) =
+                                crate::imaging::thumbcache::load_cached_thumbnail(cache_root, path)
+                        {
+                            let (mut real_w, mut real_h) = image::image_dimensions(path)
+                                .unwrap_or((cached_thumb.width(), cached_thumb.height()));
+                            if cached_thumb.width() != cached_thumb.height()
+                                && (real_w > real_h)
+                                    != (cached_thumb.width() > cached_thumb.height())
+                            {
+                                std::mem::swap(&mut real_w, &mut real_h);
+                            }
+                            let thumb_dur = start.elapsed();
+                            let _ = response_tx.send(LoaderResponse {
+                                idx: r.idx,
+                                result: Ok(DecodedImage {
+                                    image: cached_thumb,
+                                    width: real_w,
+                                    height: real_h,
+                                    format: Some(image::ImageFormat::Png),
+                                    disk_size: 0,
+                                    raw_width: Some(real_w),
+                                    raw_height: Some(real_h),
+                                }),
+                                is_prefetch: r.is_prefetch,
+                                sequence: r.sequence,
+                                decode_duration: thumb_dur,
+                                is_thumbnail: true,
+                            });
+                            has_thumbnail = true;
                         }
                     }
 
@@ -417,6 +463,20 @@ impl App {
                     };
 
                     if !cancel.is_cancelled() {
+                        if let Ok(ref decoded) = res
+                            && !has_thumbnail
+                            && !disable_thumbnail
+                            && let Some(ref path) = local_path
+                            && let Some(ref cache_root) = thumb_cache_root
+                        {
+                            crate::imaging::thumbcache::save_cached_thumbnail(
+                                cache_root,
+                                &mut thumb_resizer,
+                                path,
+                                &decoded.image,
+                            );
+                        }
+
                         let decode_duration = start.elapsed();
                         let _ = response_tx.send(LoaderResponse {
                             idx: r.idx,
