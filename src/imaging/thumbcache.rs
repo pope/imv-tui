@@ -238,7 +238,8 @@ pub fn downscale_for_thumbnail(
             let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x3);
 
             let mut options = fir::ResizeOptions::new();
-            options.algorithm = fir::ResizeAlg::Convolution(fir::FilterType::Mitchell);
+            options.algorithm =
+                crate::imaging::to_fir_resize_alg(crate::imaging::FilterType::Mitchell);
             options.mul_div_alpha = false;
 
             resizer
@@ -262,7 +263,8 @@ pub fn downscale_for_thumbnail(
             let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x4);
 
             let mut options = fir::ResizeOptions::new();
-            options.algorithm = fir::ResizeAlg::Convolution(fir::FilterType::Mitchell);
+            options.algorithm =
+                crate::imaging::to_fir_resize_alg(crate::imaging::FilterType::Mitchell);
             options.mul_div_alpha = true;
 
             resizer

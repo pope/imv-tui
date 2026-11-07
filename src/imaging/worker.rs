@@ -7,6 +7,73 @@ use ratatui_image::protocol::StatefulProtocol;
 use crate::imaging::ResizeRequest;
 use crate::imaging::types::*;
 
+/// Analytical single-sine Lanczos3 filter kernel.
+///
+/// Uses the triple-angle trigonometric identity $\sin(\pi x) = \sin(3\theta) = \sin(\theta)(3 - 4\sin^2\theta)$
+/// where $\theta = \frac{\pi}{3} x$, evaluating only a single sine call per tap instead of two while
+/// remaining mathematically identical to $\text{sinc}(x) \cdot \text{sinc}(x / 3.0)$.
+pub fn fast_lanczos3_kernel(x: f64) -> f64 {
+    if x.abs() < 1e-8 {
+        return 1.0;
+    }
+    if !(-3.0..3.0).contains(&x) {
+        return 0.0;
+    }
+    let theta = (std::f64::consts::PI / 3.0) * x;
+    let s = theta.sin();
+    let s2 = s * s;
+    (s2 * (3.0 - 4.0 * s2)) / (3.0 * theta * theta)
+}
+
+/// Division-free Horner polynomial Mitchell-Netravali ($B = 1/3, C = 1/3$) filter kernel.
+///
+/// Evaluates the cubic piecewise polynomial using Horner's method with compile-time reciprocal constants.
+pub fn fast_mitchell_kernel(mut x: f64) -> f64 {
+    x = x.abs();
+    if x < 1.0 {
+        ((7.0 / 6.0) * x - 2.0) * x * x + (8.0 / 9.0)
+    } else if x < 2.0 {
+        (((-7.0 / 18.0) * x + 2.0) * x - (10.0 / 3.0)) * x + (16.0 / 9.0)
+    } else {
+        0.0
+    }
+}
+
+/// Gaussian ($\sigma = 0.5$) filter kernel with precomputed normalization.
+///
+/// Evaluates $\frac{1}{\sigma \sqrt{2\pi}} e^{-\frac{x^2}{2\sigma^2}}$ with compile-time $\sqrt{\frac{2}{\pi}}$ constant.
+pub fn fast_gaussian_kernel(x: f64) -> f64 {
+    if (-3.0..3.0).contains(&x) {
+        const INV_SQRT_2PI_HALF: f64 = 0.7978845608028654;
+        INV_SQRT_2PI_HALF * (-2.0 * x * x).exp()
+    } else {
+        0.0
+    }
+}
+
+/// Maps `FilterType` to `fir::ResizeAlg`, utilizing optimized custom analytical kernels
+/// for Mitchell, Gaussian, and Lanczos.
+pub fn to_fir_resize_alg(filter_type: FilterType) -> fir::ResizeAlg {
+    match filter_type {
+        FilterType::Nearest => fir::ResizeAlg::Nearest,
+        FilterType::Linear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
+        FilterType::Cubic => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
+        FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
+            fir::Filter::new("Mitchell", fast_mitchell_kernel, 2.0)
+                .expect("Valid custom Mitchell filter"),
+        )),
+        FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
+            fir::Filter::new("Gaussian", fast_gaussian_kernel, 3.0)
+                .expect("Valid custom Gaussian filter"),
+        )),
+        FilterType::Lanczos => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
+            fir::Filter::new("Lanczos3", fast_lanczos3_kernel, 3.0)
+                .expect("Valid custom Lanczos3 filter"),
+        )),
+        FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
+    }
+}
+
 /// Helper resizing function leveraging fast_image_resize for sub-millisecond execution speeds.
 pub fn fast_resize(
     resizer: &mut fir::Resizer,
@@ -18,15 +85,7 @@ pub fn fast_resize(
 ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     use fast_image_resize::images::Image as FirImage;
 
-    let resize_alg = match filter_type {
-        FilterType::Nearest => fir::ResizeAlg::Nearest,
-        FilterType::Linear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
-        FilterType::Cubic => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
-        FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Mitchell),
-        FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Gaussian),
-        FilterType::Lanczos => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
-        FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
-    };
+    let resize_alg = to_fir_resize_alg(filter_type);
 
     let (crop_w, crop_h) = match crop_rect {
         Some((_, _, w, h)) => (w, h),
@@ -335,10 +394,13 @@ pub fn clamp_anti_ringing_rgba(
     src: &image::RgbaImage,
     crop_rect: Option<(f64, f64, f64, f64)>,
 ) {
-    clamp_anti_ringing_impl(dst, src.width(), src.height(), crop_rect, |x, y| {
-        let p = src.get_pixel(x, y).0;
-        [p[0], p[1], p[2]]
-    });
+    clamp_anti_ringing_span_cached::<4>(
+        dst,
+        src.as_raw().as_chunks::<4>().0,
+        src.width(),
+        src.height(),
+        crop_rect,
+    );
 }
 
 /// Clamps destination pixel colors to the min/max bounding envelope of the corresponding
@@ -348,20 +410,22 @@ pub fn clamp_anti_ringing_rgb(
     src: &image::RgbImage,
     crop_rect: Option<(f64, f64, f64, f64)>,
 ) {
-    clamp_anti_ringing_impl(dst, src.width(), src.height(), crop_rect, |x, y| {
-        src.get_pixel(x, y).0
-    });
+    clamp_anti_ringing_span_cached::<3>(
+        dst,
+        src.as_raw().as_chunks::<3>().0,
+        src.width(),
+        src.height(),
+        crop_rect,
+    );
 }
 
-fn clamp_anti_ringing_impl<F>(
+fn clamp_anti_ringing_span_cached<const N: usize>(
     dst: &mut image::RgbaImage,
+    src_pixels: &[[u8; N]],
     src_w: u32,
     src_h: u32,
     crop_rect: Option<(f64, f64, f64, f64)>,
-    get_pixel: F,
-) where
-    F: Fn(u32, u32) -> [u8; 3],
-{
+) {
     let dst_w = dst.width();
     let dst_h = dst.height();
 
@@ -378,28 +442,52 @@ fn clamp_anti_ringing_impl<F>(
         return;
     }
 
-    for y in 0..dst_h {
+    // Pre-tabulate 1D horizontal source bounds for each destination x coordinate
+    let mut x_bounds = Vec::with_capacity(dst_w as usize);
+    for x in 0..dst_w {
+        let src_x_f = crop_left + (x as f64 + 0.5) * scale_x - 0.5;
+        let x0 = (src_x_f.floor() as i64).clamp(0, src_w as i64 - 1) as usize;
+        let x1 = (x0 + 1).min(src_w as usize - 1);
+        x_bounds.push((x0, x1));
+    }
+
+    let src_w_usize = src_w as usize;
+    let dst_pixels = dst.as_mut().as_chunks_mut::<4>().0;
+
+    // Process rows with horizontal span caching
+    for (y, dst_row) in dst_pixels.chunks_exact_mut(dst_w as usize).enumerate() {
         let src_y_f = crop_top + (y as f64 + 0.5) * scale_y - 0.5;
-        let y0 = (src_y_f.floor() as i64).clamp(0, src_h as i64 - 1) as u32;
-        let y1 = (y0 + 1).min(src_h - 1);
+        let y0 = (src_y_f.floor() as i64).clamp(0, src_h as i64 - 1) as usize;
+        let y1 = (y0 + 1).min(src_h as usize - 1);
 
-        for x in 0..dst_w {
-            let src_x_f = crop_left + (x as f64 + 0.5) * scale_x - 0.5;
-            let x0 = (src_x_f.floor() as i64).clamp(0, src_w as i64 - 1) as u32;
-            let x1 = (x0 + 1).min(src_w - 1);
+        let row0 = &src_pixels[y0 * src_w_usize..(y0 + 1) * src_w_usize];
+        let row1 = &src_pixels[y1 * src_w_usize..(y1 + 1) * src_w_usize];
 
-            let p00 = get_pixel(x0, y0);
-            let p10 = get_pixel(x1, y0);
-            let p01 = get_pixel(x0, y1);
-            let p11 = get_pixel(x1, y1);
+        let mut prev_x0 = usize::MAX;
+        let mut min_rgb = [0u8; 3];
+        let mut max_rgb = [0u8; 3];
 
-            let dst_pixel = dst.get_pixel_mut(x, y);
+        for (dst_pixel, &(x0, x1)) in dst_row.iter_mut().zip(&x_bounds) {
+            if x0 != prev_x0 {
+                prev_x0 = x0;
+                let p00 = row0[x0];
+                let p10 = row0[x1];
+                let p01 = row1[x0];
+                let p11 = row1[x1];
 
-            for c in 0..3 {
-                let min_c = p00[c].min(p10[c]).min(p01[c]).min(p11[c]);
-                let max_c = p00[c].max(p10[c]).max(p01[c]).max(p11[c]);
-                dst_pixel.0[c] = dst_pixel.0[c].clamp(min_c, max_c);
+                min_rgb[0] = p00[0].min(p10[0]).min(p01[0]).min(p11[0]);
+                max_rgb[0] = p00[0].max(p10[0]).max(p01[0]).max(p11[0]);
+
+                min_rgb[1] = p00[1].min(p10[1]).min(p01[1]).min(p11[1]);
+                max_rgb[1] = p00[1].max(p10[1]).max(p01[1]).max(p11[1]);
+
+                min_rgb[2] = p00[2].min(p10[2]).min(p01[2]).min(p11[2]);
+                max_rgb[2] = p00[2].max(p10[2]).max(p01[2]).max(p11[2]);
             }
+
+            dst_pixel[0] = dst_pixel[0].clamp(min_rgb[0], max_rgb[0]);
+            dst_pixel[1] = dst_pixel[1].clamp(min_rgb[1], max_rgb[1]);
+            dst_pixel[2] = dst_pixel[2].clamp(min_rgb[2], max_rgb[2]);
         }
     }
 }
@@ -764,6 +852,155 @@ mod tests {
             dst_rgb_clamped.get_pixel(0, 0),
             &image::Rgba([0, 0, 0, 255])
         );
+
+        // 4. Test equivalence between clamp_anti_ringing_rgba and clamp_anti_ringing_rgb
+        // across multi-pixel magnified spans and cropped sub-regions.
+        let mut src_rgba_span = image::RgbaImage::new(10, 10);
+        let mut src_rgb_span = image::RgbImage::new(10, 10);
+        for y in 0..10 {
+            for x in 0..10 {
+                let r = ((x * 25) % 256) as u8;
+                let g = ((y * 25) % 256) as u8;
+                let b = (((x + y) * 20) % 256) as u8;
+                src_rgba_span.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+                src_rgb_span.put_pixel(x, y, image::Rgb([r, g, b]));
+            }
+        }
+
+        // 4a. Full image 5x magnification (50x50 target) with synthetic ringing
+        let mut dst_rgba_span = image::RgbaImage::new(50, 50);
+        let mut dst_rgb_span = image::RgbaImage::new(50, 50);
+        for y in 0..50 {
+            for x in 0..50 {
+                let val = ((x + y * 2) % 256) as u8;
+                dst_rgba_span.put_pixel(x, y, image::Rgba([val, val, val, 255]));
+                dst_rgb_span.put_pixel(x, y, image::Rgba([val, val, val, 255]));
+            }
+        }
+
+        clamp_anti_ringing_rgba(&mut dst_rgba_span, &src_rgba_span, None);
+        clamp_anti_ringing_rgb(&mut dst_rgb_span, &src_rgb_span, None);
+        assert_eq!(dst_rgba_span, dst_rgb_span);
+
+        // 4b. Cropped sub-region (2.0, 2.0, 4.0, 4.0)
+        let crop = Some((2.0, 2.0, 4.0, 4.0));
+        let mut dst_rgba_crop = image::RgbaImage::new(40, 40);
+        let mut dst_rgb_crop = image::RgbaImage::new(40, 40);
+        for y in 0..40 {
+            for x in 0..40 {
+                let val = ((x * 3 + y) % 256) as u8;
+                dst_rgba_crop.put_pixel(x, y, image::Rgba([val, val, val, 255]));
+                dst_rgb_crop.put_pixel(x, y, image::Rgba([val, val, val, 255]));
+            }
+        }
+
+        clamp_anti_ringing_rgba(&mut dst_rgba_crop, &src_rgba_span, crop);
+        clamp_anti_ringing_rgb(&mut dst_rgb_crop, &src_rgb_span, crop);
+        assert_eq!(dst_rgba_crop, dst_rgb_crop);
+    }
+
+    #[test]
+    fn test_custom_filter_kernels_mathematical_fidelity() {
+        // 1. Lanczos3 reference sinc(x) * sinc(x / 3.0)
+        fn sinc(x: f64) -> f64 {
+            if x == 0.0 {
+                1.0
+            } else {
+                let px = std::f64::consts::PI * x;
+                px.sin() / px
+            }
+        }
+        fn ref_lanczos3(x: f64) -> f64 {
+            if (-3.0..3.0).contains(&x) {
+                sinc(x) * sinc(x / 3.0)
+            } else {
+                0.0
+            }
+        }
+
+        assert_eq!(fast_lanczos3_kernel(0.0), 1.0);
+        assert_eq!(fast_lanczos3_kernel(3.0), 0.0);
+        assert_eq!(fast_lanczos3_kernel(3.5), 0.0);
+        assert_eq!(fast_lanczos3_kernel(-4.2), 0.0);
+
+        // Sample points in (-3.0, 3.0)
+        for i in -2999..=2999 {
+            let x = i as f64 / 1000.0;
+            let expected = ref_lanczos3(x);
+            let actual = fast_lanczos3_kernel(x);
+            assert!(
+                (actual - expected).abs() < 1e-14,
+                "Lanczos3 mismatch at x = {}: actual = {}, expected = {}",
+                x,
+                actual,
+                expected
+            );
+        }
+
+        // Sample points outside [-3.0, 3.0]
+        for i in [31, 35, 40, 50, -31, -35, -40, -50] {
+            let x = i as f64 / 10.0;
+            assert_eq!(fast_lanczos3_kernel(x), 0.0);
+            assert_eq!(ref_lanczos3(x), 0.0);
+        }
+
+        // 2. Mitchell-Netravali reference formula (B = 1/3, C = 1/3)
+        fn ref_mitchell(x: f64) -> f64 {
+            let x = x.abs();
+            let b = 1.0 / 3.0;
+            let c = 1.0 / 3.0;
+            if x < 1.0 {
+                (1.0 / 6.0)
+                    * ((12.0 - 9.0 * b - 6.0 * c) * x.powi(3)
+                        + (-18.0 + 12.0 * b + 6.0 * c) * x.powi(2)
+                        + (6.0 - 2.0 * b))
+            } else if x < 2.0 {
+                (1.0 / 6.0)
+                    * ((-b - 6.0 * c) * x.powi(3)
+                        + (6.0 * b + 30.0 * c) * x.powi(2)
+                        + (-12.0 * b - 48.0 * c) * x
+                        + (8.0 * b + 24.0 * c))
+            } else {
+                0.0
+            }
+        }
+
+        for i in 0..=2500 {
+            let x = i as f64 / 1000.0;
+            let expected = ref_mitchell(x);
+            let actual = fast_mitchell_kernel(x);
+            assert!(
+                (actual - expected).abs() < 1e-14,
+                "Mitchell mismatch at x = {}: actual = {}, expected = {}",
+                x,
+                actual,
+                expected
+            );
+        }
+
+        // 3. Gaussian reference formula (sigma = 0.5)
+        fn ref_gaussian(x: f64) -> f64 {
+            if (-3.0..3.0).contains(&x) {
+                let sigma = 0.5;
+                (1.0 / (sigma * (2.0 * std::f64::consts::PI).sqrt()))
+                    * (-0.5 * (x / sigma).powi(2)).exp()
+            } else {
+                0.0
+            }
+        }
+
+        for i in -3500..=3500 {
+            let x = i as f64 / 1000.0;
+            let expected = ref_gaussian(x);
+            let actual = fast_gaussian_kernel(x);
+            assert!(
+                (actual - expected).abs() < 1e-14,
+                "Gaussian mismatch at x = {}: actual = {}, expected = {}",
+                x,
+                actual,
+                expected
+            );
+        }
     }
 
     #[test]
