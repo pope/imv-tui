@@ -48,8 +48,24 @@ pub fn fast_resize(
     resizer.resize(rgba_src, &mut dst_image, Some(&options))?;
 
     let buffer = dst_image.into_vec();
-    let rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
+    let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
         .ok_or("Failed to construct RgbaImage from resized buffer")?;
+
+    let (crop_w, crop_h) = match crop_rect {
+        Some((_, _, w, h)) => (w, h),
+        None => (src_img.width() as f64, src_img.height() as f64),
+    };
+    let is_magnified = dst_w as f64 >= crop_w && dst_h as f64 >= crop_h;
+
+    if is_magnified
+        && matches!(
+            filter_type,
+            FilterType::Lanczos | FilterType::Mitchell | FilterType::Cubic
+        )
+    {
+        clamp_anti_ringing_rgba(&mut rgba_dst, rgba_src, crop_rect);
+    }
+
     Ok(DynamicImage::ImageRgba8(rgba_dst))
 }
 
@@ -192,10 +208,10 @@ pub(crate) fn render_resize_canvas(
 
     if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
         if !req.brightness.is_zero() {
-            image::imageops::colorops::brighten_in_place(rgba_canvas, req.brightness.value());
+            apply_brightness_simd(rgba_canvas.as_mut(), req.brightness.value());
         }
         if !req.contrast.is_zero() {
-            image::imageops::colorops::contrast_in_place(rgba_canvas, req.contrast.value());
+            apply_contrast_lut(rgba_canvas.as_mut(), req.contrast.value());
         }
     }
 
@@ -217,6 +233,123 @@ pub fn process_resize(
     let protocol_duration = start_protocol.elapsed();
 
     (protocol, process_duration, protocol_duration)
+}
+
+/// Applies brightness adjustment to RGBA pixel buffer in-place while strictly preserving the Alpha channel.
+pub(crate) fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
+    if value == 0 {
+        return;
+    }
+    if value > 0 {
+        let delta = value.min(255) as u8;
+        for chunk in pixels.as_chunks_mut::<4>().0 {
+            chunk[0] = chunk[0].saturating_add(delta);
+            chunk[1] = chunk[1].saturating_add(delta);
+            chunk[2] = chunk[2].saturating_add(delta);
+        }
+    } else {
+        let delta = (-value).min(255) as u8;
+        for chunk in pixels.as_chunks_mut::<4>().0 {
+            chunk[0] = chunk[0].saturating_sub(delta);
+            chunk[1] = chunk[1].saturating_sub(delta);
+            chunk[2] = chunk[2].saturating_sub(delta);
+        }
+    }
+}
+
+/// Numerically stable continuous rational highlight soft-knee curve from `peng`.
+///
+/// Smoothly compresses highlight values above `knee = 0.75` towards an asymptote of `1.0`,
+/// preventing harsh clipping transitions while ensuring $C^1$ continuity and complete
+/// numerical stability (free of NaN, Inf, or overflow even for extreme inputs).
+#[inline]
+pub(crate) fn soft_knee_highlight(x: f32) -> f32 {
+    let knee = 0.75f32;
+    let w = 0.25f32;
+    if x <= knee {
+        x.max(0.0)
+    } else {
+        let excess = x - knee;
+        knee + (w * excess) / (excess + w)
+    }
+}
+
+/// Applies contrast adjustment to an RGBA pixel buffer using a 256-byte stack LUT incorporating
+/// `peng`'s photometric contrast curve and soft-knee shoulder compression while preserving Alpha.
+pub(crate) fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
+    if contrast == 0.0 {
+        return;
+    }
+
+    let factor = ((100.0 + contrast) / 100.0).max(0.0);
+    let factor = factor * factor;
+
+    let mut lut = [0u8; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let normalized = i as f32 / 255.0;
+        let mut val = (normalized - 0.5) * factor + 0.5;
+        if contrast > 0.0 {
+            val = soft_knee_highlight(val);
+        }
+        *slot = (val.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+
+    for chunk in pixels.as_chunks_mut::<4>().0 {
+        chunk[0] = lut[chunk[0] as usize];
+        chunk[1] = lut[chunk[1] as usize];
+        chunk[2] = lut[chunk[2] as usize];
+    }
+}
+
+/// Clamps destination pixel colors to the min/max bounding envelope of the corresponding
+/// 2x2 source texel neighborhood to eliminate Gibbs ringing/overshoot artifacts from lobed filters.
+pub(crate) fn clamp_anti_ringing_rgba(
+    dst: &mut image::RgbaImage,
+    src: &image::RgbaImage,
+    crop_rect: Option<(f64, f64, f64, f64)>,
+) {
+    let dst_w = dst.width();
+    let dst_h = dst.height();
+    let src_w = src.width();
+    let src_h = src.height();
+
+    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+        return;
+    }
+
+    let (crop_left, crop_top, crop_w, crop_h) =
+        crop_rect.unwrap_or((0.0, 0.0, src_w as f64, src_h as f64));
+    let scale_x = crop_w / dst_w as f64;
+    let scale_y = crop_h / dst_h as f64;
+
+    if scale_x > 1.0 || scale_y > 1.0 {
+        return;
+    }
+
+    for y in 0..dst_h {
+        let src_y_f = crop_top + (y as f64 + 0.5) * scale_y - 0.5;
+        let y0 = (src_y_f.floor() as i64).clamp(0, src_h as i64 - 1) as u32;
+        let y1 = (y0 + 1).min(src_h - 1);
+
+        for x in 0..dst_w {
+            let src_x_f = crop_left + (x as f64 + 0.5) * scale_x - 0.5;
+            let x0 = (src_x_f.floor() as i64).clamp(0, src_w as i64 - 1) as u32;
+            let x1 = (x0 + 1).min(src_w - 1);
+
+            let p00 = src.get_pixel(x0, y0).0;
+            let p10 = src.get_pixel(x1, y0).0;
+            let p01 = src.get_pixel(x0, y1).0;
+            let p11 = src.get_pixel(x1, y1).0;
+
+            let dst_pixel = dst.get_pixel_mut(x, y);
+
+            for c in 0..3 {
+                let min_c = p00[c].min(p10[c]).min(p01[c]).min(p11[c]);
+                let max_c = p00[c].max(p10[c]).max(p01[c]).max(p11[c]);
+                dst_pixel.0[c] = dst_pixel.0[c].clamp(min_c, max_c);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -465,5 +598,92 @@ mod tests {
         );
         assert!(px_neg[3] > 0);
         let (_proto, _proc_dur, _proto_dur) = process_resize(req_neg, &mut resizer);
+    }
+
+    #[test]
+    fn test_brightness_simd_and_contrast_lut_preserve_alpha() {
+        let mut pixels = vec![
+            100, 100, 100, 0, // fully transparent
+            100, 100, 100, 128, // semi-transparent
+            100, 100, 100, 255, // opaque
+        ];
+
+        // 1. Positive and negative brightness
+        apply_brightness_simd(&mut pixels, 50);
+        assert_eq!(pixels[0..3], [150, 150, 150]);
+        assert_eq!(pixels[3], 0);
+        assert_eq!(pixels[4..7], [150, 150, 150]);
+        assert_eq!(pixels[7], 128);
+        assert_eq!(pixels[8..11], [150, 150, 150]);
+        assert_eq!(pixels[11], 255);
+
+        apply_brightness_simd(&mut pixels, -100);
+        assert_eq!(pixels[0..3], [50, 50, 50]);
+        assert_eq!(pixels[3], 0);
+        assert_eq!(pixels[4..7], [50, 50, 50]);
+        assert_eq!(pixels[7], 128);
+        assert_eq!(pixels[8..11], [50, 50, 50]);
+        assert_eq!(pixels[11], 255);
+
+        // 2. Contrast LUT
+        apply_contrast_lut(&mut pixels, 25.0);
+        assert_eq!(pixels[3], 0);
+        assert_eq!(pixels[7], 128);
+        assert_eq!(pixels[11], 255);
+    }
+
+    #[test]
+    fn test_soft_knee_highlight_continuity_and_stability() {
+        assert_eq!(soft_knee_highlight(0.75), 0.75);
+
+        let eps = 1e-4;
+        let slope_left = (soft_knee_highlight(0.75) - soft_knee_highlight(0.75 - eps)) / eps;
+        let slope_right = (soft_knee_highlight(0.75 + eps) - soft_knee_highlight(0.75)) / eps;
+        assert!((slope_left - 1.0).abs() < 1e-3);
+        assert!((slope_right - 1.0).abs() < 1e-3);
+
+        let mut prev = soft_knee_highlight(0.75);
+        for i in 1..=50 {
+            let x = 0.75 + i as f32 * 0.1;
+            let y = soft_knee_highlight(x);
+            assert!(y > prev, "Monotonicity violated at x = {}", x);
+            assert!(y < 1.0, "Should approach 1.0 asymptotically, got {}", y);
+            prev = y;
+        }
+
+        let extreme = soft_knee_highlight(1e20);
+        assert!(!extreme.is_nan());
+        assert!(!extreme.is_infinite());
+        assert!((extreme - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_anti_ringing_clamp_eliminates_overshoot() {
+        // 4x2 source: columns 0 and 1 black, columns 2 and 3 white
+        let mut src = image::RgbaImage::new(4, 2);
+        for y in 0..2 {
+            src.put_pixel(0, y, image::Rgba([0, 0, 0, 255]));
+            src.put_pixel(1, y, image::Rgba([0, 0, 0, 255]));
+            src.put_pixel(2, y, image::Rgba([255, 255, 255, 255]));
+            src.put_pixel(3, y, image::Rgba([255, 255, 255, 255]));
+        }
+
+        // 1. Upscaled target (8x4 >= 4x2) with ringing overshoot at (0, 0)
+        let mut dst_up = image::RgbaImage::new(8, 4);
+        dst_up.put_pixel(0, 0, image::Rgba([75, 75, 75, 255]));
+
+        clamp_anti_ringing_rgba(&mut dst_up, &src, None);
+
+        // Pixel (0, 0) maps to local texels which are all 0, so overshoot clamped to 0
+        assert_eq!(dst_up.get_pixel(0, 0), &image::Rgba([0, 0, 0, 255]));
+
+        // 2. Downscaled target (2x1 < 4x2): should be a no-op to preserve anti-aliased averages
+        let mut dst_down = image::RgbaImage::new(2, 1);
+        dst_down.put_pixel(0, 0, image::Rgba([75, 75, 75, 255]));
+
+        clamp_anti_ringing_rgba(&mut dst_down, &src, None);
+
+        // Clamping must not modify downscaled images
+        assert_eq!(dst_down.get_pixel(0, 0), &image::Rgba([75, 75, 75, 255]));
     }
 }
