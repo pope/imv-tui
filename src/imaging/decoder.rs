@@ -1177,4 +1177,80 @@ mod tests {
         assert_eq!(decoded.width, 20);
         assert_eq!(decoded.height, 10);
     }
+
+    #[test]
+    fn test_raw_strip_offsets_and_sof3_lossless_rejection() {
+        // 1. Test is_decodable_jpeg
+        assert!(!is_decodable_jpeg(&[]));
+        assert!(!is_decodable_jpeg(b"PNG\r\n\x1a\n"));
+        assert!(!is_decodable_jpeg(&[0xFF, 0xD8, 0x00, 0x00]));
+
+        // Baseline SOF0 (0xFF, 0xC0)
+        let mut baseline_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        baseline_jpeg.extend_from_slice(&[0; 14]);
+        baseline_jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x0A, 0x00, 0x0A]);
+        assert!(is_decodable_jpeg(&baseline_jpeg));
+
+        // Progressive SOF2 (0xFF, 0xC2)
+        let mut prog_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        prog_jpeg.extend_from_slice(&[0; 14]);
+        prog_jpeg.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x11, 0x08, 0x00, 0x0A, 0x00, 0x0A]);
+        assert!(is_decodable_jpeg(&prog_jpeg));
+
+        // Lossless SOF3 (0xFF, 0xC3) -> must be rejected!
+        let mut lossless_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        lossless_jpeg.extend_from_slice(&[0; 14]);
+        lossless_jpeg.extend_from_slice(&[0xFF, 0xC3, 0x00, 0x11, 0x08, 0x00, 0x0A, 0x00, 0x0A]);
+        assert!(!is_decodable_jpeg(&lossless_jpeg));
+
+        // 2. Synthetic TIFF container with two candidates:
+        // Candidate 1: larger (500 bytes) SOF3 lossless stream via JPEGInterchangeFormat
+        // Candidate 2: smaller (200 bytes) SOF0 baseline stream via StripOffsets / StripByteCounts
+        let mut container = vec![0u8; 1024];
+        // TIFF header: II*\0, offset to IFD0 = 8
+        container[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        // IFD0 count: 4 tags
+        container[8..10].copy_from_slice(&[0x04, 0x00]);
+        // Tag 1: JPEGInterchangeFormat (0x0201), Type 4 (LONG), Count 1, Value = 100
+        container[10..22].copy_from_slice(&[
+            0x01, 0x02, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 100, 0x00, 0x00, 0x00,
+        ]);
+        // Tag 2: JPEGInterchangeFormatLength (0x0202), Type 4 (LONG), Count 1, Value = 500
+        container[22..34].copy_from_slice(&[
+            0x02, 0x02, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF4, 0x01, 0x00, 0x00,
+        ]);
+        // Tag 3: StripOffsets (0x0111), Type 4 (LONG), Count 1, Value = 700
+        container[34..46].copy_from_slice(&[
+            0x11, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0xBC, 0x02, 0x00, 0x00,
+        ]);
+        // Tag 4: StripByteCounts (0x0117), Type 4 (LONG), Count 1, Value = 200
+        container[46..58].copy_from_slice(&[
+            0x17, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 200, 0x00, 0x00, 0x00,
+        ]);
+        // Next IFD: 0
+        container[58..62].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        // Place SOF3 lossless payload at offset 100..600 (500 bytes)
+        container[100..100 + lossless_jpeg.len()].copy_from_slice(&lossless_jpeg);
+
+        // Place SOF0 baseline payload at offset 700..900 (200 bytes)
+        container[700..700 + baseline_jpeg.len()].copy_from_slice(&baseline_jpeg);
+
+        // extract_jpeg_preview sorts descending by length: tries 500-byte SOF3 first, rejects it,
+        // and returns the 200-byte SOF0 baseline JPEG preview!
+        let extracted_preview = extract_jpeg_preview(&container)
+            .expect("extract_jpeg_preview must skip SOF3 and extract SOF0 preview");
+        assert_eq!(extracted_preview.len(), 200);
+        assert_eq!(
+            &extracted_preview[..baseline_jpeg.len()],
+            &baseline_jpeg[..]
+        );
+
+        // Also test read_raw_preview_bytes_with_header on synthetic ImageSource
+        let source = ImageSource::Local(PathBuf::from("mock.dng"));
+        let extracted_source = read_raw_preview_bytes_with_header(&source, &container)
+            .expect("read_raw_preview_bytes_with_header must extract in-memory SOF0 preview");
+        assert_eq!(extracted_source.len(), 200);
+        assert_eq!(&extracted_source[..baseline_jpeg.len()], &baseline_jpeg[..]);
+    }
 }

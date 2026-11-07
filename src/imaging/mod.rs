@@ -416,10 +416,10 @@ mod tests {
         raf_bytes[88..92].copy_from_slice(&length);
 
         // Write mock JPEG bytes
-        raf_bytes[92..96].copy_from_slice(b"JPEG");
+        raf_bytes[92..96].copy_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0]);
 
         let extracted = extract_jpeg_thumbnail(&raf_bytes).unwrap();
-        assert_eq!(extracted, b"JPEG");
+        assert_eq!(extracted, &[0xFF, 0xD8, 0xFF, 0xE0]);
     }
 
     #[test]

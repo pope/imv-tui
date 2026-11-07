@@ -218,6 +218,129 @@ pub fn read_source_range(
     }
 }
 
+/// Returns `true` if `bytes` begins with a valid JPEG SOI header and contains a standard
+/// baseline/extended/progressive DCT frame (`SOF0`..=`SOF2`), rejecting lossless JPEG (`SOF3`)
+/// raw sensor streams that standard JPEG decoders cannot decode.
+pub fn is_decodable_jpeg(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
+        return false;
+    }
+    let mut i = 2;
+    let limit = bytes.len().min(64 * 1024);
+    while i + 1 < limit {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        while i < limit && bytes[i] == 0xFF {
+            i += 1;
+        }
+        if i >= limit {
+            break;
+        }
+        let marker = bytes[i];
+        i += 1;
+        match marker {
+            // Baseline (SOF0), Extended Sequential (SOF1), Progressive (SOF2) DCT
+            0xC0..=0xC2 => return true,
+            // Lossless JPEG (SOF3) and differential/arithmetic lossless variants -> reject!
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return false,
+            // SOS (Start of Scan) or EOI (End of Image)
+            0xDA | 0xD9 => break,
+            // Standalone markers without length payload
+            0x00 | 0x01 | 0xD0..=0xD8 => continue,
+            _ => {
+                if i + 2 > limit {
+                    break;
+                }
+                let seg_len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+                if seg_len < 2 {
+                    return false;
+                }
+                i = i.saturating_add(seg_len);
+            }
+        }
+    }
+    // If the slice was truncated before reaching SOF, accept if it has a valid SOI and no SOF3 was seen
+    true
+}
+
+fn extract_tag_pair(
+    exif: &exif::Exif,
+    tag_off: exif::Tag,
+    tag_len: exif::Tag,
+    ifd: exif::In,
+) -> Option<(u64, u64)> {
+    let f_off = exif.get_field(tag_off, ifd)?;
+    let f_len = exif.get_field(tag_len, ifd)?;
+
+    let off = match f_off.value {
+        exif::Value::Long(ref v) => v.first().copied(),
+        exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+        _ => None,
+    }?;
+    let len = match f_len.value {
+        exif::Value::Long(ref v) => v.first().copied(),
+        exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
+        _ => None,
+    }?;
+
+    if len > 0 {
+        Some((off as u64, len as u64))
+    } else {
+        None
+    }
+}
+
+/// Collects byte offset and length pairs of all embedded JPEG stream candidates
+/// (`JPEGInterchangeFormat` or JPEG-compressed `StripOffsets`) across all IFDs in `exif`.
+pub fn collect_exif_jpeg_candidates(exif: &exif::Exif) -> Vec<(u64, u64)> {
+    let mut ifds: Vec<exif::In> = vec![exif::In::PRIMARY, exif::In::THUMBNAIL];
+    for f in exif.fields() {
+        if !ifds.contains(&f.ifd_num) {
+            ifds.push(f.ifd_num);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for ifd in ifds {
+        // 1. JPEGInterchangeFormat / JPEGInterchangeFormatLength
+        if let Some(pair) = extract_tag_pair(
+            exif,
+            exif::Tag::JPEGInterchangeFormat,
+            exif::Tag::JPEGInterchangeFormatLength,
+            ifd,
+        ) {
+            candidates.push(pair);
+        }
+
+        // 2. StripOffsets / StripByteCounts when Compression is absent or 6/7 (JPEG)
+        let is_jpeg_compression = match exif.get_field(exif::Tag::Compression, ifd) {
+            Some(f) => match f.value {
+                exif::Value::Short(ref v) => v.first().copied().is_some_and(|c| c == 6 || c == 7),
+                exif::Value::Long(ref v) => v.first().copied().is_some_and(|c| c == 6 || c == 7),
+                _ => false,
+            },
+            None => true,
+        };
+
+        if is_jpeg_compression
+            && let Some(pair) = extract_tag_pair(
+                exif,
+                exif::Tag::StripOffsets,
+                exif::Tag::StripByteCounts,
+                ifd,
+            )
+        {
+            candidates.push(pair);
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
 /// Extracts embedded JPEG preview from RAW header bytes, reading remaining bytes via `read_source_range` if necessary.
 pub fn read_raw_preview_bytes_with_header(
     source: &ImageSource,
@@ -229,68 +352,28 @@ pub fn read_raw_preview_bytes_with_header(
         }
         let offset = u32::from_be_bytes(header_bytes[84..88].try_into().ok()?) as u64;
         let length = u32::from_be_bytes(header_bytes[88..92].try_into().ok()?) as u64;
-        return read_source_range(source, offset, length).ok();
+
+        if let Some(end) = offset.checked_add(length)
+            && end as usize <= header_bytes.len()
+        {
+            let candidate = &header_bytes[offset as usize..end as usize];
+            if is_decodable_jpeg(candidate) {
+                return Some(candidate.to_vec());
+            }
+        }
+        let buf = read_source_range(source, offset, length).ok()?;
+        if is_decodable_jpeg(&buf) {
+            return Some(buf);
+        }
+        return None;
     }
 
     let exif = parse_tolerant_exif(header_bytes)?;
-
-    let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
-    let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
-
-    let thumb_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL);
-    let thumb_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL);
-
-    let mut best_offset = None;
-    let mut best_length = 0;
-
-    if let Some(f_off) = primary_offset
-        && let Some(f_len) = primary_length
-    {
-        let off = match f_off.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        let len = match f_len.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        if let Some(off) = off
-            && let Some(len) = len
-        {
-            best_offset = Some(off as u64);
-            best_length = len as u64;
-        }
-    }
-
-    if let Some(f_off) = thumb_offset
-        && let Some(f_len) = thumb_length
-    {
-        let off = match f_off.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        let len = match f_len.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        if let Some(off) = off
-            && let Some(len) = len
-            && len as u64 > best_length
-        {
-            best_offset = Some(off as u64);
-            best_length = len as u64;
-        }
-    }
-
-    let offset = best_offset?;
-    let length = best_length;
+    let mut candidates = collect_exif_jpeg_candidates(&exif);
+    // Sort by length descending (largest first)
+    candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
 
     let is_tiff = is_tiff_header(header_bytes);
-
     let tiff_start = if is_tiff {
         0
     } else {
@@ -300,8 +383,38 @@ pub fn read_raw_preview_bytes_with_header(
             + 6
     };
 
-    let start = tiff_start.checked_add(offset)?;
-    read_source_range(source, start, length).ok()
+    for (offset, length) in candidates {
+        let Some(start) = tiff_start.checked_add(offset) else {
+            continue;
+        };
+
+        // In-memory fast path: if the candidate is fully within header_bytes
+        if let Some(end) = start.checked_add(length)
+            && (end as usize) <= header_bytes.len()
+        {
+            let candidate = &header_bytes[start as usize..end as usize];
+            if is_decodable_jpeg(candidate) {
+                return Some(candidate.to_vec());
+            }
+            continue;
+        }
+
+        // If start is within header_bytes and doesn't even look like a decodable JPEG header, skip reading from disk!
+        if (start as usize) < header_bytes.len()
+            && !is_decodable_jpeg(&header_bytes[start as usize..])
+        {
+            continue;
+        }
+
+        // Otherwise, read from source
+        if let Ok(buf) = read_source_range(source, start, length)
+            && is_decodable_jpeg(&buf)
+        {
+            return Some(buf);
+        }
+    }
+
+    None
 }
 
 /// Helper to read raw preview JPEG bytes.
@@ -391,81 +504,37 @@ pub fn extract_jpeg_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
         let length = u32::from_be_bytes(bytes[88..92].try_into().ok()?) as usize;
         let end = offset.checked_add(length)?;
         if end <= bytes.len() {
-            return Some(bytes[offset..end].to_vec());
+            let candidate = &bytes[offset..end];
+            if is_decodable_jpeg(candidate) {
+                return Some(candidate.to_vec());
+            }
         }
         return None;
     }
 
     // 2. Parse standard TIFF/EXIF structures for other formats
     let exif = parse_tolerant_exif(bytes)?;
-
-    let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
-    let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
-
-    let thumb_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL);
-    let thumb_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL);
-
-    let mut candidates = Vec::new();
-
-    if let Some(f_off) = primary_offset
-        && let Some(f_len) = primary_length
-    {
-        let off = match f_off.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        let len = match f_len.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        if let Some(off) = off
-            && let Some(len) = len
-        {
-            candidates.push((off as usize, len as usize));
-        }
-    }
-
-    if let Some(f_off) = thumb_offset
-        && let Some(f_len) = thumb_length
-    {
-        let off = match f_off.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        let len = match f_len.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        if let Some(off) = off
-            && let Some(len) = len
-        {
-            candidates.push((off as usize, len as usize));
-        }
-    }
-
+    let mut candidates = collect_exif_jpeg_candidates(&exif);
     // Sort by length ascending (smallest first)
     candidates.sort_by_key(|&(_, len)| len);
 
-    // TIFF magic headers: II*\0 or MM\0*
     let is_tiff = is_tiff_header(bytes);
-
     let tiff_start = if is_tiff {
         0
     } else {
-        bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6
+        (bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6) as u64
     };
 
-    // Pick the smallest candidate that fits within the provided bytes slice
+    // Pick the first candidate within bytes where is_decodable_jpeg is true
     for (offset, length) in candidates {
         if let Some(start) = tiff_start.checked_add(offset)
             && let Some(end) = start.checked_add(length)
-            && end <= bytes.len()
+            && (end as usize) <= bytes.len()
         {
-            return Some(bytes[start..end].to_vec());
+            let candidate = &bytes[start as usize..end as usize];
+            if is_decodable_jpeg(candidate) {
+                return Some(candidate.to_vec());
+            }
         }
     }
 
@@ -483,86 +552,41 @@ pub fn extract_jpeg_preview(bytes: &[u8]) -> Option<Vec<u8>> {
         let length = u32::from_be_bytes(bytes[88..92].try_into().ok()?) as usize;
         let end = offset.checked_add(length)?;
         if end <= bytes.len() {
-            return Some(bytes[offset..end].to_vec());
+            let candidate = &bytes[offset..end];
+            if is_decodable_jpeg(candidate) {
+                return Some(candidate.to_vec());
+            }
         }
         return None;
     }
 
     // 2. Parse standard TIFF/EXIF structures for other formats
     let exif = parse_tolerant_exif(bytes)?;
+    let mut candidates = collect_exif_jpeg_candidates(&exif);
+    // Sort by length descending (largest first)
+    candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
 
-    let primary_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::PRIMARY);
-    let primary_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::PRIMARY);
-
-    let thumb_offset = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL);
-    let thumb_length = exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL);
-
-    let mut best_offset = None;
-    let mut best_length = 0;
-
-    if let Some(f_off) = primary_offset
-        && let Some(f_len) = primary_length
-    {
-        let off = match f_off.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        let len = match f_len.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        if let Some(off) = off
-            && let Some(len) = len
-        {
-            best_offset = Some(off as usize);
-            best_length = len as usize;
-        }
-    }
-
-    if let Some(f_off) = thumb_offset
-        && let Some(f_len) = thumb_length
-    {
-        let off = match f_off.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        let len = match f_len.value {
-            exif::Value::Long(ref v) => v.first().copied(),
-            exif::Value::Short(ref v) => v.first().map(|&x| x as u32),
-            _ => None,
-        };
-        if let Some(off) = off
-            && let Some(len) = len
-            && len as usize > best_length
-        {
-            best_offset = Some(off as usize);
-            best_length = len as usize;
-        }
-    }
-
-    let offset = best_offset?;
-    let length = best_length;
-
-    // TIFF magic headers: II*\0 or MM\0*
     let is_tiff = is_tiff_header(bytes);
-
     let tiff_start = if is_tiff {
         0
     } else {
-        bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6
+        (bytes.windows(6).position(|window| window == b"Exif\0\0")? + 6) as u64
     };
 
-    let start = tiff_start.checked_add(offset)?;
-    let end = start.checked_add(length)?;
-
-    if end <= bytes.len() {
-        Some(bytes[start..end].to_vec())
-    } else {
-        None
+    // Pick the first candidate within bytes where is_decodable_jpeg is true
+    for (offset, length) in candidates {
+        if let Some(start) = tiff_start.checked_add(offset)
+            && let Some(end) = start.checked_add(length)
+            && (end as usize) <= bytes.len()
+        {
+            let candidate = &bytes[start as usize..end as usize];
+            if is_decodable_jpeg(candidate) {
+                return Some(candidate.to_vec());
+            }
+        }
     }
+
+    None
 }
 
 /// Helper to parse dimensions from standard EXIF metadata.
