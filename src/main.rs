@@ -175,6 +175,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut draw_needed = true;
+    let mut wait_for_frame = true;
     let mut last_loop_tick = std::time::Instant::now();
 
     // Main event loop
@@ -214,6 +215,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         app.update_layout(term_size.width, term_size.height);
 
+        if (wait_for_frame || app.resize_in_flight)
+            && app.wait_for_frame_ready(
+                term_size.width,
+                term_size.height,
+                Duration::from_millis(12),
+            )
+        {
+            draw_needed = true;
+        }
+        wait_for_frame = false;
+
         if app.needs_clear {
             app.needs_clear = false;
             if app.should_clear_on_update() {
@@ -227,7 +239,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             terminal.draw(|f| ui(f, &mut app))?;
         }
 
-        if event::poll(Duration::from_millis(33))? {
+        let poll_timeout = if app.has_pending_work() {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(33)
+        };
+        if event::poll(poll_timeout)? {
             let mut events = Vec::new();
             events.push(event::read()?);
             while event::poll(Duration::from_millis(0))? {
@@ -257,6 +274,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if meaningful {
                 draw_needed = true;
+                wait_for_frame = true;
             }
         }
     }

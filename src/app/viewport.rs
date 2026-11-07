@@ -169,10 +169,11 @@ impl App {
                 use_kitty_shm: self.active_protocol.uses_kitty_shm(),
             };
 
-            let _ = self.resize_tx.send(req);
+            self.resize_in_flight = self.resize_tx.send(req).is_ok();
         } else {
             self.image_protocol = None;
             self.rendered_size_cells = (0, 0);
+            self.resize_in_flight = false;
         }
     }
 

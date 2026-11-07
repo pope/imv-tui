@@ -52,6 +52,8 @@ impl App {
                 idx,
                 source,
                 is_prefetch: true,
+                thumb_only: false,
+                skip_thumbnail: false,
                 sequence: self.current_sequence,
             });
         }
@@ -67,6 +69,8 @@ impl App {
             return;
         }
 
+        self.resize_in_flight = false;
+        self.full_image_pending = false;
         self.error_message = None;
         self.clear_on_protocol_receive = true;
         self.slideshow_last_transition = std::time::Instant::now();
@@ -78,6 +82,8 @@ impl App {
             let cache = self.prefetch_cache.lock().unwrap();
             cache.get(&self.queue.current_index).cloned()
         };
+
+        let mut loaded_cached_thumb = false;
 
         if let Some(cached_img) = cached {
             if let Some(ref img) = cached_img.image {
@@ -152,6 +158,9 @@ impl App {
                 self.img_height = orig_h;
 
                 self.show_thumbnail_only = true;
+                self.needs_update = true;
+                loaded_cached_thumb = true;
+                self.stats.is_prefetch_cache_hit = true;
                 self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
                 let (tw, th) = self
                     .thumbnail_image
@@ -165,10 +174,11 @@ impl App {
         }
 
         // Cache miss (or thumbnail-only hit): load as normal via background loader worker
-        if self.thumbnail_image.is_none() {
+        if !loaded_cached_thumb {
             self.original_image = None;
             self.thumbnail_image = None;
             self.show_thumbnail_only = false;
+            self.stats.is_prefetch_cache_hit = false;
             self.stats.thumbnail_load_duration = None;
             self.stats.thumbnail_dimensions = None;
             self.stats.thumbnail_source = None;
@@ -187,20 +197,28 @@ impl App {
         self.pan_offset = PanOffset::ZERO;
         self.zoom_needs_initialization = true;
 
-        let source = self.queue.images()[self.queue.current_index].clone();
-        let _ = self.loader_tx.send(LoaderRequest {
-            idx: self.queue.current_index,
-            source,
-            is_prefetch: false,
-            sequence: self.current_sequence,
-        });
-
         let now = Instant::now();
         let is_fast_scroll = self
             .last_nav_time
             .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
         self.last_nav_time = Some(now);
         self.prefetch_suspended = is_fast_scroll;
+
+        let thumb_only = is_fast_scroll && !self.disable_thumbnail;
+        if loaded_cached_thumb && thumb_only {
+            self.full_image_pending = true;
+        } else {
+            self.full_image_pending = thumb_only;
+            let source = self.queue.images()[self.queue.current_index].clone();
+            let _ = self.loader_tx.send(LoaderRequest {
+                idx: self.queue.current_index,
+                source,
+                is_prefetch: false,
+                thumb_only,
+                skip_thumbnail: loaded_cached_thumb,
+                sequence: self.current_sequence,
+            });
+        }
 
         if !is_fast_scroll {
             self.trigger_prefetch();
@@ -304,6 +322,7 @@ impl App {
                             let thumb_h = rotated_img.height();
                             self.original_image = Some(rotated_img.clone());
                             self.thumbnail_image = Some(rotated_img);
+                            self.show_thumbnail_only = true;
                             self.error_message = None;
                             self.needs_update = true;
 
@@ -320,6 +339,7 @@ impl App {
                             self.img_height = rotated_img.height();
                             self.original_image = Some(rotated_img);
                             self.show_thumbnail_only = false;
+                            self.full_image_pending = false;
                             self.error_message = None;
                             self.is_loading = false;
                             self.needs_update = true;
@@ -359,6 +379,7 @@ impl App {
             received = true;
             self.image_protocol = Some(resp.protocol);
             self.rendered_size_cells = resp.rendered_cells;
+            self.resize_in_flight = false;
             self.is_loading = false;
             if self.clear_on_protocol_receive {
                 self.clear_on_protocol_receive = false;
@@ -377,8 +398,9 @@ impl App {
 
     /// Periodic background tick called from the main event loop.
     ///
-    /// Resumes suspended background prefetching once fast scrolling ceases
-    /// and the elapsed time exceeds `FAST_SCROLL_THRESHOLD`.
+    /// Promotes deferred thumbnail placeholders to full-resolution images and resumes
+    /// suspended background prefetching once fast scrolling ceases and the elapsed time
+    /// exceeds `FAST_SCROLL_THRESHOLD`.
     pub fn tick(&mut self) {
         if self.prefetch_suspended
             && self
@@ -386,8 +408,63 @@ impl App {
                 .is_some_and(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
         {
             self.prefetch_suspended = false;
+            if self.full_image_pending && !self.queue.is_empty() {
+                self.full_image_pending = false;
+                let source = self.queue.images()[self.queue.current_index].clone();
+                let _ = self.loader_tx.send(LoaderRequest {
+                    idx: self.queue.current_index,
+                    source,
+                    is_prefetch: false,
+                    thumb_only: false,
+                    skip_thumbnail: self.thumbnail_image.is_some(),
+                    sequence: self.current_sequence,
+                });
+            }
             self.trigger_prefetch();
         }
+    }
+
+    /// Returns true if any foreground load, full-resolution decode, resize, or deferred fast-scroll
+    /// promotion is currently in flight, signaling the event loop to poll at 1ms instead of 33ms.
+    pub fn has_pending_work(&self) -> bool {
+        if self.error_message.is_some() {
+            return false;
+        }
+        self.is_loading
+            || self.needs_update
+            || self.resize_in_flight
+            || self.prefetch_suspended
+            || self.full_image_pending
+            || (!self.queue.is_empty() && self.stats.load_duration.is_none())
+    }
+
+    /// Pumps background worker channels and layout updates for up to `budget` while waiting
+    /// for an initial thumbnail/image protocol or in-flight resize to complete on Frame 1.
+    pub fn wait_for_frame_ready(
+        &mut self,
+        term_width: u16,
+        term_height: u16,
+        budget: std::time::Duration,
+    ) -> bool {
+        if !self.is_loading && !self.resize_in_flight && !self.needs_update {
+            return false;
+        }
+        let start = Instant::now();
+        let mut updated = false;
+        loop {
+            if self.update_channels() {
+                updated = true;
+            }
+            self.update_layout(term_width, term_height);
+            if !self.is_loading && !self.resize_in_flight && !self.needs_update {
+                break;
+            }
+            if start.elapsed() >= budget {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        updated
     }
 
     #[cfg(test)]

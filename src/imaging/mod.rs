@@ -152,6 +152,11 @@ pub struct LoaderRequest {
     pub source: ImageSource,
     /// Whether this is a background prefetch request.
     pub is_prefetch: bool,
+    /// Whether to restrict loading to the fast low-res thumbnail placeholder (during fast scrolling).
+    pub thumb_only: bool,
+    /// Whether to skip thumbnail extraction and decode only the full-resolution image
+    /// (used when promoting an already-displayed thumbnail placeholder to full resolution).
+    pub skip_thumbnail: bool,
     /// Navigation sequence identifier to discard outdated loads.
     pub sequence: u64,
 }

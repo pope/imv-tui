@@ -1167,22 +1167,25 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
     app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
     app.next_image();
     assert!(!app.prefetch_suspended);
+    assert!(!app.full_image_pending);
     // Drain requests
     let mut reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         reqs.push(r);
     }
-    assert!(reqs.iter().any(|r| !r.is_prefetch));
+    let non_prefetch = reqs.iter().find(|r| !r.is_prefetch).unwrap();
+    assert!(!non_prefetch.thumb_only);
 
     // 3. Trigger rapid successive navigation (within FAST_SCROLL_THRESHOLD)
     app.next_image();
     assert!(app.prefetch_suspended);
+    assert!(app.full_image_pending);
     assert_eq!(
         app.active_sequence.load(Ordering::Acquire),
         app.current_sequence as usize
     );
 
-    // In fast scroll, active load is sent, but prefetch requests are skipped
+    // In fast scroll, active load is sent with thumb_only = true, and prefetch requests are skipped
     let mut rapid_reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         rapid_reqs.push(r);
@@ -1190,23 +1193,102 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
     // Active load was sent
     assert_eq!(rapid_reqs.len(), 1);
     assert!(!rapid_reqs[0].is_prefetch);
+    assert!(rapid_reqs[0].thumb_only);
 
     // 4. Tick before threshold does not resume prefetch
     app.tick();
     assert!(app.prefetch_suspended);
+    assert!(app.full_image_pending);
     assert!(channels.loader_rx.try_recv().is_err());
 
-    // 5. Once elapsed time exceeds threshold, tick resumes prefetch
+    // 5. Once elapsed time exceeds threshold, tick resumes prefetch and dispatches full-resolution promotion
     app.last_nav_time = Some(Instant::now() - Duration::from_millis(70));
     app.tick();
     assert!(!app.prefetch_suspended);
+    assert!(!app.full_image_pending);
 
-    // Prefetch requests were dispatched by tick
+    // Requests dispatched by tick: promotion request + prefetch requests
     let mut resumed_reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         resumed_reqs.push(r);
     }
+    let promo_req = resumed_reqs
+        .iter()
+        .find(|r| !r.is_prefetch)
+        .expect("Expected full-resolution promotion request");
+    assert_eq!(promo_req.idx, app.queue.current_index);
+    assert!(!promo_req.thumb_only);
+    assert_eq!(promo_req.skip_thumbnail, app.thumbnail_image.is_some());
     assert!(resumed_reqs.iter().any(|r| r.is_prefetch));
+}
+
+#[test]
+fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // 1. Simulate an active thumbnail on image 0
+    let fake_thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(16, 16)));
+    app.thumbnail_image = Some(fake_thumb.clone());
+    app.original_image = Some(fake_thumb);
+    app.show_thumbnail_only = true;
+    app.stats.thumbnail_dimensions = Some((16, 16));
+    app.stats.thumbnail_load_duration = Some(Duration::from_millis(2));
+    app.stats.thumbnail_source = Some(crate::imaging::ThumbnailSource::Exif);
+    app.stats.is_prefetch_cache_hit = true;
+
+    assert!(app.thumbnail_image.is_some());
+    assert!(app.original_image.is_some());
+    assert!(app.stats.is_prefetch_cache_hit);
+
+    // 2. Navigate to image 1 (which is NOT in prefetch cache)
+    app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
+    app.next_image();
+
+    // Stale thumbnail and original image must be completely cleared!
+    assert!(app.thumbnail_image.is_none());
+    assert!(app.original_image.is_none());
+    assert!(!app.show_thumbnail_only);
+    assert!(!app.stats.is_prefetch_cache_hit);
+    assert!(app.stats.thumbnail_dimensions.is_none());
+    assert!(app.stats.thumbnail_load_duration.is_none());
+    assert!(app.stats.thumbnail_source.is_none());
+
+    // 3. Verify has_pending_work() is true while loading or resizing
+    assert!(app.is_loading);
+    assert!(app.has_pending_work());
+
+    // Once error state is set, has_pending_work() is false
+    app.set_error_state("Failed to load");
+    assert!(!app.has_pending_work());
+
+    // 4. Verify cached thumbnail hit sets is_prefetch_cache_hit = true and activates thumbnail
+    let cached_thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(24, 24)));
+    {
+        let mut cache = app.prefetch_cache.lock().unwrap();
+        cache.insert(
+            0,
+            CachedImage {
+                image: None,
+                thumbnail: Some(cached_thumb),
+                thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
+                width: 240,
+                height: 240,
+                format: Some(image::ImageFormat::Jpeg),
+                decode_duration: Duration::from_millis(15),
+                thumbnail_decode_duration: Duration::from_millis(3),
+                disk_size: 1024,
+                raw_width: None,
+                raw_height: None,
+            },
+        );
+    }
+    app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
+    app.prev_image(); // Navigates back to image 0 (which has cached thumbnail)
+    assert!(app.thumbnail_image.is_some());
+    assert!(app.show_thumbnail_only);
+    assert!(app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.thumbnail_dimensions, Some((24, 24)));
 }
 
 #[test]

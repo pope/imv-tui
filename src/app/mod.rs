@@ -180,6 +180,10 @@ pub struct App {
     pub last_widget_size: (u16, u16),
     /// If true, triggers a resize worker dispatch.
     pub needs_update: bool,
+    /// Tracks whether a resize request for `current_sequence` is currently in flight on the worker thread.
+    pub resize_in_flight: bool,
+    /// Tracks whether full-resolution decoding was deferred during fast scrolling.
+    pub full_image_pending: bool,
     /// Triggers a visual clearing of the terminal screen, gated on `should_clear_on_update()` (e.g. Sixel).
     /// Used to clean obsolete graphic cells on discrete updates (like image loads or dismissed dialogues)
     /// without causing constant Kitty/Halfblocks flicker.
@@ -383,7 +387,7 @@ impl App {
 
                     let mut has_thumbnail = false;
 
-                    if !disable_thumbnail {
+                    if !disable_thumbnail && !r.skip_thumbnail {
                         if cancel.is_cancelled() {
                             continue;
                         }
@@ -463,6 +467,10 @@ impl App {
                         }
                     }
 
+                    if r.thumb_only && has_thumbnail {
+                        continue;
+                    }
+
                     if cancel.is_cancelled() {
                         continue;
                     }
@@ -498,6 +506,7 @@ impl App {
                     if !cancel.is_cancelled() {
                         if let Ok(ref decoded) = res
                             && !has_thumbnail
+                            && !r.skip_thumbnail
                             && !disable_thumbnail
                             && let Some(ref path) = local_path
                             && let Some(ref cache_root) = thumb_cache_root
@@ -574,6 +583,8 @@ impl App {
             error_message: None,
             last_widget_size: (0, 0),
             needs_update: true,
+            resize_in_flight: false,
+            full_image_pending: false,
             needs_clear: true,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
@@ -678,6 +689,9 @@ impl App {
         self.original_image = None;
         self.thumbnail_image = None;
         self.image_protocol = None;
+        self.resize_in_flight = false;
+        self.full_image_pending = false;
+        self.needs_update = false;
     }
 
     /// Returns the number of cached entries and their total uncompressed memory footprint in bytes.
