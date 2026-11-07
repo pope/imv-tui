@@ -116,7 +116,7 @@ impl App {
                 self.zoom_needs_initialization = true;
 
                 // Set stats for cache hit
-                self.stats.load_duration = cached_img.decode_duration;
+                self.stats.load_duration = Some(cached_img.decode_duration);
                 self.stats.is_prefetch_cache_hit = true;
                 self.stats.disk_size = cached_img.disk_size;
                 self.stats.format = cached_img.format;
@@ -152,7 +152,11 @@ impl App {
 
                 self.show_thumbnail_only = true;
                 self.stats.thumbnail_load_duration = Some(cached_img.thumbnail_decode_duration);
-                self.stats.thumbnail_dimensions = Some((cached_img.width, cached_img.height));
+                let (tw, th) = self
+                    .thumbnail_image
+                    .as_ref()
+                    .map_or((thumb.width(), thumb.height()), |t| (t.width(), t.height()));
+                self.stats.thumbnail_dimensions = Some((tw, th));
                 self.stats.raw_width = cached_img.raw_width;
                 self.stats.raw_height = cached_img.raw_height;
             }
@@ -168,6 +172,7 @@ impl App {
             self.stats.raw_width = None;
             self.stats.raw_height = None;
         }
+        self.stats.load_duration = None;
         self.image_protocol = None;
         self.is_loading = true;
         self.loading_start_time = Some(Instant::now());
@@ -312,7 +317,7 @@ impl App {
                             self.is_loading = false;
                             self.needs_update = true;
 
-                            self.stats.load_duration = resp.decode_duration;
+                            self.stats.load_duration = Some(resp.decode_duration);
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;

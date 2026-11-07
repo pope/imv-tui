@@ -573,6 +573,11 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     assert!(app.thumbnail_image.is_some());
     assert_eq!(app.img_width, 160);
     assert_eq!(app.img_height, 120);
+    assert_eq!(app.stats.thumbnail_dimensions, Some((160, 120)));
+    assert!(
+        app.stats.load_duration.is_none(),
+        "load_duration must be None during thumbnail placeholder phase"
+    );
 
     // Verify ResizeRequest was triggered on resize_rx
     let resize_req = channels
@@ -610,6 +615,10 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     assert!(!app.is_loading);
     assert_eq!(app.img_width, 1920);
     assert_eq!(app.img_height, 1080);
+    assert_eq!(
+        app.stats.load_duration,
+        Some(std::time::Duration::from_millis(25))
+    );
 
     // Verify updated ResizeRequest for full resolution
     let full_resize_req = channels

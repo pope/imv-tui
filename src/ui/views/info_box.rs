@@ -202,9 +202,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "No (Miss)".red()
         };
+        let load_decode_val = match app.stats.load_duration {
+            Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0).bold(),
+            None => "Loading...".yellow(),
+        };
         lines.push(Line::from(vec![
             "   Load / Decode: ".gray(),
-            format!("{:.2} ms", app.stats.load_duration.as_secs_f64() * 1000.0).bold(),
+            load_decode_val,
         ]));
 
         let thumb_load_line = if app.disable_thumbnail {

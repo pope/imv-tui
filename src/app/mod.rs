@@ -45,8 +45,8 @@ pub const FAST_SCROLL_THRESHOLD: Duration = Duration::from_millis(60);
 /// Diagnostic and telemetry instrumentation for image decoding, resizing, and protocol delivery.
 #[derive(Debug, Clone, Default)]
 pub struct StatsForNerds {
-    /// Time taken to load (decode) the photo from disk or zip.
-    pub load_duration: std::time::Duration,
+    /// Time taken to load (decode) the photo from disk or zip, or None while loading.
+    pub load_duration: Option<std::time::Duration>,
     /// Time taken to extract and decode the thumbnail.
     pub thumbnail_load_duration: Option<std::time::Duration>,
     /// Dimensions of the decoded thumbnail placeholder, if any.
@@ -462,6 +462,7 @@ impl App {
                     }
 
                     // Decode the full resolution image
+                    let decode_start = std::time::Instant::now();
                     let final_bytes = if let Some(bytes) = bytes_opt {
                         Some(bytes)
                     } else {
@@ -477,6 +478,7 @@ impl App {
                     } else {
                         decode_image_source_cancellable(r.source, &cancel)
                     };
+                    let decode_duration = decode_start.elapsed();
 
                     if !cancel.is_cancelled() {
                         if let Ok(ref decoded) = res
@@ -493,7 +495,6 @@ impl App {
                             );
                         }
 
-                        let decode_duration = start.elapsed();
                         let _ = response_tx.send(LoaderResponse {
                             idx: r.idx,
                             result: res,
