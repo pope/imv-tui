@@ -54,14 +54,12 @@ pub fn fast_resize(
     Ok(DynamicImage::ImageRgba8(rgba_dst))
 }
 
-/// Processes a scaling and panning request in the background, creating/rendering
-/// the final scaled viewport on a screen-pixel canvas block to support offscreen panning boundaries.
-pub fn process_resize(
-    req: ResizeRequest,
+/// Renders the scaled and panned image onto the destination canvas, applying
+/// offscreen boundary margins, centering, and brightness/contrast adjustments.
+pub(crate) fn render_resize_canvas(
+    req: &ResizeRequest,
     resizer: &mut fir::Resizer,
-) -> (StatefulProtocol, std::time::Duration, std::time::Duration) {
-    let start_process = std::time::Instant::now();
-
+) -> DynamicImage {
     // Map input crop/intersection coordinates from the full image space to the thumbnail space
     // if the loaded image buffer is a thumbnail placeholder of different dimensions.
     let (img_to_resize, scale, crop, intersection) =
@@ -200,6 +198,18 @@ pub fn process_resize(
             image::imageops::colorops::contrast_in_place(rgba_canvas, req.contrast.value());
         }
     }
+
+    canvas
+}
+
+/// Processes a scaling and panning request in the background, creating/rendering
+/// the final scaled viewport on a screen-pixel canvas block to support offscreen panning boundaries.
+pub fn process_resize(
+    req: ResizeRequest,
+    resizer: &mut fir::Resizer,
+) -> (StatefulProtocol, std::time::Duration, std::time::Duration) {
+    let start_process = std::time::Instant::now();
+    let canvas = render_resize_canvas(&req, resizer);
     let process_duration = start_process.elapsed();
 
     let start_protocol = std::time::Instant::now();
@@ -207,4 +217,252 @@ pub fn process_resize(
     let protocol_duration = start_protocol.elapsed();
 
     (protocol, process_duration, protocol_duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+    use ratatui_image::picker::Picker;
+
+    fn make_test_image(width: u32, height: u32) -> DynamicImage {
+        let mut img = RgbaImage::new(width, height);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255]);
+        }
+        DynamicImage::ImageRgba8(img)
+    }
+
+    fn make_gray_test_image(width: u32, height: u32, val: u8) -> DynamicImage {
+        let mut img = RgbaImage::new(width, height);
+        for pixel in img.pixels_mut() {
+            *pixel = Rgba([val, val, val, 255]);
+        }
+        DynamicImage::ImageRgba8(img)
+    }
+
+    #[test]
+    fn test_fast_resize_filters_downscale_and_upscale() {
+        let mut resizer = fir::Resizer::new();
+        let src = make_test_image(100, 100);
+
+        let filters = [
+            FilterType::Nearest,
+            FilterType::Linear,
+            FilterType::Cubic,
+            FilterType::Mitchell,
+            FilterType::Gaussian,
+            FilterType::Lanczos,
+            FilterType::Hamming,
+        ];
+
+        for filter in filters {
+            // Downscale
+            let downscaled =
+                fast_resize(&mut resizer, &src, 40, 30, filter, None).expect("Downscale failed");
+            assert_eq!(downscaled.width(), 40);
+            assert_eq!(downscaled.height(), 30);
+
+            // Upscale
+            let upscaled =
+                fast_resize(&mut resizer, &src, 200, 150, filter, None).expect("Upscale failed");
+            assert_eq!(upscaled.width(), 200);
+            assert_eq!(upscaled.height(), 150);
+        }
+    }
+
+    #[test]
+    fn test_fast_resize_with_crop() {
+        let mut resizer = fir::Resizer::new();
+        let src = make_test_image(100, 100);
+
+        let crop = Some((20.0, 20.0, 40.0, 40.0));
+        let resized = fast_resize(&mut resizer, &src, 80, 80, FilterType::Lanczos, crop)
+            .expect("Crop resize failed");
+        assert_eq!(resized.width(), 80);
+        assert_eq!(resized.height(), 80);
+    }
+
+    #[test]
+    fn test_process_resize_fully_contained() {
+        let mut resizer = fir::Resizer::new();
+        let src = Arc::new(make_test_image(100, 100));
+        let picker = Picker::halfblocks();
+
+        let req = ResizeRequest {
+            img: src,
+            original_size: (100, 100),
+            scale: 0.5,
+            crop: CropBox::new(0, 0, 100, 100),
+            intersection: ImageIntersection::new(0, 0, 100, 100),
+            target_w: 50,
+            target_h: 50,
+            filter_type: FilterType::Nearest,
+            picker,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (25, 25),
+            sequence: 1,
+        };
+
+        let canvas = render_resize_canvas(&req, &mut resizer);
+        assert_eq!(canvas.width(), 50);
+        assert_eq!(canvas.height(), 50);
+        let rgba = canvas.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0)[3], 255);
+        assert_eq!(rgba.get_pixel(25, 25)[3], 255);
+        assert_eq!(rgba.get_pixel(49, 49)[3], 255);
+
+        let (_proto, proc_dur, _proto_dur) = process_resize(req, &mut resizer);
+        assert!(proc_dur.as_nanos() > 0 || proc_dur.as_secs() == 0);
+    }
+
+    #[test]
+    fn test_process_resize_canvas_centering_and_margins() {
+        let mut resizer = fir::Resizer::new();
+        let src = Arc::new(make_test_image(40, 40));
+        let picker = Picker::halfblocks();
+
+        // Image is 40x40, target viewport is 100x100.
+        // Crop box extends beyond the image bounds (margins).
+        let req = ResizeRequest {
+            img: src,
+            original_size: (40, 40),
+            scale: 1.0,
+            crop: CropBox::new(-30, -30, 70, 70),
+            intersection: ImageIntersection::new(0, 0, 40, 40),
+            target_w: 100,
+            target_h: 100,
+            filter_type: FilterType::Nearest,
+            picker,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (50, 50),
+            sequence: 1,
+        };
+
+        let canvas = render_resize_canvas(&req, &mut resizer);
+        assert_eq!(canvas.width(), 100);
+        assert_eq!(canvas.height(), 100);
+
+        let rgba = canvas.to_rgba8();
+        // Margins outside the centered 40x40 area (which is pasted at x=30..70, y=30..70)
+        // must remain completely transparent
+        assert_eq!(*rgba.get_pixel(0, 0), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba.get_pixel(99, 99), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba.get_pixel(29, 29), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba.get_pixel(70, 70), Rgba([0, 0, 0, 0]));
+
+        // Pixels inside the pasted area must be opaque (alpha == 255)
+        assert_eq!(rgba.get_pixel(30, 30)[3], 255);
+        assert_eq!(rgba.get_pixel(50, 50)[3], 255);
+        assert_eq!(rgba.get_pixel(69, 69)[3], 255);
+
+        let (_proto, _proc_dur, _proto_dur) = process_resize(req, &mut resizer);
+    }
+
+    #[test]
+    fn test_process_resize_pan_offset_boundary() {
+        let mut resizer = fir::Resizer::new();
+        let src = Arc::new(make_test_image(80, 80));
+        let picker = Picker::halfblocks();
+
+        // Panned offset resulting in negative crop coordinates and partial intersection
+        let req = ResizeRequest {
+            img: src,
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(-20, -20, 60, 60),
+            intersection: ImageIntersection::new(0, 0, 60, 60),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Linear,
+            picker,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (40, 40),
+            sequence: 1,
+        };
+
+        let canvas = render_resize_canvas(&req, &mut resizer);
+        assert_eq!(canvas.width(), 80);
+        assert_eq!(canvas.height(), 80);
+
+        let rgba = canvas.to_rgba8();
+        // Unpasted region at (0, 0) must be transparent
+        assert_eq!(*rgba.get_pixel(0, 0), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba.get_pixel(19, 19), Rgba([0, 0, 0, 0]));
+
+        // Panned region starting at (20, 20) must be opaque
+        assert_eq!(rgba.get_pixel(20, 20)[3], 255);
+        assert_eq!(rgba.get_pixel(25, 25)[3], 255);
+        assert_eq!(rgba.get_pixel(79, 79)[3], 255);
+
+        let (_proto, _proc_dur, _proto_dur) = process_resize(req, &mut resizer);
+    }
+
+    #[test]
+    fn test_process_resize_brightness_and_contrast() {
+        let mut resizer = fir::Resizer::new();
+        let src = Arc::new(make_gray_test_image(60, 60, 100));
+        let picker = Picker::halfblocks();
+
+        // Test positive brightness and contrast adjustments
+        let req_pos = ResizeRequest {
+            img: Arc::clone(&src),
+            original_size: (60, 60),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 60, 60),
+            intersection: ImageIntersection::new(0, 0, 60, 60),
+            target_w: 60,
+            target_h: 60,
+            filter_type: FilterType::Nearest,
+            picker: picker.clone(),
+            brightness: Brightness::new(30),
+            contrast: Contrast::new(20.0),
+            rendered_size_cells: (30, 30),
+            sequence: 1,
+        };
+        let canvas_pos = render_resize_canvas(&req_pos, &mut resizer);
+        assert_eq!(canvas_pos.width(), 60);
+        assert_eq!(canvas_pos.height(), 60);
+        let rgba_pos = canvas_pos.to_rgba8();
+        let px_pos = rgba_pos.get_pixel(30, 30);
+        assert!(
+            px_pos[0] > 100 && px_pos[1] > 100 && px_pos[2] > 100,
+            "Expected RGB channels > 100 with positive brightness and contrast, got {:?}",
+            px_pos
+        );
+        assert!(px_pos[3] > 0);
+        let (_proto, _proc_dur, _proto_dur) = process_resize(req_pos, &mut resizer);
+
+        // Test negative brightness and contrast adjustments
+        let req_neg = ResizeRequest {
+            img: src,
+            original_size: (60, 60),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 60, 60),
+            intersection: ImageIntersection::new(0, 0, 60, 60),
+            target_w: 60,
+            target_h: 60,
+            filter_type: FilterType::Nearest,
+            picker,
+            brightness: Brightness::new(-30),
+            contrast: Contrast::new(-20.0),
+            rendered_size_cells: (30, 30),
+            sequence: 2,
+        };
+        let canvas_neg = render_resize_canvas(&req_neg, &mut resizer);
+        assert_eq!(canvas_neg.width(), 60);
+        assert_eq!(canvas_neg.height(), 60);
+        let rgba_neg = canvas_neg.to_rgba8();
+        let px_neg = rgba_neg.get_pixel(30, 30);
+        assert!(
+            px_neg[0] < 100 && px_neg[1] < 100 && px_neg[2] < 100,
+            "Expected RGB channels < 100 with negative brightness and contrast, got {:?}",
+            px_neg
+        );
+        assert!(px_neg[3] > 0);
+        let (_proto, _proc_dur, _proto_dur) = process_resize(req_neg, &mut resizer);
+    }
 }

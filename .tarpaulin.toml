@@ -1,0 +1,4 @@
+[default]
+engine = "Ptrace"
+skip-clean = true
+no-dead-code = true

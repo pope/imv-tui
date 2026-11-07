@@ -90,6 +90,19 @@ pub struct ScanConfig {
     pub is_piped: bool,
 }
 
+#[cfg(test)]
+/// Mock channels used for decoupled synchronous testing of App state transitions.
+pub(crate) struct MockChannels {
+    /// Receiver for image load requests dispatched by App.
+    pub(crate) loader_rx: mpsc::Receiver<LoaderRequest>,
+    /// Sender to simulate image decoder responses back to App.
+    pub(crate) response_tx: mpsc::Sender<LoaderResponse>,
+    /// Receiver for image resize/protocol requests dispatched by App.
+    pub(crate) resize_rx: mpsc::Receiver<ResizeRequest>,
+    /// Sender to simulate resize/protocol responses back to App.
+    pub(crate) protocol_tx: mpsc::Sender<ResizeResponse>,
+}
+
 /// The central application state controller.
 pub struct App {
     /// The encapsulated image queue and navigation state.
@@ -359,8 +372,35 @@ impl App {
             }
         });
 
+        let mut app = Self::with_channels(
+            queue,
+            picker,
+            config,
+            scan_config,
+            loader_tx,
+            response_rx,
+            resize_tx,
+            protocol_rx,
+        );
+
+        app.start_load_image();
+        Ok(app)
+    }
+
+    /// Constructs an `App` instance initialized with the given channel pairs.
+    #[allow(clippy::too_many_arguments)]
+    fn with_channels(
+        queue: ImageQueue,
+        picker: Picker,
+        config: AppConfig,
+        scan_config: ScanConfig,
+        loader_tx: mpsc::Sender<LoaderRequest>,
+        response_rx: mpsc::Receiver<LoaderResponse>,
+        resize_tx: mpsc::Sender<ResizeRequest>,
+        protocol_rx: mpsc::Receiver<ResizeResponse>,
+    ) -> Self {
         let num_images = queue.images.len();
-        let mut app = Self {
+        Self {
             queue,
             filtered_files: Vec::new(),
             filtered_commands: Vec::new(),
@@ -411,10 +451,43 @@ impl App {
             infobar: config.infobar,
             unmapped_classifications: HashMap::new(),
             scan_config,
-        };
+        }
+    }
 
+    #[cfg(test)]
+    /// Initializes an App instance with decoupled, synchronous mock channels.
+    /// Does NOT spawn any background OS worker threads.
+    pub(crate) fn new_mocked(
+        images: Vec<ImageSource>,
+        current_index: usize,
+        picker: Picker,
+        config: AppConfig,
+        scan_config: ScanConfig,
+    ) -> Result<(Self, MockChannels), String> {
+        let queue = ImageQueue::new(images, current_index)?;
+        let (resize_tx, mock_resize_rx) = mpsc::channel::<ResizeRequest>();
+        let (mock_protocol_tx, protocol_rx) = mpsc::channel::<ResizeResponse>();
+        let (loader_tx, mock_loader_rx) = mpsc::channel::<LoaderRequest>();
+        let (mock_response_tx, response_rx) = mpsc::channel::<LoaderResponse>();
+
+        let mut app = Self::with_channels(
+            queue,
+            picker,
+            config,
+            scan_config,
+            loader_tx,
+            response_rx,
+            resize_tx,
+            protocol_rx,
+        );
         app.start_load_image();
-        Ok(app)
+        let channels = MockChannels {
+            loader_rx: mock_loader_rx,
+            response_tx: mock_response_tx,
+            resize_rx: mock_resize_rx,
+            protocol_tx: mock_protocol_tx,
+        };
+        Ok((app, channels))
     }
 
     /// Checks if the image at index is visible under the current ViewMode.
@@ -1432,6 +1505,19 @@ impl App {
         received
     }
 
+    #[cfg(test)]
+    /// Drains all incoming worker responses from loader and resizer channels,
+    /// updating state and triggering protocol resize requests if widget size is non-zero.
+    pub(crate) fn check_background_responses(&mut self) -> bool {
+        let updated = self.update_channels();
+        if self.needs_update && self.last_widget_size.0 > 0 && self.last_widget_size.1 > 0 {
+            let (w, h) = self.last_widget_size;
+            self.needs_update = false;
+            self.update_protocol(w, h);
+        }
+        updated
+    }
+
     /// Calculates the size of the viewport area, subtracting the infobar height if configured.
     pub fn get_viewport_size(&self, term_width: u16, term_height: u16) -> (u16, u16) {
         let viewport_h = term_height.saturating_sub(self.infobar.height());
@@ -2161,6 +2247,37 @@ impl App {
 }
 
 #[cfg(test)]
+/// Helper to instantiate a test App with mock channels without spawning worker threads.
+pub(crate) fn setup_test_app_with_channels() -> (App, MockChannels) {
+    let images = vec![
+        ImageSource::Local(std::path::PathBuf::from("img1.png")),
+        ImageSource::Local(std::path::PathBuf::from("img2.png")),
+    ];
+    let picker = Picker::halfblocks();
+    let app_config = AppConfig {
+        filter_type: crate::imaging::FilterType::Nearest,
+        scale_mode: crate::imaging::ScaleMode::Shrink,
+        disable_thumbnail: false,
+        infobar: InfoBarPosition::Bottom,
+    };
+    let scan_config = ScanConfig {
+        initial_scan_path: std::path::PathBuf::from("."),
+        check_magic: false,
+        recursive: false,
+        is_cbz: false,
+        is_piped: false,
+    };
+    App::new_mocked(images, 0, picker, app_config, scan_config).unwrap()
+}
+
+#[cfg(test)]
+/// Helper to instantiate a test App without spawning worker threads.
+pub(crate) fn setup_test_app() -> App {
+    let (app, _) = setup_test_app_with_channels();
+    app
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::classifications::ClassificationJsonItem;
@@ -2198,7 +2315,8 @@ mod tests {
             is_cbz: false,
             is_piped: false,
         };
-        let mut app = App::new(images.clone(), 0, picker, app_config, scan_config).unwrap();
+        let (mut app, _channels) =
+            App::new_mocked(images.clone(), 0, picker, app_config, scan_config).unwrap();
 
         app.classifications[0] = Classification::Pick;
         app.classifications[1] = Classification::Reject;
@@ -2337,7 +2455,8 @@ mod tests {
             is_cbz: false,
             is_piped: false,
         };
-        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+        let (mut app, _channels) =
+            App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
         // Initially no unmapped files
         assert!(app.unmapped_classifications.is_empty());
@@ -2410,7 +2529,8 @@ mod tests {
             is_cbz: false,
             is_piped: false,
         };
-        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+        let (mut app, _channels) =
+            App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
         // Flag the first image as a Pick
         app.classifications[0] = Classification::Pick;
@@ -2480,7 +2600,8 @@ mod tests {
             is_cbz: false,
             is_piped: false,
         };
-        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+        let (mut app, _channels) =
+            App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
         // Flag img2 and set contrast
         app.classifications[1] = Classification::Reject;
@@ -2544,7 +2665,8 @@ mod tests {
             is_cbz: false,
             is_piped: false,
         };
-        let mut app = App::new(images, 0, picker, app_config, scan_config).unwrap();
+        let (mut app, _channels) =
+            App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
 
         // Simulate background loading inserting into prefetch cache
         let shared_img = Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
@@ -2583,16 +2705,11 @@ mod tests {
 
     #[test]
     fn test_sequence_number_protection() {
-        use crate::imaging::{DecodedImage, LoaderResponse};
-        use std::sync::mpsc;
-        let mut app = setup_test_app();
+        let (mut app, channels) = setup_test_app_with_channels();
+        while channels.loader_rx.try_recv().is_ok() {}
 
         // Bump current sequence
         app.current_sequence = 10;
-
-        // Mock a LoaderResponse sent with older sequence 9
-        let (tx, rx) = mpsc::channel();
-        app.response_rx = rx;
 
         let dummy_img = image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1));
         let resp = LoaderResponse {
@@ -2611,7 +2728,7 @@ mod tests {
             }),
             decode_duration: std::time::Duration::ZERO,
         };
-        tx.send(resp).unwrap();
+        channels.response_tx.send(resp).unwrap();
 
         // Process channels
         let updated = app.update_channels();
@@ -2622,11 +2739,8 @@ mod tests {
 
     #[test]
     fn test_error_propagation_boundary() {
-        use crate::imaging::LoaderResponse;
-        use std::sync::mpsc;
-        let mut app = setup_test_app();
-        let (tx, rx) = mpsc::channel();
-        app.response_rx = rx;
+        let (mut app, channels) = setup_test_app_with_channels();
+        while channels.loader_rx.try_recv().is_ok() {}
 
         // 1. Prefetch error at index 1 (should not update current image error state)
         let resp_prefetch_err = LoaderResponse {
@@ -2637,7 +2751,7 @@ mod tests {
             result: Err("Failed to load prefetch".to_string()),
             decode_duration: std::time::Duration::ZERO,
         };
-        tx.send(resp_prefetch_err).unwrap();
+        channels.response_tx.send(resp_prefetch_err).unwrap();
         app.update_channels();
         assert!(app.error_message.is_none());
 
@@ -2650,9 +2764,215 @@ mod tests {
             result: Err("Corrupt image file".to_string()),
             decode_duration: std::time::Duration::ZERO,
         };
-        tx.send(resp_active_err).unwrap();
+        channels.response_tx.send(resp_active_err).unwrap();
         app.update_channels();
         assert_eq!(app.error_message.as_deref(), Some("Corrupt image file"));
+        assert!(app.original_image.is_none());
+    }
+
+    #[test]
+    fn test_start_load_image_channel_dispatch() {
+        let (mut app, channels) = setup_test_app_with_channels();
+
+        // On App::new_mocked, start_load_image() was called.
+        // It dispatches the active load request for index 0 with sequence 1.
+        let active_req = channels
+            .loader_rx
+            .try_recv()
+            .expect("Expected active LoaderRequest on loader_rx");
+        assert_eq!(active_req.idx, 0);
+        assert!(!active_req.is_prefetch);
+        assert_eq!(active_req.sequence, 1);
+        assert_eq!(
+            active_req.source,
+            ImageSource::Local(PathBuf::from("img1.png"))
+        );
+
+        // It also dispatches prefetch request for index 1 with sequence 1.
+        let prefetch_req = channels
+            .loader_rx
+            .try_recv()
+            .expect("Expected prefetch LoaderRequest on loader_rx");
+        assert_eq!(prefetch_req.idx, 1);
+        assert!(prefetch_req.is_prefetch);
+        assert_eq!(prefetch_req.sequence, 1);
+
+        // No additional requests pending
+        assert!(channels.loader_rx.try_recv().is_err());
+
+        // Navigating to the next image triggers another start_load_image()
+        app.next_image();
+        assert_eq!(app.queue.current_index, 1);
+
+        let next_active_req = channels
+            .loader_rx
+            .try_recv()
+            .expect("Expected new active LoaderRequest after next_image()");
+        assert_eq!(next_active_req.idx, 1);
+        assert!(!next_active_req.is_prefetch);
+        assert_eq!(next_active_req.sequence, 2);
+    }
+
+    #[test]
+    fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
+        let (mut app, channels) = setup_test_app_with_channels();
+
+        // Drain initial loader requests
+        while channels.loader_rx.try_recv().is_ok() {}
+
+        // Set widget size so resize requests are generated
+        app.last_widget_size = (80, 24);
+
+        let thumb_img = DynamicImage::ImageRgb8(image::RgbImage::new(160, 120));
+        let thumb_resp = LoaderResponse {
+            idx: 0,
+            is_prefetch: false,
+            is_thumbnail: true,
+            sequence: app.current_sequence,
+            result: Ok(DecodedImage {
+                image: thumb_img,
+                width: 160,
+                height: 120,
+                format: Some(image::ImageFormat::Jpeg),
+                disk_size: 1024,
+                raw_width: Some(1920),
+                raw_height: Some(1080),
+            }),
+            decode_duration: std::time::Duration::from_millis(5),
+        };
+
+        // Send thumbnail response and process via check_background_responses
+        channels.response_tx.send(thumb_resp).unwrap();
+        assert!(app.check_background_responses());
+
+        // Verify thumbnail state
+        assert!(app.thumbnail_image.is_some());
+        assert_eq!(app.img_width, 160);
+        assert_eq!(app.img_height, 120);
+
+        // Verify ResizeRequest was triggered on resize_rx
+        let resize_req = channels
+            .resize_rx
+            .try_recv()
+            .expect("Expected ResizeRequest on resize_rx after thumbnail load");
+        assert_eq!(resize_req.original_size, (160, 120));
+        assert_eq!(resize_req.sequence, app.current_sequence);
+
+        // Now simulate full-resolution load completion
+        let full_img = DynamicImage::ImageRgb8(image::RgbImage::new(1920, 1080));
+        let full_resp = LoaderResponse {
+            idx: 0,
+            is_prefetch: false,
+            is_thumbnail: false,
+            sequence: app.current_sequence,
+            result: Ok(DecodedImage {
+                image: full_img,
+                width: 1920,
+                height: 1080,
+                format: Some(image::ImageFormat::Jpeg),
+                disk_size: 20480,
+                raw_width: Some(1920),
+                raw_height: Some(1080),
+            }),
+            decode_duration: std::time::Duration::from_millis(25),
+        };
+
+        channels.response_tx.send(full_resp).unwrap();
+        assert!(app.check_background_responses());
+
+        // Verify full resolution state
+        assert!(app.original_image.is_some());
+        assert!(!app.show_thumbnail_only);
+        assert!(!app.is_loading);
+        assert_eq!(app.img_width, 1920);
+        assert_eq!(app.img_height, 1080);
+
+        // Verify updated ResizeRequest for full resolution
+        let full_resize_req = channels
+            .resize_rx
+            .try_recv()
+            .expect("Expected ResizeRequest on resize_rx after full resolution load");
+        assert_eq!(full_resize_req.original_size, (1920, 1080));
+    }
+
+    #[test]
+    fn test_sequence_number_invalidation() {
+        let (mut app, channels) = setup_test_app_with_channels();
+
+        // Drain initial loader requests
+        while channels.loader_rx.try_recv().is_ok() {}
+
+        // Advance sequence
+        app.current_sequence = 10;
+
+        // 1. Stale LoaderResponse with sequence 9 (< 10)
+        let dummy_img = DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
+        let stale_loader = LoaderResponse {
+            idx: 0,
+            is_prefetch: false,
+            is_thumbnail: false,
+            sequence: 9,
+            result: Ok(DecodedImage {
+                image: dummy_img,
+                width: 100,
+                height: 100,
+                format: None,
+                disk_size: 0,
+                raw_width: None,
+                raw_height: None,
+            }),
+            decode_duration: std::time::Duration::ZERO,
+        };
+        channels.response_tx.send(stale_loader).unwrap();
+        app.check_background_responses();
+        assert!(app.original_image.is_none());
+        assert_eq!(app.img_width, 0);
+
+        // 2. Stale ResizeResponse with sequence 9 (< 10)
+        let stale_proto = ResizeResponse {
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10))),
+            rendered_cells: (10, 10),
+            process_duration: std::time::Duration::ZERO,
+            protocol_duration: std::time::Duration::ZERO,
+            target_width: 10,
+            target_height: 10,
+            sequence: 9,
+        };
+        channels.protocol_tx.send(stale_proto).unwrap();
+        app.check_background_responses();
+        assert!(app.image_protocol.is_none());
+    }
+
+    #[test]
+    fn test_decode_error_handling() {
+        let (mut app, channels) = setup_test_app_with_channels();
+
+        // Drain initial requests
+        while channels.loader_rx.try_recv().is_ok() {}
+
+        assert!(app.is_loading);
+        assert!(app.error_message.is_none());
+
+        // Send a decode error for the current active image
+        let error_resp = LoaderResponse {
+            idx: 0,
+            is_prefetch: false,
+            is_thumbnail: false,
+            sequence: app.current_sequence,
+            result: Err("Corrupt image data: decode failed".to_string()),
+            decode_duration: std::time::Duration::from_millis(2),
+        };
+
+        channels.response_tx.send(error_resp).unwrap();
+        app.check_background_responses();
+
+        assert_eq!(
+            app.error_message.as_deref(),
+            Some("Corrupt image data: decode failed")
+        );
+        assert!(!app.is_loading);
         assert!(app.original_image.is_none());
     }
 
@@ -2699,16 +3019,15 @@ mod tests {
         assert_eq!(app.pan_offset.x, -400);
     }
 
-    fn setup_test_app() -> App {
-        let images = vec![
-            ImageSource::Local(PathBuf::from("img1.png")),
-            ImageSource::Local(PathBuf::from("img2.png")),
-        ];
+    fn setup_multi_image_app(count: usize) -> (App, MockChannels) {
+        let images: Vec<ImageSource> = (1..=count)
+            .map(|i| ImageSource::Local(PathBuf::from(format!("img{}.png", i))))
+            .collect();
         let picker = Picker::halfblocks();
         let app_config = AppConfig {
             filter_type: crate::imaging::FilterType::Nearest,
             scale_mode: crate::imaging::ScaleMode::Shrink,
-            disable_thumbnail: true,
+            disable_thumbnail: false,
             infobar: InfoBarPosition::Bottom,
         };
         let scan_config = ScanConfig {
@@ -2718,6 +3037,279 @@ mod tests {
             is_cbz: false,
             is_piped: false,
         };
-        App::new(images, 0, picker, app_config, scan_config).unwrap()
+        App::new_mocked(images, 0, picker, app_config, scan_config).unwrap()
+    }
+
+    #[test]
+    fn test_execute_prompt_goto_image() {
+        let (mut app, _channels) = setup_multi_image_app(5);
+        assert_eq!(app.queue.current_index, 0);
+
+        // 1. Absolute 1-based index: "2" -> index 1
+        app.palette_query.set("2");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 1);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+        assert_eq!(app.prompt_type, None);
+
+        // 2. Absolute "0" -> ignored via checked_sub(1), stays at index 1
+        app.palette_query.set("0");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 1);
+
+        // 3. Absolute "999" -> clamped to last visible index (4)
+        app.palette_query.set("999");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 4);
+
+        // 4. Relative sub: "-1" from index 4 -> index 3
+        app.palette_query.set("-1");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 3);
+
+        // 5. Relative add: "+1" from index 3 -> index 4
+        app.palette_query.set("+1");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 4);
+
+        // 6. Filtered ViewMode (e.g. ViewMode::Picks where visible indices are non-contiguous)
+        // Mark indices 1 and 3 as Pick, others as Reject
+        app.classifications[0] = Classification::Reject;
+        app.classifications[1] = Classification::Pick;
+        app.classifications[2] = Classification::Reject;
+        app.classifications[3] = Classification::Pick;
+        app.classifications[4] = Classification::Reject;
+        app.view_mode = ViewMode::Picks;
+        app.queue.current_index = 1; // First visible Pick
+
+        // Absolute "2" in Picks mode -> 2nd visible Pick is index 3
+        app.palette_query.set("2");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 3);
+
+        // Relative sub "-1" in Picks mode -> 1st visible Pick is index 1
+        app.palette_query.set("-1");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 1);
+
+        // Relative add "+1" in Picks mode -> 2nd visible Pick is index 3
+        app.palette_query.set("+1");
+        app.execute_prompt(PromptType::GoToImage);
+        assert_eq!(app.queue.current_index, 3);
+    }
+
+    #[test]
+    fn test_execute_prompt_brightness_and_contrast() {
+        let (mut app, _channels) = setup_test_app_with_channels();
+
+        // 1. When original_image is None, prompts early-return without changes
+        assert!(app.original_image.is_none());
+        app.palette_query.set("50");
+        app.execute_prompt(PromptType::SetBrightness);
+        assert_eq!(app.current_brightness().value(), 0);
+
+        app.palette_query.set("=-25.5");
+        app.execute_prompt(PromptType::SetContrast);
+        assert_eq!(app.current_contrast().value(), 0.0);
+
+        // 2. Set original_image to allow adjustments
+        app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(100, 100),
+        )));
+
+        // Brightness: absolute "50"
+        app.palette_query.set("50");
+        app.execute_prompt(PromptType::SetBrightness);
+        assert_eq!(app.current_brightness().value(), 50);
+
+        // Brightness: relative add "+20" -> 70
+        app.palette_query.set("+20");
+        app.execute_prompt(PromptType::SetBrightness);
+        assert_eq!(app.current_brightness().value(), 70);
+
+        // Brightness: relative sub "-15" -> 55
+        app.palette_query.set("-15");
+        app.execute_prompt(PromptType::SetBrightness);
+        assert_eq!(app.current_brightness().value(), 55);
+
+        // Brightness: clamping upper bound (max 255)
+        app.palette_query.set("+300");
+        app.execute_prompt(PromptType::SetBrightness);
+        assert_eq!(app.current_brightness().value(), 255);
+
+        // Brightness: clamping lower bound (min -255)
+        app.palette_query.set("-600");
+        app.execute_prompt(PromptType::SetBrightness);
+        assert_eq!(app.current_brightness().value(), -255);
+
+        // Contrast: absolute "=-25.5"
+        app.palette_query.set("=-25.5");
+        app.execute_prompt(PromptType::SetContrast);
+        assert!((app.current_contrast().value() - (-25.5)).abs() < 1e-4);
+
+        // Contrast: relative add "+20" -> -5.5
+        app.palette_query.set("+20");
+        app.execute_prompt(PromptType::SetContrast);
+        assert!((app.current_contrast().value() - (-5.5)).abs() < 1e-4);
+
+        // Contrast: relative sub "-15" -> -20.5
+        app.palette_query.set("-15");
+        app.execute_prompt(PromptType::SetContrast);
+        assert!((app.current_contrast().value() - (-20.5)).abs() < 1e-4);
+
+        // Contrast: clamping upper bound (max 255.0)
+        app.palette_query.set("+500");
+        app.execute_prompt(PromptType::SetContrast);
+        assert_eq!(app.current_contrast().value(), 255.0);
+
+        // Contrast: clamping lower bound (min -255.0)
+        app.palette_query.set("-600");
+        app.execute_prompt(PromptType::SetContrast);
+        assert_eq!(app.current_contrast().value(), -255.0);
+    }
+
+    #[test]
+    fn test_execute_prompt_slideshow() {
+        let (mut app, _channels) = setup_test_app_with_channels();
+        assert!(!app.slideshow_state.is_active());
+        assert_eq!(app.slideshow_state.seconds(), 0);
+
+        // 1. Absolute "5" -> Playing with 5s delay
+        app.palette_query.set("5");
+        app.execute_prompt(PromptType::SetSlideshow);
+        assert!(app.slideshow_state.is_playing());
+        assert_eq!(app.slideshow_state.seconds(), 5);
+
+        // 2. Relative add "+3" -> 8s
+        app.palette_query.set("+3");
+        app.execute_prompt(PromptType::SetSlideshow);
+        assert!(app.slideshow_state.is_playing());
+        assert_eq!(app.slideshow_state.seconds(), 8);
+
+        // 3. Relative sub "-8" -> 0s -> Transitions to Stopped
+        app.palette_query.set("-8");
+        app.execute_prompt(PromptType::SetSlideshow);
+        assert!(!app.slideshow_state.is_active());
+        assert_eq!(app.slideshow_state.seconds(), 0);
+    }
+
+    #[test]
+    fn test_zoom_stops_and_scale_modes() {
+        let (mut app, _channels) = setup_test_app_with_channels();
+        app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(800, 600),
+        )));
+        app.img_width = 800;
+        app.img_height = 600;
+        app.is_loading = false;
+        app.last_widget_size = (100, 50); // With 8x16 font: 800x800 px viewport
+
+        let fit_scale = app.get_fit_scale();
+        assert!(fit_scale > 0.0);
+
+        // 1. ScaleMode::None -> zoom_factor = 1.0 / fit_scale (displayed scale 1.0)
+        app.scale_mode = ScaleMode::None;
+        app.apply_scale_mode();
+        assert!((app.zoom_factor.value() - (1.0 / fit_scale)).abs() < 1e-4);
+        assert_eq!(app.pan_offset, PanOffset::ZERO);
+
+        // 2. ScaleMode::Shrink with image larger than viewport (fit_scale < 1.0)
+        // Set viewport smaller than image: (50, 20) -> 400x320 px
+        app.last_widget_size = (50, 20);
+        let s_large = app.get_fit_scale();
+        assert!(s_large < 1.0);
+        app.scale_mode = ScaleMode::Shrink;
+        app.apply_scale_mode();
+        assert_eq!(app.zoom_factor.value(), 1.0);
+
+        // ScaleMode::Shrink with image smaller than viewport (fit_scale >= 1.0)
+        // Reset viewport back to (200, 100) -> 1600x1600 px
+        app.last_widget_size = (200, 100);
+        let s_small = app.get_fit_scale();
+        assert!(s_small >= 1.0);
+        app.scale_mode = ScaleMode::Shrink;
+        app.apply_scale_mode();
+        assert!((app.zoom_factor.value() - (1.0 / s_small)).abs() < 1e-4);
+
+        // 3. ScaleMode::Full -> zoom_factor = 1.0
+        app.scale_mode = ScaleMode::Full;
+        app.apply_scale_mode();
+        assert_eq!(app.zoom_factor.value(), 1.0);
+
+        // 4. ScaleMode::Crop -> zoom_factor = s_w.max(s_h) / fit_scale
+        app.scale_mode = ScaleMode::Crop;
+        app.apply_scale_mode();
+        assert!(app.zoom_factor.value() >= 1.0);
+
+        // 5. cycle_scale_mode transitions: None -> Shrink -> Full -> Crop -> None
+        app.scale_mode = ScaleMode::None;
+        app.cycle_scale_mode();
+        assert_eq!(app.scale_mode, ScaleMode::Shrink);
+        app.cycle_scale_mode();
+        assert_eq!(app.scale_mode, ScaleMode::Full);
+        app.cycle_scale_mode();
+        assert_eq!(app.scale_mode, ScaleMode::Crop);
+        app.cycle_scale_mode();
+        assert_eq!(app.scale_mode, ScaleMode::None);
+
+        // 6. jump_zoom_in and jump_zoom_out monotonic progression
+        app.last_widget_size = (100, 50);
+        let fs = app.get_fit_scale();
+        // Start from very small zoom
+        app.zoom_factor = ZoomFactor::new(0.01 / fs);
+        let mut prev_scale = fs * app.zoom_factor.value();
+
+        // Step up with jump_zoom_in across predefined stops and beyond
+        for _ in 0..10 {
+            app.jump_zoom_in();
+            let curr_scale = fs * app.zoom_factor.value();
+            assert!(
+                curr_scale >= prev_scale,
+                "jump_zoom_in must be monotonically increasing"
+            );
+            prev_scale = curr_scale;
+        }
+        // At maximum limit, clamped at 102.4
+        let max_scale = fs * app.zoom_factor.value();
+        assert!((max_scale - 102.4).abs() < 0.1 || max_scale <= 102.4);
+
+        // Step down with jump_zoom_out
+        for _ in 0..15 {
+            app.jump_zoom_out();
+            let curr_scale = fs * app.zoom_factor.value();
+            assert!(
+                curr_scale <= prev_scale,
+                "jump_zoom_out must be monotonically decreasing"
+            );
+            prev_scale = curr_scale;
+        }
+        // At minimum limit, clamped at 0.01
+        let min_scale = fs * app.zoom_factor.value();
+        assert!((min_scale - 0.01).abs() < 0.005 || min_scale >= 0.01);
+
+        // 7. set_actual_size, reset_view, and reset_image
+        app.zoom_factor = ZoomFactor::new(5.0);
+        app.pan_offset = PanOffset::new(100, -50);
+        app.clear_on_protocol_receive = false;
+        app.set_actual_size();
+        assert!((app.zoom_factor.value() - (1.0 / fs)).abs() < 1e-4);
+        assert!(app.clear_on_protocol_receive);
+
+        app.zoom_factor = ZoomFactor::new(3.0);
+        app.pan_offset = PanOffset::new(80, 40);
+        app.clear_on_protocol_receive = false;
+        app.reset_view();
+        assert_eq!(app.pan_offset, PanOffset::ZERO);
+        assert!(app.clear_on_protocol_receive);
+
+        // reset_image resets adjustments on current index
+        let curr = app.queue.current_index;
+        app.adjustments[curr].rotation = Rotation::D90;
+        app.adjustments[curr].brightness = Brightness::new(40);
+        app.adjustments[curr].contrast = Contrast::new(30.0);
+        app.reset_image();
+        assert_eq!(app.adjustments[curr].rotation, Rotation::D0);
+        assert_eq!(app.adjustments[curr].brightness, Brightness::ZERO);
+        assert_eq!(app.adjustments[curr].contrast, Contrast::ZERO);
     }
 }

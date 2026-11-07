@@ -69,6 +69,7 @@
             cargo
             cargo-flamegraph
             cargo-nextest
+            cargo-tarpaulin
             cargo-watch
             clang
             clippy

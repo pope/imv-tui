@@ -13,6 +13,10 @@ use ratatui::{
 
 /// Renders the searchable command palette or file search input overlays.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
     let title = match app.palette_mode {
         PaletteMode::File => " File Search ",
         PaletteMode::Command => " Command Palette ",

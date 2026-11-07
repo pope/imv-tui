@@ -185,4 +185,219 @@ impl App {
             }
         }
     }
+
+    /// Handles a Crossterm keyboard event.
+    pub(crate) fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        terminal_height: u16,
+    ) {
+        self.handle_event(Event::Key(key), terminal_height);
+    }
+
+    /// Handles a Crossterm mouse event.
+    pub(crate) fn handle_mouse_event(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        terminal_height: u16,
+    ) {
+        self.handle_event(Event::Mouse(mouse), terminal_height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::PromptType;
+    use crate::app::classifications::Classification;
+    use crate::app::setup_test_app;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
+    };
+
+    fn make_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn make_mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn test_normal_mode_key_dispatch() {
+        let mut app = setup_test_app();
+        app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(800, 600),
+        )));
+        app.is_loading = false;
+        app.img_width = 800;
+        app.img_height = 600;
+        app.last_widget_size = (80, 24);
+
+        // Zoom in '+'
+        let initial_zoom = app.zoom_factor.value();
+        app.handle_key_event(make_key(KeyCode::Char('+'), KeyModifiers::NONE), 24);
+        assert!(app.zoom_factor.value() > initial_zoom);
+
+        // Zoom out '-'
+        app.handle_key_event(make_key(KeyCode::Char('-'), KeyModifiers::NONE), 24);
+        assert!((app.zoom_factor.value() - initial_zoom).abs() < 1e-4);
+
+        // Panning 'l' (right) and 'h' (left)
+        app.handle_key_event(make_key(KeyCode::Char('l'), KeyModifiers::NONE), 24);
+        assert!(app.pan_offset.x > 0);
+        app.handle_key_event(make_key(KeyCode::Char('r'), KeyModifiers::NONE), 24);
+        assert_eq!(app.pan_offset.x, 0);
+
+        // Classifications 'z' (pick), 'x' (reject), 'u' (unflag)
+        app.handle_key_event(make_key(KeyCode::Char('z'), KeyModifiers::NONE), 24);
+        assert_eq!(app.current_classification(), Classification::Pick);
+        // Marking as reject hides it from default view and advances to next visible image
+        app.handle_key_event(make_key(KeyCode::Char('x'), KeyModifiers::NONE), 24);
+        assert_eq!(app.classifications[0], Classification::Reject);
+        app.handle_key_event(make_key(KeyCode::Char('u'), KeyModifiers::NONE), 24);
+        assert_eq!(app.current_classification(), Classification::Unflagged);
+
+        // Overlays: ':' opens Command Palette
+        app.handle_key_event(make_key(KeyCode::Char(':'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Command);
+        app.palette_mode = PaletteMode::Closed;
+
+        // 'f' opens File search
+        app.handle_key_event(make_key(KeyCode::Char('f'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::File);
+        app.palette_mode = PaletteMode::Closed;
+
+        // Command::GoToImage opens Goto prompt
+        app.execute_command(Command::GoToImage);
+        assert_eq!(app.palette_mode, PaletteMode::Prompt);
+        assert_eq!(app.prompt_type, Some(PromptType::GoToImage));
+        app.palette_mode = PaletteMode::Closed;
+
+        // 'd' opens Info dialog
+        app.handle_key_event(make_key(KeyCode::Char('d'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Info);
+        app.palette_mode = PaletteMode::Closed;
+
+        // Reset classification and index for navigation testing
+        app.classifications[0] = Classification::Unflagged;
+        app.queue.current_index = 0;
+
+        // 'n' next image
+        assert_eq!(app.queue.current_index, 0);
+        app.handle_key_event(make_key(KeyCode::Char('n'), KeyModifiers::NONE), 24);
+        assert_eq!(app.queue.current_index, 1);
+
+        // 'p' previous image
+        app.handle_key_event(make_key(KeyCode::Char('p'), KeyModifiers::NONE), 24);
+        assert_eq!(app.queue.current_index, 0);
+
+        // 'q' quits
+        app.handle_key_event(make_key(KeyCode::Char('q'), KeyModifiers::NONE), 24);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn test_palette_mode_event_dispatch() {
+        let mut app = setup_test_app();
+        app.open_palette(PaletteMode::Command);
+        assert_eq!(app.palette_mode, PaletteMode::Command);
+
+        // Typing query into line editor
+        app.handle_key_event(make_key(KeyCode::Char('q'), KeyModifiers::NONE), 24);
+        app.handle_key_event(make_key(KeyCode::Char('u'), KeyModifiers::NONE), 24);
+        app.handle_key_event(make_key(KeyCode::Char('i'), KeyModifiers::NONE), 24);
+        app.handle_key_event(make_key(KeyCode::Char('t'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_query.value(), "quit");
+
+        // List navigation Down / Up
+        let init_idx = app.palette_selected_index;
+        app.handle_key_event(make_key(KeyCode::Down, KeyModifiers::NONE), 24);
+        if app.get_filtered_commands().len() > 1 {
+            assert_eq!(app.palette_selected_index, init_idx + 1);
+            app.handle_key_event(make_key(KeyCode::Up, KeyModifiers::NONE), 24);
+            assert_eq!(app.palette_selected_index, init_idx);
+        }
+
+        // Mouse scrolling in palette mode
+        let max_items = app.get_filtered_commands().len();
+        if max_items > 1 {
+            app.handle_mouse_event(make_mouse(MouseEventKind::ScrollDown), 24);
+            assert!(app.palette_selected_index > 0);
+            app.handle_mouse_event(make_mouse(MouseEventKind::ScrollUp), 24);
+            assert_eq!(app.palette_selected_index, 0);
+        }
+
+        // Esc closes palette
+        app.handle_key_event(make_key(KeyCode::Esc, KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+    }
+
+    #[test]
+    fn test_info_overlay_and_mouse_zoom() {
+        let mut app = setup_test_app();
+        app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(800, 600),
+        )));
+        app.is_loading = false;
+        app.img_width = 800;
+        app.img_height = 600;
+        app.last_widget_size = (80, 24);
+
+        // Info mode Esc and 'q' close
+        app.palette_mode = PaletteMode::Info;
+        app.handle_key_event(make_key(KeyCode::Esc, KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+
+        app.palette_mode = PaletteMode::Info;
+        app.handle_key_event(make_key(KeyCode::Char('q'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+
+        // Mouse wheel zooming in normal mode
+        let init_zoom = app.zoom_factor.value();
+        app.handle_mouse_event(make_mouse(MouseEventKind::ScrollUp), 24);
+        assert!(app.zoom_factor.value() > init_zoom);
+
+        app.handle_mouse_event(make_mouse(MouseEventKind::ScrollDown), 24);
+        assert!((app.zoom_factor.value() - init_zoom).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_prompt_event_dispatch() {
+        let mut app = setup_test_app();
+
+        // 1. Open GoToImage prompt
+        app.open_prompt(PromptType::GoToImage);
+        assert_eq!(app.palette_mode, PaletteMode::Prompt);
+        assert_eq!(app.prompt_type, Some(PromptType::GoToImage));
+
+        // 2. Type '2'
+        app.handle_key_event(make_key(KeyCode::Char('2'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_query.value(), "2");
+
+        // 3. Press Enter -> execute prompt and close
+        app.handle_key_event(make_key(KeyCode::Enter, KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+        assert_eq!(app.prompt_type, None);
+        assert_eq!(app.queue.current_index, 1);
+
+        // 4. Open prompt again and cancel with Esc
+        app.open_prompt(PromptType::GoToImage);
+        app.handle_key_event(make_key(KeyCode::Char('1'), KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_query.value(), "1");
+        app.handle_key_event(make_key(KeyCode::Esc, KeyModifiers::NONE), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+        // Current index should remain 1, not cancelled target 0
+        assert_eq!(app.queue.current_index, 1);
+    }
 }

@@ -137,6 +137,13 @@ impl LineEditor {
         self.cursor_char_idx = 0;
     }
 
+    #[cfg(test)]
+    /// Sets the editor text, updating the value and moving the cursor to the end.
+    pub(crate) fn set(&mut self, text: &str) {
+        self.value = text.to_string();
+        self.cursor_char_idx = self.value.chars().count();
+    }
+
     /// Returns the byte offset corresponding to the current character cursor position.
     pub(crate) fn cursor_byte_offset(&self) -> usize {
         self.byte_offset_for_char_idx(self.cursor_char_idx)

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The source input format for an image.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageSource {
     /// A local filesystem image path.
     Local(PathBuf),

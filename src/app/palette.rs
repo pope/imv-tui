@@ -1,7 +1,7 @@
 use crate::commands::{PaletteCommand, get_commands};
 
 /// The specific input prompt type.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptType {
     /// Go to specific image index.
     GoToImage,
@@ -14,7 +14,7 @@ pub enum PromptType {
 }
 
 /// The state of the top overlay search palette or prompt dialog.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     /// Palette/prompt overlay is closed.
     Closed,

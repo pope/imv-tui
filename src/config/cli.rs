@@ -94,7 +94,11 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
 fn get_arg(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     if *i + 1 < args.len() {
         let val = &args[*i + 1];
-        if val.starts_with('-') {
+        // Allow negative numbers (like -5) instead of misclassifying them as flags
+        let is_negative_num = val.starts_with('-')
+            && val.len() > 1
+            && val[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
+        if val.starts_with('-') && !is_negative_num {
             return Err(format!(
                 "Error: Argument for {} cannot be another option ({})",
                 flag, val
@@ -191,7 +195,13 @@ where
                 let flag = args[i].clone();
                 let val = get_arg(&args, &mut i, &flag)?;
                 if let Ok(config) = val.parse::<SlideshowState>() {
-                    slideshow = Some(config);
+                    if config.is_active() {
+                        slideshow = Some(config);
+                    } else {
+                        return Err(
+                            "Error: -t / --slideshow requires a positive integer argument".into(),
+                        );
+                    }
                 } else {
                     return Err(
                         "Error: -t / --slideshow requires a positive integer argument".into(),
@@ -240,6 +250,10 @@ where
                 let val = get_arg(&args, &mut i, &flag)?;
                 export_path = Some(PathBuf::from(val));
             }
+            "--version" | "-v" | "-V" => {
+                println!("imv-tui {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!("imv-tui: A fast keyboard-driven terminal image viewer");
                 println!();
@@ -277,6 +291,7 @@ where
                 println!(
                     "      --infobar <position>   Position of the info bar: top, bottom, none (defaults to bottom)"
                 );
+                println!("  -v, --version              Show version information");
                 println!("  -h, --help                 Show this help menu");
                 std::process::exit(0);
             }
@@ -412,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_invalid_slideshow_parameter() {
-        // slideshow requires positive integer (actually non-negative)
+        // slideshow requires positive integer
         let args1 = vec!["imv-tui".to_string(), "-t".to_string(), "abc".to_string()];
         assert!(parse_cli_args_from(args1).is_err());
 
@@ -422,6 +437,13 @@ mod tests {
             "-5".to_string(),
         ];
         assert!(parse_cli_args_from(args2).is_err());
+
+        let args3 = vec![
+            "imv-tui".to_string(),
+            "--slideshow".to_string(),
+            "0".to_string(),
+        ];
+        assert!(parse_cli_args_from(args3).is_err());
     }
 
     #[test]

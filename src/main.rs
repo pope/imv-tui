@@ -228,7 +228,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         | event::Event::Mouse(_)
                         | event::Event::Paste(_)
                 );
-                app.handle_event(ev, term_size.height);
+                match ev {
+                    event::Event::Key(key) => app.handle_key_event(key, term_size.height),
+                    event::Event::Mouse(mouse) => {
+                        app.handle_mouse_event(mouse, term_size.height);
+                    }
+                    other => app.handle_event(other, term_size.height),
+                }
             }
             if meaningful {
                 draw_needed = true;
@@ -272,7 +278,12 @@ fn main() {
     }));
 
     if let Err(e) = run() {
-        eprintln!("Error: {}", e);
+        let err_str = e.to_string();
+        if err_str.starts_with("Error: ") {
+            eprintln!("{}", err_str);
+        } else {
+            eprintln!("Error: {}", err_str);
+        }
         std::process::exit(1);
     }
 }

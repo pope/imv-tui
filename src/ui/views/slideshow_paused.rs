@@ -10,8 +10,12 @@ use ratatui::{
 
 /// Renders a pop-up dialog indicating that the slideshow is paused.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    let w = 34.min(area.width.saturating_sub(1));
-    let h = 3.min(area.height.saturating_sub(1));
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let w = 34.min(area.width.saturating_sub(1)).max(1);
+    let h = 3.min(area.height.saturating_sub(1)).max(1);
 
     let block = Block::default()
         .title(" Slideshow Paused ")
@@ -32,6 +36,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         area.y.saturating_add(1)
     };
+
+    let x = x.min(area.right().saturating_sub(w));
+    let y = y.min(area.bottom().saturating_sub(h));
 
     let popup_area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, popup_area);

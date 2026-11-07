@@ -10,6 +10,10 @@ use ratatui::{
 
 /// Renders the confirm or value input prompt box (for delays, indexes, biases).
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
     let prompt_title = match app.prompt_type {
         Some(PromptType::GoToImage) => " Go to Image ",
         Some(PromptType::SetBrightness) => " Set Brightness ",
