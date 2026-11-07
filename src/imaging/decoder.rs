@@ -331,7 +331,6 @@ pub fn decode_image_bytes_with_header_cancellable(
         _ => bytes.len() as u64,
     };
     let format = image::guess_format(bytes).ok();
-    let display_name = source.display_name();
 
     // Intercept RAW/TIFF files to extract and decode their embedded JPEG preview/thumbnail
     let is_raw_extension = source.is_raw();
@@ -348,26 +347,12 @@ pub fn decode_image_bytes_with_header_cancellable(
             }
         };
 
-        // Inspect raw container format for dimensions and orientation
         if let Some(partial_bytes) = partial_bytes {
-            if partial_bytes.starts_with(b"FUJIFILM")
-                && let Some(meta_offset) = partial_bytes
-                    .get(92..96)
-                    .and_then(|b| b.try_into().ok())
-                    .map(u32::from_be_bytes)
-                    .map(|x| x as u64)
-                && let Some(meta_length) = partial_bytes
-                    .get(96..100)
-                    .and_then(|b| b.try_into().ok())
-                    .map(u32::from_be_bytes)
-                    .map(|x| x as u64)
-                && let Ok(meta_bytes) = read_source_range(source, meta_offset, meta_length)
-                && let Some((w, h)) = get_fuji_raf_dimensions(&meta_bytes)
-            {
-                // Get orientation from the JPEG preview (the bytes variable contains the preview JPEG!)
-                let orientation = get_exif_orientation(bytes);
+            let probe = probe_raw_header(partial_bytes, Some(source));
+            raw_container_orientation = Some(probe.orientation);
+            if let Some((w, h)) = probe.sensor_dims {
                 let swaps = matches!(
-                    orientation,
+                    probe.orientation,
                     image::metadata::Orientation::Rotate90
                         | image::metadata::Orientation::Rotate270
                         | image::metadata::Orientation::Rotate90FlipH
@@ -378,34 +363,16 @@ pub fn decode_image_bytes_with_header_cancellable(
                 } else {
                     raw_dimensions = Some((w, h));
                 }
-            } else if let Some(exif) = parse_tolerant_exif(partial_bytes) {
-                // If not Fuji RAF, try standard TIFF EXIF container check
-                let orientation = get_orientation_from_exif(&exif);
-                raw_container_orientation = Some(orientation);
-                if let Some((w, h)) = get_dimensions_from_exif(&exif) {
-                    let swaps = matches!(
-                        orientation,
-                        image::metadata::Orientation::Rotate90
-                            | image::metadata::Orientation::Rotate270
-                            | image::metadata::Orientation::Rotate90FlipH
-                            | image::metadata::Orientation::Rotate270FlipH
-                    );
-                    if swaps {
-                        raw_dimensions = Some((h, w));
-                    } else {
-                        raw_dimensions = Some((w, h));
-                    }
-                }
             }
         }
     }
 
     if is_raw_extension
         && raw_dimensions.is_none()
-        && let Some(exif) = parse_tolerant_exif(bytes)
-        && let Some((w, h)) = get_dimensions_from_exif(&exif)
+        && let probe = probe_raw_header(bytes, Some(source))
+        && let Some((w, h)) = probe.sensor_dims
     {
-        let orientation = get_orientation_from_exif(&exif);
+        let orientation = raw_container_orientation.unwrap_or(probe.orientation);
         let swaps = matches!(
             orientation,
             image::metadata::Orientation::Rotate90
@@ -420,22 +387,92 @@ pub fn decode_image_bytes_with_header_cancellable(
         }
     }
 
-    if format != Some(image::ImageFormat::Jpeg)
-        && (format == Some(image::ImageFormat::Tiff) || is_raw_extension)
-        && let Some(jpeg_bytes) = extract_jpeg_preview(bytes)
+    if is_raw_container_header(bytes)
+        || ((format == Some(image::ImageFormat::Tiff) || is_raw_extension)
+            && format != Some(image::ImageFormat::Jpeg))
     {
-        // Recurse using the extracted JPEG bytes
-        if let Ok(mut decoded) =
-            decode_image_bytes_with_header_cancellable(&jpeg_bytes, source, header_bytes, cancel)
-        {
-            decoded.format = Some(image::ImageFormat::Jpeg);
-            decoded.disk_size = file_size;
-            if raw_dimensions.is_some() {
-                decoded.raw_dimensions = raw_dimensions;
+        let probe = probe_raw_header(bytes, Some(source));
+        let cont_orient = raw_container_orientation.unwrap_or(probe.orientation);
+        for loc in &probe.candidates_desc {
+            if let Some(jpeg_bytes) = read_location_bytes(bytes, Some(source), *loc)
+                && is_decodable_jpeg(&jpeg_bytes)
+                && let Ok(mut decoded) = decode_single_payload_cancellable(
+                    &jpeg_bytes,
+                    source,
+                    Some(cont_orient),
+                    file_size,
+                    raw_dimensions,
+                    cancel,
+                )
+            {
+                decoded.format = Some(image::ImageFormat::Jpeg);
+                decoded.disk_size = file_size;
+                if raw_dimensions.is_some() {
+                    decoded.raw_dimensions = raw_dimensions;
+                }
+                return Ok(decoded);
             }
-            return Ok(decoded);
         }
     }
+
+    let single_res = decode_single_payload_cancellable(
+        bytes,
+        source,
+        raw_container_orientation,
+        file_size,
+        raw_dimensions,
+        cancel,
+    );
+
+    if let Ok(decoded) = single_res {
+        return Ok(decoded);
+    }
+
+    // Fallback: If decoding this primary preview candidate failed and this is a RAW container,
+    // try the next candidates in probe_raw_header before failing!
+    if is_raw_extension {
+        let probe_bytes = header_bytes.unwrap_or(bytes);
+        let probe = probe_raw_header(probe_bytes, Some(source));
+        let cont_orient = raw_container_orientation.unwrap_or(probe.orientation);
+        for loc in &probe.candidates_desc {
+            if loc.length as usize != bytes.len()
+                && let Some(cand_bytes) = read_location_bytes(probe_bytes, Some(source), *loc)
+                && is_decodable_jpeg(&cand_bytes)
+                && let Ok(mut decoded) = decode_single_payload_cancellable(
+                    &cand_bytes,
+                    source,
+                    Some(cont_orient),
+                    file_size,
+                    raw_dimensions,
+                    cancel,
+                )
+            {
+                decoded.format = Some(image::ImageFormat::Jpeg);
+                decoded.disk_size = file_size;
+                if raw_dimensions.is_some() {
+                    decoded.raw_dimensions = raw_dimensions;
+                }
+                return Ok(decoded);
+            }
+        }
+    }
+
+    single_res
+}
+
+/// Decodes a single standalone image payload (JPEG fast path or `image::ImageReader` fallback)
+/// without recursing into container inspection.
+fn decode_single_payload_cancellable(
+    bytes: &[u8],
+    source: &ImageSource,
+    container_orientation: Option<image::metadata::Orientation>,
+    file_size: u64,
+    raw_dimensions: Option<(u32, u32)>,
+    cancel: &CancellationToken<'_>,
+) -> Result<DecodedImage, String> {
+    let format = image::guess_format(bytes).ok();
+    let display_name = source.display_name();
+    let is_raw_extension = source.is_raw();
 
     if let Some(image::ImageFormat::Jpeg) = format {
         let options = zune_jpeg::zune_core::options::DecoderOptions::default()
@@ -456,7 +493,7 @@ pub fn decode_image_bytes_with_header_cancellable(
             let mut orientation = get_exif_orientation(bytes);
             if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
                 orientation =
-                    raw_container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
+                    container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
             }
 
             let mut img = image::DynamicImage::ImageRgb8(rgb_img);
@@ -484,54 +521,61 @@ pub fn decode_image_bytes_with_header_cancellable(
     }
 
     let cursor = std::io::Cursor::new(bytes);
-    let reader = image::ImageReader::new(cursor)
+    image::ImageReader::new(cursor)
         .with_guessed_format()
         .map_err(|e| {
             format!(
                 "Failed to parse image from memory:\n{}\nError: {}",
                 display_name, e
             )
-        })?;
+        })
+        .and_then(|reader| {
+            reader
+                .into_decoder()
+                .map_err(|e| format!("Failed to read metadata:\n{}\n\nError: {}", display_name, e))
+        })
+        .and_then(|mut decoder| {
+            let mut orientation = decoder
+                .orientation()
+                .unwrap_or(image::metadata::Orientation::NoTransforms);
+            if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
+                orientation =
+                    container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
+            }
 
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|e| format!("Failed to read metadata:\n{}\n\nError: {}", display_name, e))?;
+            // Checkpoint 2 before image-rs decoding
+            if cancel.is_cancelled() {
+                return Err("Operation cancelled".to_string());
+            }
 
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
+            let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
+                format!("Failed to decode image:\n{}\n\nError: {}", display_name, e)
+            })?;
 
-    // Checkpoint 2 before image-rs decoding
-    if cancel.is_cancelled() {
-        return Err("Operation cancelled".to_string());
-    }
+            // Checkpoint 3 before orientation transforms
+            if orientation != image::metadata::Orientation::NoTransforms {
+                if cancel.is_cancelled() {
+                    return Err("Operation cancelled".to_string());
+                }
+                img.apply_orientation(orientation);
+            }
 
-    let mut img = image::DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("Failed to decode image:\n{}\n\nError: {}", display_name, e))?;
-
-    // Checkpoint 3 before orientation transforms
-    if orientation != image::metadata::Orientation::NoTransforms {
-        if cancel.is_cancelled() {
-            return Err("Operation cancelled".to_string());
-        }
-        img.apply_orientation(orientation);
-    }
-
-    let img = match img {
-        image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageRgba8(_) => img,
-        other => image::DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-    };
-    let w = img.width();
-    let h = img.height();
-    let final_raw_dims = raw_dimensions.unwrap_or((w, h));
-    Ok(DecodedImage {
-        image: img,
-        width: w,
-        height: h,
-        format,
-        disk_size: file_size,
-        raw_dimensions: Some(final_raw_dims),
-    })
+            let img = match img {
+                image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageRgba8(_) => img,
+                other => image::DynamicImage::ImageRgba8(into_rgba8_fast(other)),
+            };
+            let w = img.width();
+            let h = img.height();
+            let final_raw_dims = raw_dimensions.unwrap_or((w, h));
+            Ok(DecodedImage {
+                image: img,
+                width: w,
+                height: h,
+                format,
+                disk_size: file_size,
+                raw_dimensions: Some(final_raw_dims),
+            })
+        })
 }
 
 /// Unpacks packed 24-bit RGB (`[R, G, B]`) bytes into 32-bit RGBA (`[R, G, B, 255]`) bytes
@@ -640,24 +684,57 @@ fn decode_jpeg_thumbnail_bytes(thumb_bytes: &[u8]) -> Option<DynamicImage> {
     }
 }
 
-/// Reads the image dimensions extremely quickly from header headers, and decodes/scales
-/// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
-pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
-    // Check if this is a TIFF/RAW container
-    let is_tiff = is_tiff_header(bytes);
+/// Reads image dimensions and decodes its embedded thumbnail with optional positional I/O fallback
+/// for Camera RAW and TIFF files where the thumbnail or root IFD is stored in file segments past the initial header slice.
+fn decode_thumbnail_and_dimensions_impl(
+    bytes: &[u8],
+    source: Option<&ImageSource>,
+) -> Option<(DynamicImage, u32, u32)> {
+    // Check if this is a RAW / TIFF container
+    if is_raw_container_header(bytes) {
+        let probe = probe_raw_header(bytes, source);
 
-    if is_tiff {
-        let exif = parse_tolerant_exif(bytes)?;
+        // Try candidate order: thumbnail, medium, preview (if <= 2MB)
+        let mut candidate_order = Vec::new();
+        if let Some(t) = probe.thumbnail {
+            candidate_order.push(t);
+        }
+        if let Some(m) = probe.medium
+            && !candidate_order.contains(&m)
+        {
+            candidate_order.push(m);
+        }
+        if let Some(p) = probe.preview
+            && p.length <= 2 * 1024 * 1024
+            && !candidate_order.contains(&p)
+        {
+            candidate_order.push(p);
+        }
+        // Also fallback to any remaining candidate in reverse order (smallest first)
+        for c in probe.candidates_desc.iter().rev() {
+            if !candidate_order.contains(c) && c.length <= 2 * 1024 * 1024 {
+                candidate_order.push(*c);
+            }
+        }
 
-        let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
-        let mut thumb_img = decode_jpeg_thumbnail_bytes(&thumb_bytes)?;
+        let mut decoded_thumb = None;
+        for loc in candidate_order {
+            if let Some(thumb_bytes) = read_location_bytes(bytes, source, loc)
+                && is_decodable_jpeg(&thumb_bytes)
+                && let Some(img) = decode_jpeg_thumbnail_bytes(&thumb_bytes)
+            {
+                decoded_thumb = Some(img);
+                break;
+            }
+        }
 
-        let orientation = get_orientation_from_exif(&exif);
-
+        let mut thumb_img = decoded_thumb?;
+        let orientation = probe.orientation;
         thumb_img.apply_orientation(orientation);
 
-        let (mut raw_w, mut raw_h) =
-            get_dimensions_from_exif(&exif).unwrap_or((thumb_img.width(), thumb_img.height()));
+        let (mut raw_w, mut raw_h) = probe
+            .sensor_dims
+            .unwrap_or((thumb_img.width(), thumb_img.height()));
 
         let swaps = matches!(
             orientation,
@@ -773,6 +850,24 @@ pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u3
     };
 
     Some((final_thumb, oriented_raw_w, oriented_raw_h))
+}
+
+/// Reads the image dimensions extremely quickly from header headers, and decodes/scales
+/// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
+pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
+    decode_thumbnail_and_dimensions_impl(bytes, None)
+}
+
+/// Reads image dimensions and decodes its embedded thumbnail with optional positional I/O fallback
+/// for Camera RAW and TIFF files where the thumbnail or root IFD is stored in file segments past the initial header slice.
+pub fn decode_thumbnail_and_dimensions_with_source(
+    bytes: &[u8],
+    source: Option<&ImageSource>,
+) -> Option<(DynamicImage, u32, u32)> {
+    match source {
+        Some(_) => decode_thumbnail_and_dimensions_impl(bytes, source),
+        None => decode_thumbnail_and_dimensions(bytes),
+    }
 }
 
 #[cfg(test)]
@@ -1335,6 +1430,472 @@ mod tests {
         assert!(
             matches!(decoded_thumb, DynamicImage::ImageRgb8(_)),
             "Expected embedded JPEG thumbnail to decode directly as DynamicImage::ImageRgb8"
+        );
+    }
+
+    fn encode_test_jpeg(w: u32, h: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |_, _| image::Rgb([r, g, b]));
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        buf
+    }
+
+    fn write_tiff_entry(
+        buf: &mut [u8],
+        offset: usize,
+        tag: u16,
+        type_id: u16,
+        count: u32,
+        val_or_off: u32,
+    ) {
+        buf[offset..offset + 2].copy_from_slice(&tag.to_le_bytes());
+        buf[offset + 2..offset + 4].copy_from_slice(&type_id.to_le_bytes());
+        buf[offset + 4..offset + 8].copy_from_slice(&count.to_le_bytes());
+        buf[offset + 8..offset + 12].copy_from_slice(&val_or_off.to_le_bytes());
+    }
+
+    fn write_ifd(buf: &mut [u8], offset: usize, entries: &[(u16, u16, u32, u32)], next_ifd: u32) {
+        buf[offset..offset + 2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut pos = offset + 2;
+        for &(tag, type_id, count, val) in entries {
+            write_tiff_entry(buf, pos, tag, type_id, count, val);
+            pos += 12;
+        }
+        buf[pos..pos + 4].copy_from_slice(&next_ifd.to_le_bytes());
+    }
+
+    #[test]
+    fn test_raw_subifd_container_preview_and_dimensions() {
+        // Encode a 10x20 thumbnail JPEG and a 40x80 preview JPEG
+        let thumb_jpeg = encode_test_jpeg(10, 20, 255, 0, 0);
+        let preview_jpeg = encode_test_jpeg(40, 80, 0, 255, 0);
+
+        let mut container = vec![0u8; 10000];
+        // Header: II*\0, IFD0 at 8
+        container[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let thumb_off = 1000u32;
+        container[thumb_off as usize..thumb_off as usize + thumb_jpeg.len()]
+            .copy_from_slice(&thumb_jpeg);
+
+        let preview_off = 3000u32;
+        container[preview_off as usize..preview_off as usize + preview_jpeg.len()]
+            .copy_from_slice(&preview_jpeg);
+
+        let sub_ifd_off = 100u32;
+        let exif_ifd_off = 200u32;
+
+        // IFD0 entries:
+        // Orientation = 6 (Rotate90)
+        // JPEGInterchangeFormat -> thumb_off
+        // JPEGInterchangeFormatLength -> thumb_jpeg.len()
+        // SubIFDs -> sub_ifd_off
+        write_ifd(
+            &mut container,
+            8,
+            &[
+                (0x0112, 3, 1, 6),
+                (0x0201, 4, 1, thumb_off),
+                (0x0202, 4, 1, thumb_jpeg.len() as u32),
+                (0x014A, 4, 1, sub_ifd_off),
+            ],
+            0,
+        );
+
+        // SubIFD entries:
+        // NewSubfileType = 1 (ReducedImage)
+        // JPEGInterchangeFormat -> preview_off
+        // JPEGInterchangeFormatLength -> preview_jpeg.len()
+        // ExifIFD -> exif_ifd_off
+        write_ifd(
+            &mut container,
+            sub_ifd_off as usize,
+            &[
+                (0x00FE, 4, 1, 1),
+                (0x0201, 4, 1, preview_off),
+                (0x0202, 4, 1, preview_jpeg.len() as u32),
+                (0x8769, 4, 1, exif_ifd_off),
+            ],
+            0,
+        );
+
+        // ExifIFD entries:
+        // PixelXDimension = 6000
+        // PixelYDimension = 4000
+        write_ifd(
+            &mut container,
+            exif_ifd_off as usize,
+            &[(0xA002, 4, 1, 6000), (0xA003, 4, 1, 4000)],
+            0,
+        );
+
+        let probe = probe_raw_header(&container, None);
+        assert_eq!(probe.orientation, image::metadata::Orientation::Rotate90);
+        assert_eq!(probe.sensor_dims, Some((6000, 4000)));
+        assert_eq!(probe.thumbnail.unwrap().offset, thumb_off as u64);
+        assert_eq!(probe.thumbnail.unwrap().length, thumb_jpeg.len() as u64);
+        assert_eq!(probe.preview.unwrap().offset, preview_off as u64);
+        assert_eq!(probe.preview.unwrap().length, preview_jpeg.len() as u64);
+
+        // Verify get_dimensions_from_exif works when tolerant EXIF is parsed
+        if let Some(exif) = parse_tolerant_exif(&container) {
+            let _ = get_dimensions_from_exif(&exif);
+        }
+
+        // Thumbnail mode: extracts small thumbnail
+        let (thumb, rw, rh) = decode_thumbnail_and_dimensions(&container)
+            .expect("decode_thumbnail_and_dimensions must succeed");
+        // Thumbnail was 10x20 rotated by 90° into 20x10, and cropped to 7x10 to match 4000:6000 aspect ratio
+        assert_eq!(thumb.height(), 10);
+        assert_eq!(thumb.width(), 7);
+        // Sensor dimensions rotated by 90° into 4000x6000
+        assert_eq!((rw, rh), (4000, 6000));
+
+        // Full mode: extracts larger preview
+        let source = ImageSource::Local(PathBuf::from("mock.arw"));
+        let decoded =
+            decode_image_bytes(&container, &source).expect("decode_image_bytes must succeed");
+        // Preview was 40x80 rotated by 90° into 80x40
+        assert_eq!(decoded.width, 80);
+        assert_eq!(decoded.height, 40);
+        assert_eq!(decoded.raw_dimensions, Some((4000, 6000)));
+    }
+
+    #[test]
+    fn test_raw_tail_ifd0_streaming() {
+        let preview_jpeg = encode_test_jpeg(32, 32, 10, 20, 30);
+        let ifd0_off = 4096u32;
+        let mut container = vec![0u8; 5000];
+
+        // TIFF header: II*\0, ifd0_off = 4096
+        container[0..4].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00]);
+        container[4..8].copy_from_slice(&ifd0_off.to_le_bytes());
+
+        let preview_off = 100u32;
+        container[preview_off as usize..preview_off as usize + preview_jpeg.len()]
+            .copy_from_slice(&preview_jpeg);
+
+        // IFD0 at 4096:
+        write_ifd(
+            &mut container,
+            ifd0_off as usize,
+            &[
+                (0x0100, 4, 1, 1920),
+                (0x0101, 4, 1, 1080),
+                (0x0201, 4, 1, preview_off),
+                (0x0202, 4, 1, preview_jpeg.len() as u32),
+            ],
+            0,
+        );
+
+        let test_dir = PathBuf::from("target/tmp/tail_ifd_test");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+        let file_path = test_dir.join("tail.dng");
+        fs::write(&file_path, &container).unwrap();
+        let source = ImageSource::Local(file_path);
+
+        // Pass only a 64-byte header slice to probe_raw_header
+        let header_slice = &container[..64];
+        let probe = probe_raw_header(header_slice, Some(&source));
+
+        assert_eq!(probe.sensor_dims, Some((1920, 1080)));
+        assert_eq!(probe.preview.unwrap().offset, preview_off as u64);
+        assert_eq!(probe.preview.unwrap().length, preview_jpeg.len() as u64);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_canon_cr2_raw_slice_rejection() {
+        let mut container = vec![0u8; 1000];
+        // TIFF header with IFD0 at 16
+        container[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x10, 0x00, 0x00, 0x00]);
+        // Canon CR2 signature at bytes 8..12
+        container[8..12].copy_from_slice(b"CR\x02\x00");
+
+        let ifd1_off = 80u32;
+        let ifd2_off = 150u32;
+
+        // IFD0 at 16: ImageWidth=1000, ImageLength=800, next IFD = ifd1_off
+        write_ifd(
+            &mut container,
+            16,
+            &[(0x0100, 4, 1, 1000), (0x0101, 4, 1, 800)],
+            ifd1_off,
+        );
+
+        // IFD1 at 80: dummy tag, next IFD = ifd2_off
+        write_ifd(
+            &mut container,
+            ifd1_off as usize,
+            &[(0x00FE, 4, 1, 1)],
+            ifd2_off,
+        );
+
+        // IFD2 at 150 (depth 2): fake large raw slice dims 9999x9999 + CR2 tag 0xC5D8
+        write_ifd(
+            &mut container,
+            ifd2_off as usize,
+            &[
+                (0x0100, 4, 1, 9999),
+                (0x0101, 4, 1, 9999),
+                (0xC5D8, 4, 1, 1),
+            ],
+            0,
+        );
+
+        let probe = probe_raw_header(&container, None);
+        // CR2 IFD2 raw slice must be filtered out! Sensor dimensions remain 1000x800 from IFD0.
+        assert_eq!(probe.sensor_dims, Some((1000, 800)));
+    }
+
+    #[test]
+    fn test_dng_private_data_makernote_preview() {
+        let preview_jpeg = encode_test_jpeg(24, 24, 128, 64, 32);
+        let mut container = vec![0u8; 2000];
+
+        // TIFF header: II*\0, IFD0 at 8
+        container[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let mn_off = 60u32;
+        let p_rel_off = 70u32;
+        let p_len = preview_jpeg.len() as u32;
+        let val_count = p_rel_off + p_len;
+
+        // At mn_off:
+        // Bytes 0..9: "PENTAX\0II"
+        container[mn_off as usize..mn_off as usize + 9].copy_from_slice(b"PENTAX\0II");
+        // Bytes 54..58: p_len (LE)
+        container[mn_off as usize + 54..mn_off as usize + 58].copy_from_slice(&p_len.to_le_bytes());
+        // Bytes 66..70: p_rel_off (LE)
+        container[mn_off as usize + 66..mn_off as usize + 70]
+            .copy_from_slice(&p_rel_off.to_le_bytes());
+        // At mn_off + p_rel_off: preview JPEG
+        let jpeg_pos = (mn_off + p_rel_off) as usize;
+        container[jpeg_pos..jpeg_pos + preview_jpeg.len()].copy_from_slice(&preview_jpeg);
+
+        // IFD0 at 8: Tag 0xC634 (DNGPrivateData), Type 7, Count val_count, Value mn_off
+        write_ifd(&mut container, 8, &[(0xC634, 7, val_count, mn_off)], 0);
+
+        let probe = probe_raw_header(&container, None);
+        assert_eq!(probe.preview.unwrap().offset, (mn_off + p_rel_off) as u64);
+        assert_eq!(probe.preview.unwrap().length, p_len as u64);
+    }
+
+    #[test]
+    fn test_panasonic_rw2_jpg_from_raw_and_dimensions() {
+        let preview_jpeg = encode_test_jpeg(32, 24, 50, 100, 150);
+        let mut container = vec![0u8; 2000];
+
+        // RW2 Header: II\x55\0, IFD0 at 8
+        container[0..4].copy_from_slice(&[0x49, 0x49, 0x55, 0x00]);
+        container[4..8].copy_from_slice(&8u32.to_le_bytes());
+
+        let preview_off = 200u32;
+        container[preview_off as usize..preview_off as usize + preview_jpeg.len()]
+            .copy_from_slice(&preview_jpeg);
+
+        // IFD0:
+        // SensorWidth (0x0002) = 4592
+        // SensorHeight (0x0003) = 3448
+        // JpgFromRaw (0x002E), Type 7, Count preview_jpeg.len(), Value preview_off
+        write_ifd(
+            &mut container,
+            8,
+            &[
+                (0x0002, 4, 1, 4592),
+                (0x0003, 4, 1, 3448),
+                (0x002E, 7, preview_jpeg.len() as u32, preview_off),
+            ],
+            0,
+        );
+
+        assert!(is_tiff_header(&container));
+        assert!(is_raw_container_header(&container));
+
+        let probe = probe_raw_header(&container, None);
+        assert_eq!(probe.sensor_dims, Some((4592, 3448)));
+        assert_eq!(probe.preview.unwrap().offset, preview_off as u64);
+        assert_eq!(probe.preview.unwrap().length, preview_jpeg.len() as u64);
+
+        let extracted =
+            extract_jpeg_preview(&container).expect("extract_jpeg_preview must succeed on RW2");
+        assert_eq!(extracted, preview_jpeg);
+    }
+
+    #[test]
+    fn test_fuji_raf_nested_ifd1_thumbnail_and_cfa_dims() {
+        let nested_thumb_jpeg = encode_test_jpeg(30, 20, 10, 20, 30);
+        let main_preview_jpeg_raw = encode_test_jpeg(40, 80, 200, 100, 50);
+
+        // Build preview JPEG with APP1 EXIF segment containing nested IFD1 thumbnail
+        let mut app1_tiff = vec![0u8; 1000];
+        app1_tiff[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let ifd1_off = 60u32;
+        let thumb_in_app1_off = 200u32;
+        app1_tiff[thumb_in_app1_off as usize..thumb_in_app1_off as usize + nested_thumb_jpeg.len()]
+            .copy_from_slice(&nested_thumb_jpeg);
+
+        // IFD0 at 8: Orientation = 6, next IFD = ifd1_off
+        write_ifd(&mut app1_tiff, 8, &[(0x0112, 3, 1, 6)], ifd1_off);
+
+        // IFD1 at 60: JPEGInterchangeFormat and JPEGInterchangeFormatLength
+        write_ifd(
+            &mut app1_tiff,
+            ifd1_off as usize,
+            &[
+                (0x0201, 4, 1, thumb_in_app1_off),
+                (0x0202, 4, 1, nested_thumb_jpeg.len() as u32),
+            ],
+            0,
+        );
+
+        // Construct preview JPEG byte stream
+        let mut preview_jpeg = vec![0xFF, 0xD8]; // SOI
+        // APP1 marker
+        let app1_payload_len = 6 + app1_tiff.len();
+        let app1_seg_len = (2 + app1_payload_len) as u16;
+        preview_jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        preview_jpeg.extend_from_slice(&app1_seg_len.to_be_bytes());
+        preview_jpeg.extend_from_slice(b"Exif\0\0");
+        preview_jpeg.extend_from_slice(&app1_tiff);
+        // Append rest of main_preview_jpeg_raw (skipping its SOI)
+        preview_jpeg.extend_from_slice(&main_preview_jpeg_raw[2..]);
+
+        // Construct RAF container
+        let mut raf_bytes = vec![0u8; 5000];
+        raf_bytes[0..8].copy_from_slice(b"FUJIFILM");
+
+        let p_off = 1000u32;
+        let p_len = preview_jpeg.len() as u32;
+        raf_bytes[84..88].copy_from_slice(&p_off.to_be_bytes());
+        raf_bytes[88..92].copy_from_slice(&p_len.to_be_bytes());
+
+        let meta_off = 200u32;
+        let meta_len = 16u32;
+        raf_bytes[92..96].copy_from_slice(&meta_off.to_be_bytes());
+        raf_bytes[96..100].copy_from_slice(&meta_len.to_be_bytes());
+
+        // CFA metadata block at 200:
+        // 4 bytes num_records = 1
+        raf_bytes[200..204].copy_from_slice(&1u32.to_be_bytes());
+        // Tag 0x0111 (cropped dims), len = 4, data = [h=4000, w=6000]
+        raf_bytes[204..206].copy_from_slice(&0x0111u16.to_be_bytes());
+        raf_bytes[206..208].copy_from_slice(&4u16.to_be_bytes());
+        raf_bytes[208..210].copy_from_slice(&4000u16.to_be_bytes());
+        raf_bytes[210..212].copy_from_slice(&6000u16.to_be_bytes());
+
+        // Place preview_jpeg at p_off
+        raf_bytes[p_off as usize..p_off as usize + preview_jpeg.len()]
+            .copy_from_slice(&preview_jpeg);
+
+        let probe = probe_raw_header(&raf_bytes, None);
+        assert_eq!(probe.sensor_dims, Some((6000, 4000)));
+        assert_eq!(probe.orientation, image::metadata::Orientation::Rotate90);
+        assert!(probe.thumbnail.is_some());
+
+        let (thumb, rw, rh) = decode_thumbnail_and_dimensions_with_source(&raf_bytes, None)
+            .expect("decode_thumbnail_and_dimensions_with_source must succeed on RAF");
+
+        // The nested thumbnail was 30x20 rotated by 90° into 20x30 (matching 4000x6000 aspect ratio)
+        assert_eq!(thumb.width(), 20);
+        assert_eq!(thumb.height(), 30);
+        // Oriented raw dimensions: 6000x4000 rotated by 90° into 4000x6000
+        assert_eq!((rw, rh), (4000, 6000));
+    }
+
+    #[test]
+    fn test_multi_candidate_decode_fallback() {
+        // Candidate 1: 500 bytes. Starts with SOI (FF D8) + SOF0 marker (FF C0), so is_decodable_jpeg is true.
+        // But its scan data is truncated / zeroed out so zune_jpeg and image-rs fail to decode pixels.
+        let mut cand1 = vec![
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x64, 0x00, 0x64, 0x03, 0x01, 0x11,
+            0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+        ];
+        cand1.resize(500, 0);
+
+        // Candidate 2: complete valid 16x16 JPEG (len ~200-300 bytes)
+        let cand2 = encode_test_jpeg(16, 16, 255, 0, 0);
+
+        let mut container = vec![0u8; 3000];
+        // TIFF Header: II*\0, IFD0 at 8
+        container[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let cand1_off = 100u32;
+        container[cand1_off as usize..cand1_off as usize + cand1.len()].copy_from_slice(&cand1);
+
+        let cand2_off = 1000u32;
+        container[cand2_off as usize..cand2_off as usize + cand2.len()].copy_from_slice(&cand2);
+
+        // IFD0 has Candidate 1 (500 bytes) via JPEGInterchangeFormat
+        // and Candidate 2 (smaller) via StripOffsets
+        write_ifd(
+            &mut container,
+            8,
+            &[
+                (0x0201, 4, 1, cand1_off),
+                (0x0202, 4, 1, cand1.len() as u32),
+                (0x0111, 4, 1, cand2_off),
+                (0x0117, 4, 1, cand2.len() as u32),
+            ],
+            0,
+        );
+
+        let source = ImageSource::Local(PathBuf::from("corrupt_primary.dng"));
+        let decoded = decode_image_bytes_with_header_cancellable(
+            &container,
+            &source,
+            None,
+            &CancellationToken::none(),
+        )
+        .expect("decode_image_bytes_with_header_cancellable must fall back to candidate 2");
+
+        assert_eq!(decoded.width, 16);
+        assert_eq!(decoded.height, 16);
+
+        // Case 2: All candidates have valid SOI+SOF0 headers but corrupt/truncated scan data.
+        // decode_image_bytes_with_header_cancellable must cleanly return an Err without stack overflow.
+        let mut all_corrupt_container = vec![0u8; 3000];
+        all_corrupt_container[0..8]
+            .copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        let cand1_corrupt_off = 100u32;
+        all_corrupt_container[cand1_corrupt_off as usize..cand1_corrupt_off as usize + cand1.len()]
+            .copy_from_slice(&cand1);
+        let mut cand2_corrupt = cand1.clone();
+        cand2_corrupt.resize(400, 0);
+        let cand2_corrupt_off = 1000u32;
+        all_corrupt_container
+            [cand2_corrupt_off as usize..cand2_corrupt_off as usize + cand2_corrupt.len()]
+            .copy_from_slice(&cand2_corrupt);
+
+        write_ifd(
+            &mut all_corrupt_container,
+            8,
+            &[
+                (0x0201, 4, 1, cand1_corrupt_off),
+                (0x0202, 4, 1, cand1.len() as u32),
+                (0x0111, 4, 1, cand2_corrupt_off),
+                (0x0117, 4, 1, cand2_corrupt.len() as u32),
+            ],
+            0,
+        );
+
+        let corrupt_res = decode_image_bytes_with_header_cancellable(
+            &all_corrupt_container,
+            &source,
+            None,
+            &CancellationToken::none(),
+        );
+        assert!(
+            corrupt_res.is_err(),
+            "Must return Err cleanly when all candidates are corrupt"
         );
     }
 }

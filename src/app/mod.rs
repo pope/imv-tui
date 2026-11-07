@@ -456,7 +456,10 @@ impl App {
                                 continue;
                             }
                             if let Some((thumb_img, real_w, real_h)) =
-                                crate::imaging::decode_thumbnail_and_dimensions(&partial_bytes)
+                                crate::imaging::decode_thumbnail_and_dimensions_with_source(
+                                    &partial_bytes,
+                                    Some(&r.source),
+                                )
                                 && !cancel.is_cancelled()
                             {
                                 // Send thumbnail placeholder immediately
@@ -495,8 +498,27 @@ impl App {
                             && let Some(cached_thumb) =
                                 crate::imaging::thumbcache::load_cached_thumbnail(cache_root, path)
                         {
-                            let (mut real_w, mut real_h) = image::image_dimensions(path)
-                                .unwrap_or((cached_thumb.width(), cached_thumb.height()));
+                            let (mut real_w, mut real_h) = if is_raw
+                                && let Some(ref hb) = raw_header_opt
+                            {
+                                let probe = crate::imaging::probe_raw_header(hb, Some(&r.source));
+                                if let Some((w, h)) = probe.sensor_dims {
+                                    let swaps = matches!(
+                                        probe.orientation,
+                                        image::metadata::Orientation::Rotate90
+                                            | image::metadata::Orientation::Rotate270
+                                            | image::metadata::Orientation::Rotate90FlipH
+                                            | image::metadata::Orientation::Rotate270FlipH
+                                    );
+                                    if swaps { (h, w) } else { (w, h) }
+                                } else {
+                                    image::image_dimensions(path)
+                                        .unwrap_or((cached_thumb.width(), cached_thumb.height()))
+                                }
+                            } else {
+                                image::image_dimensions(path)
+                                    .unwrap_or((cached_thumb.width(), cached_thumb.height()))
+                            };
                             if cached_thumb.width() != cached_thumb.height()
                                 && (real_w > real_h)
                                     != (cached_thumb.width() > cached_thumb.height())
