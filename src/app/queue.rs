@@ -28,7 +28,7 @@ pub struct ImageQueue {
 }
 
 /// Type alias for ImageQueue representing the encapsulated media collection.
-pub(crate) type MediaList = ImageQueue;
+pub type MediaList = ImageQueue;
 
 impl ImageQueue {
     /// Computes common prefix stripped relative paths and their lowercase counterparts.
@@ -126,7 +126,7 @@ impl ImageQueue {
 
     /// Creates an ImageQueue with pre-existing classifications and adjustments.
     #[cfg(test)]
-    pub(crate) fn with_state(
+    pub fn with_state(
         images: Vec<ImageSource>,
         current_index: usize,
         classifications: Vec<Classification>,
@@ -199,7 +199,7 @@ impl ImageQueue {
     /// Replaces the current images with `new_images`, preserving classifications and adjustments
     /// for existing files by their canonical identifier and migrating removed non-default items
     /// to `unmapped`.
-    pub(crate) fn rescan_preserving_state(
+    pub fn rescan_preserving_state(
         &mut self,
         new_images: Vec<ImageSource>,
         unmapped: &mut HashMap<String, (Classification, ImageAdjustments)>,
@@ -405,7 +405,7 @@ impl ImageQueue {
 
     /// Resets all classifications to Unflagged, adjustments to default, and clears bitsets.
     #[cfg(test)]
-    pub(crate) fn clear_classifications_and_adjustments(&mut self) {
+    pub fn clear_classifications_and_adjustments(&mut self) {
         self.classifications.fill(Classification::Unflagged);
         for adj in &mut self.adjustments {
             *adj = ImageAdjustments::default();
@@ -418,7 +418,7 @@ impl ImageQueue {
 
     /// Appends an item to all 5 vectors and updates bitsets and counters atomically.
     #[cfg(test)]
-    pub(crate) fn push(
+    pub fn push(
         &mut self,
         source: ImageSource,
         relative_path: String,
@@ -456,7 +456,7 @@ impl ImageQueue {
 
     /// Removes an item at `idx` via swap_remove across all 5 vectors, maintaining bitsets and counters.
     #[cfg(test)]
-    pub(crate) fn swap_remove(&mut self, idx: usize) {
+    pub fn swap_remove(&mut self, idx: usize) {
         if idx >= self.images.len() {
             return;
         }
@@ -723,7 +723,7 @@ impl ImageQueue {
 
     /// Returns the first visible index in the queue under `view_mode`.
     #[cfg(test)]
-    pub(crate) fn first_visible(&self, view_mode: ViewMode) -> Option<usize> {
+    pub fn first_visible(&self, view_mode: ViewMode) -> Option<usize> {
         let total = self.images.len();
         if total == 0 || self.visible_count(view_mode) == 0 {
             return None;
@@ -742,7 +742,7 @@ impl ImageQueue {
 
     /// Returns the last visible index in the queue under `view_mode`.
     #[cfg(test)]
-    pub(crate) fn last_visible(&self, view_mode: ViewMode) -> Option<usize> {
+    pub fn last_visible(&self, view_mode: ViewMode) -> Option<usize> {
         let total = self.images.len();
         if total == 0 || self.visible_count(view_mode) == 0 {
             return None;

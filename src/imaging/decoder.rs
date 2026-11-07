@@ -11,7 +11,7 @@ use image::{DynamicImage, ImageDecoder};
 
 /// Cooperative cancellation token checked at multi-step I/O and decode checkpoints.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CancellationToken<'a> {
+pub struct CancellationToken<'a> {
     cancelled: Option<&'a AtomicBool>,
     sequence: Option<(usize, &'a AtomicUsize)>,
 }
@@ -20,7 +20,7 @@ impl<'a> CancellationToken<'a> {
     /// Creates a dummy token that never cancels and performs zero allocations.
     #[cfg(test)]
     #[inline]
-    pub(crate) const fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             cancelled: None,
             sequence: None,
@@ -30,7 +30,7 @@ impl<'a> CancellationToken<'a> {
     /// Creates a new active cancellation token backed by a borrowed boolean flag.
     #[cfg(test)]
     #[inline]
-    pub(crate) const fn from_flag(flag: &'a AtomicBool) -> Self {
+    pub const fn from_flag(flag: &'a AtomicBool) -> Self {
         Self {
             cancelled: Some(flag),
             sequence: None,
@@ -39,7 +39,7 @@ impl<'a> CancellationToken<'a> {
 
     /// Creates a token that cancels automatically when `active_seq` no longer matches `seq`.
     #[inline]
-    pub(crate) const fn with_sequence(seq: usize, active_seq: &'a AtomicUsize) -> Self {
+    pub const fn with_sequence(seq: usize, active_seq: &'a AtomicUsize) -> Self {
         Self {
             cancelled: None,
             sequence: Some((seq, active_seq)),
@@ -49,7 +49,7 @@ impl<'a> CancellationToken<'a> {
     /// Signals cancellation on the underlying boolean flag, if present.
     #[cfg(test)]
     #[inline]
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         if let Some(c) = self.cancelled {
             c.store(true, Ordering::Release);
         }
@@ -57,7 +57,7 @@ impl<'a> CancellationToken<'a> {
 
     /// Returns `true` if cancellation has been signaled or the sequence is obsolete.
     #[inline]
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         if let Some(c) = self.cancelled
             && c.load(Ordering::Acquire)
         {
@@ -101,7 +101,7 @@ pub fn guess_file_type(path: &Path) -> Option<GuessType> {
 }
 
 /// Returns true if the file path has a supported image extension.
-pub(crate) fn is_supported_image_ext(path: &Path) -> bool {
+pub fn is_supported_image_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|ext| {
@@ -303,7 +303,7 @@ pub fn scan_directory(
 }
 
 /// Decodes an image from already loaded memory bytes with cooperative cancellation support.
-pub(crate) fn decode_image_bytes_cancellable(
+pub fn decode_image_bytes_cancellable(
     bytes: &[u8],
     source: &ImageSource,
     cancel: &CancellationToken<'_>,
@@ -556,22 +556,19 @@ pub(crate) fn decode_image_bytes_cancellable(
 
 /// Decodes an image from already loaded memory bytes.
 #[cfg(test)]
-pub(crate) fn decode_image_bytes(
-    bytes: &[u8],
-    source: &ImageSource,
-) -> Result<DecodedImage, String> {
+pub fn decode_image_bytes(bytes: &[u8], source: &ImageSource) -> Result<DecodedImage, String> {
     decode_image_bytes_cancellable(bytes, source, &CancellationToken::none())
 }
 
 /// Decodes an image from local paths or comic book archives.
 /// Employs zune-jpeg for extremely fast decoding of JPEGs.
 #[cfg(test)]
-pub(crate) fn decode_image_source(source: ImageSource) -> Result<DecodedImage, String> {
+pub fn decode_image_source(source: ImageSource) -> Result<DecodedImage, String> {
     decode_image_source_cancellable(source, &CancellationToken::none())
 }
 
 /// Decodes an image from local paths or comic book archives with cooperative cancellation support.
-pub(crate) fn decode_image_source_cancellable(
+pub fn decode_image_source_cancellable(
     source: ImageSource,
     cancel: &CancellationToken<'_>,
 ) -> Result<DecodedImage, String> {

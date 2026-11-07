@@ -187,16 +187,12 @@ impl App {
     }
 
     /// Handles a Crossterm keyboard event.
-    pub(crate) fn handle_key_event(
-        &mut self,
-        key: crossterm::event::KeyEvent,
-        terminal_height: u16,
-    ) {
+    pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent, terminal_height: u16) {
         self.handle_event(Event::Key(key), terminal_height);
     }
 
     /// Handles a Crossterm mouse event.
-    pub(crate) fn handle_mouse_event(
+    pub fn handle_mouse_event(
         &mut self,
         mouse: crossterm::event::MouseEvent,
         terminal_height: u16,

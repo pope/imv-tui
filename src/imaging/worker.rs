@@ -71,10 +71,7 @@ pub fn fast_resize(
 
 /// Renders the scaled and panned image onto the destination canvas, applying
 /// offscreen boundary margins, centering, and brightness/contrast adjustments.
-pub(crate) fn render_resize_canvas(
-    req: &ResizeRequest,
-    resizer: &mut fir::Resizer,
-) -> DynamicImage {
+pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> DynamicImage {
     // Map input crop/intersection coordinates from the full image space to the thumbnail space
     // if the loaded image buffer is a thumbnail placeholder of different dimensions.
     let (scale, crop, intersection) =
@@ -236,7 +233,7 @@ pub fn process_resize(
 }
 
 /// Applies brightness adjustment to RGBA pixel buffer in-place while strictly preserving the Alpha channel.
-pub(crate) fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
+pub fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
     if value == 0 {
         return;
     }
@@ -263,7 +260,7 @@ pub(crate) fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
 /// preventing harsh clipping transitions while ensuring $C^1$ continuity and complete
 /// numerical stability (free of NaN, Inf, or overflow even for extreme inputs).
 #[inline]
-pub(crate) fn soft_knee_highlight(x: f32) -> f32 {
+pub fn soft_knee_highlight(x: f32) -> f32 {
     let knee = 0.75f32;
     let w = 0.25f32;
     if x <= knee {
@@ -276,7 +273,7 @@ pub(crate) fn soft_knee_highlight(x: f32) -> f32 {
 
 /// Applies contrast adjustment to an RGBA pixel buffer using a 256-byte stack LUT incorporating
 /// `peng`'s photometric contrast curve and soft-knee shoulder compression while preserving Alpha.
-pub(crate) fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
+pub fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
     if contrast == 0.0 {
         return;
     }
@@ -303,7 +300,7 @@ pub(crate) fn apply_contrast_lut(pixels: &mut [u8], contrast: f32) {
 
 /// Clamps destination pixel colors to the min/max bounding envelope of the corresponding
 /// 2x2 source texel neighborhood to eliminate Gibbs ringing/overshoot artifacts from lobed filters.
-pub(crate) fn clamp_anti_ringing_rgba(
+pub fn clamp_anti_ringing_rgba(
     dst: &mut image::RgbaImage,
     src: &image::RgbaImage,
     crop_rect: Option<(f64, f64, f64, f64)>,

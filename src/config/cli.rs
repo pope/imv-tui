@@ -1,4 +1,4 @@
-pub(crate) use super::{KittyCompression, ProtocolConfig};
+pub use super::{KittyCompression, ProtocolConfig};
 use crate::config::{InfoBarPosition, SlideshowState};
 use crate::imaging::{FilterType, ScaleMode};
 use ratatui_image::picker::ProtocolType;
@@ -12,7 +12,7 @@ pub struct CliOptions {
     /// Scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming.
     pub filter: FilterType,
     /// Terminal graphics protocol configuration.
-    pub(crate) protocol: ProtocolConfig,
+    pub protocol: ProtocolConfig,
     /// Image scale mode: none, actual, shrink, full, crop.
     pub scale: ScaleMode,
     /// Delay duration in seconds for slideshow transitions.
@@ -80,7 +80,7 @@ pub fn read_piped_stdin() -> Vec<PathBuf> {
 }
 
 /// Reopens STDIN from `/dev/tty` so crossterm can read interactive keyboard inputs in piped mode.
-pub(crate) fn reopen_tty_stdin() -> Result<(), String> {
+pub fn reopen_tty_stdin() -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

@@ -100,7 +100,7 @@ impl std::str::FromStr for SlideshowState {
 
 /// Controls whether Kitty graphics protocol payloads use zlib (`o=z`) deflate compression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum KittyCompression {
+pub enum KittyCompression {
     /// Automatically enable compression only when running over a remote SSH session
     /// (`$SSH_CONNECTION`, `$SSH_CLIENT`, or `$SSH_TTY`).
     #[default]
@@ -113,14 +113,14 @@ pub(crate) enum KittyCompression {
 
 impl KittyCompression {
     /// Returns `true` if any of `$SSH_CONNECTION`, `$SSH_CLIENT`, or `$SSH_TTY` is set to a non-empty value.
-    pub(crate) fn is_remote_ssh_session() -> bool {
+    pub fn is_remote_ssh_session() -> bool {
         ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
             .iter()
             .any(|&var| std::env::var_os(var).is_some_and(|val| !val.is_empty()))
     }
 
     /// Evaluates whether compression should be enabled given whether the session is a remote SSH session.
-    pub(crate) const fn should_compress_for_env(self, is_remote_ssh: bool) -> bool {
+    pub const fn should_compress_for_env(self, is_remote_ssh: bool) -> bool {
         match self {
             Self::Auto => is_remote_ssh,
             Self::Always => true,
@@ -129,14 +129,14 @@ impl KittyCompression {
     }
 
     /// Determines whether Kitty graphics payloads should be compressed in the current environment.
-    pub(crate) fn should_compress(self) -> bool {
+    pub fn should_compress(self) -> bool {
         self.should_compress_for_env(Self::is_remote_ssh_session())
     }
 }
 
 /// Validated CLI protocol configuration encoding protocol-specific options in the type system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProtocolConfig {
+pub enum ProtocolConfig {
     /// Auto-detect terminal protocol; if `--kitty-compress` was explicitly set,
     /// `explicit_kitty_compress` is `Some(...)` and requires the detected protocol to be Kitty.
     Auto {
@@ -167,7 +167,7 @@ impl Default for ProtocolConfig {
 impl ProtocolConfig {
     /// Parses protocol configuration from CLI arguments, validating that protocol-specific options
     /// like `--kitty-compress` are only used with Kitty (or auto-detection).
-    pub(crate) fn from_cli(
+    pub fn from_cli(
         protocol: Option<ratatui_image::picker::ProtocolType>,
         explicit_kitty_compress: Option<KittyCompression>,
     ) -> Result<Self, String> {
@@ -193,7 +193,7 @@ impl ProtocolConfig {
     }
 
     /// Evaluates whether Kitty compression should be requested during terminal initialization.
-    pub(crate) fn should_enable_kitty_compression(self) -> bool {
+    pub fn should_enable_kitty_compression(self) -> bool {
         match self {
             Self::Kitty { compression } => compression.should_compress(),
             Self::Auto {
@@ -206,7 +206,7 @@ impl ProtocolConfig {
     }
 
     /// Returns the forced `ProtocolType` if explicitly configured on the CLI.
-    pub(crate) fn forced_protocol_type(self) -> Option<ratatui_image::picker::ProtocolType> {
+    pub fn forced_protocol_type(self) -> Option<ratatui_image::picker::ProtocolType> {
         match self {
             Self::Auto { .. } => None,
             Self::Kitty { .. } => Some(ratatui_image::picker::ProtocolType::Kitty),
@@ -217,7 +217,7 @@ impl ProtocolConfig {
     }
 
     /// Resolves the final `ActiveProtocol` based on the detected terminal protocol and compression state.
-    pub(crate) fn resolve_active_protocol(
+    pub fn resolve_active_protocol(
         self,
         detected: ratatui_image::picker::ProtocolType,
         kitty_compressed: bool,
@@ -257,7 +257,7 @@ impl ProtocolConfig {
 
 /// Active runtime terminal graphics protocol and its protocol-specific configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ActiveProtocol {
+pub enum ActiveProtocol {
     /// Kitty graphics protocol with explicit compression state.
     Kitty {
         /// Whether `o=z` zlib deflate compression is enabled.
@@ -275,7 +275,7 @@ pub(crate) enum ActiveProtocol {
 impl ActiveProtocol {
     #[cfg(test)]
     /// Constructs an `ActiveProtocol` from a `ProtocolType` and a Kitty compression state.
-    pub(crate) fn from_protocol_type(
+    pub fn from_protocol_type(
         proto: ratatui_image::picker::ProtocolType,
         compressed: bool,
     ) -> Self {
@@ -288,7 +288,7 @@ impl ActiveProtocol {
     }
 
     /// Returns the descriptive label for Stats for Nerds, indicating compression only when active.
-    pub(crate) const fn display_label(self) -> &'static str {
+    pub const fn display_label(self) -> &'static str {
         match self {
             Self::Kitty { compressed: true } => "Kitty (Compressed)",
             Self::Kitty { compressed: false } => "Kitty",

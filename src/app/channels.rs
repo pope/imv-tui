@@ -11,13 +11,13 @@ use std::time::Instant;
 impl App {
     /// Returns the sliding prefetch window of up to 5 visible images as a stack struct.
     #[inline]
-    pub(crate) fn get_sliding_window(&self) -> VisibleWindow {
+    pub fn get_sliding_window(&self) -> VisibleWindow {
         VisibleWindow::compute(&self.queue, self.view_mode)
     }
 
     /// Returns the sliding prefetch window indices as a heap-allocated vector.
     #[cfg(test)]
-    pub(crate) fn get_sliding_window_indices(&self) -> Vec<usize> {
+    pub fn get_sliding_window_indices(&self) -> Vec<usize> {
         self.get_sliding_window().as_slice().to_vec()
     }
 
@@ -367,7 +367,7 @@ impl App {
     ///
     /// Resumes suspended background prefetching once fast scrolling ceases
     /// and the elapsed time exceeds `FAST_SCROLL_THRESHOLD`.
-    pub(crate) fn tick(&mut self) {
+    pub fn tick(&mut self) {
         if self.prefetch_suspended
             && self
                 .last_nav_time
@@ -381,7 +381,7 @@ impl App {
     #[cfg(test)]
     /// Drains all incoming worker responses from loader and resizer channels,
     /// updating state and triggering protocol resize requests if widget size is non-zero.
-    pub(crate) fn check_background_responses(&mut self) -> bool {
+    pub fn check_background_responses(&mut self) -> bool {
         let updated = self.update_channels();
         if self.needs_update && self.last_widget_size.0 > 0 && self.last_widget_size.1 > 0 {
             let (w, h) = self.last_widget_size;

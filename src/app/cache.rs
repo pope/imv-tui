@@ -33,7 +33,7 @@ pub type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;
 
 /// Zero-allocation, stack-allocated sliding window of up to 5 visible image indices (`current`, `±1`, `±2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct VisibleWindow {
+pub struct VisibleWindow {
     indices: [usize; 5],
     len: usize,
 }
@@ -41,37 +41,37 @@ pub(crate) struct VisibleWindow {
 impl VisibleWindow {
     /// Returns the sliding window indices as a slice.
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[usize] {
+    pub fn as_slice(&self) -> &[usize] {
         &self.indices[..self.len]
     }
 
     /// Returns true if the window contains the given index.
     #[inline]
-    pub(crate) fn contains(&self, idx: usize) -> bool {
+    pub fn contains(&self, idx: usize) -> bool {
         self.as_slice().contains(&idx)
     }
 
     /// Returns true if the window contains no indices.
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Returns the number of indices in the window.
     #[inline]
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
     /// Returns an iterator over the indices in the window.
     #[inline]
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, usize> {
+    pub fn iter(&self) -> std::slice::Iter<'_, usize> {
         self.as_slice().iter()
     }
 
     /// Computes the sliding prefetch window for the active queue and view mode with zero heap allocations.
-    pub(crate) fn compute(queue: &MediaList, view_mode: ViewMode) -> Self {
+    pub fn compute(queue: &MediaList, view_mode: ViewMode) -> Self {
         let total_visible = queue.visible_count(view_mode);
         if total_visible == 0 || queue.is_empty() {
             return Self::default();
@@ -107,7 +107,7 @@ impl VisibleWindow {
 
 /// Helper function to compute sliding window indices as a heap-allocated vector.
 #[cfg(test)]
-pub(crate) fn get_sliding_window_indices(
+pub fn get_sliding_window_indices(
     current_index: usize,
     total_images: usize,
     is_visible: impl Fn(usize) -> bool,

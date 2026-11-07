@@ -398,47 +398,47 @@ impl Default for ZoomFactor {
 
 /// Terminal cell grid dimensions (columns and rows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct CellDimensions {
+pub struct CellDimensions {
     /// Width in terminal columns/cells.
-    pub(crate) cols: u16,
+    pub cols: u16,
     /// Height in terminal rows/cells.
-    pub(crate) rows: u16,
+    pub rows: u16,
 }
 
 impl CellDimensions {
     /// Creates a new cell dimension struct.
-    pub(crate) const fn new(cols: u16, rows: u16) -> Self {
+    pub const fn new(cols: u16, rows: u16) -> Self {
         Self { cols, rows }
     }
 
     /// Returns true if either columns or rows are zero.
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.cols == 0 || self.rows == 0
     }
 }
 
 /// Image pixel dimensions (width and height).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct PixelDimensions {
+pub struct PixelDimensions {
     /// Width in pixels.
-    pub(crate) width: u32,
+    pub width: u32,
     /// Height in pixels.
-    pub(crate) height: u32,
+    pub height: u32,
 }
 
 impl PixelDimensions {
     /// Creates a new pixel dimension struct.
-    pub(crate) const fn new(width: u32, height: u32) -> Self {
+    pub const fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
 
     /// Calculates megapixels as a floating-point count.
-    pub(crate) fn megapixels(self) -> f64 {
+    pub fn megapixels(self) -> f64 {
         (self.width as f64 * self.height as f64) / 1_000_000.0
     }
 
     /// Returns true if either width or height is zero.
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.width == 0 || self.height == 0
     }
 }

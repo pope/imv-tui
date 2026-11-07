@@ -20,7 +20,7 @@ pub enum KeyDef {
 impl KeyDef {
     /// Evaluates if an incoming crossterm Event matches the configured KeyDef shortcut.
     #[cfg(test)]
-    pub(crate) fn matches(self, event: &event::Event) -> bool {
+    pub fn matches(self, event: &event::Event) -> bool {
         match event {
             event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
                 use event::{KeyCode, KeyModifiers};
@@ -84,7 +84,7 @@ impl KeyDef {
 
     /// Extracts the canonical `KeyDef` shortcut representation corresponding to the given event,
     /// with 100% behavioral parity with `KeyDef::matches`.
-    pub(crate) fn from_event(event: &event::Event) -> Option<Self> {
+    pub fn from_event(event: &event::Event) -> Option<Self> {
         match event {
             event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
                 use event::{KeyCode, KeyModifiers};

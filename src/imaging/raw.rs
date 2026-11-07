@@ -7,10 +7,10 @@ use crate::imaging::ImageSource;
 /// Maximum probe limit in bytes for RAW EXIF metadata and preview extraction (2MB).
 /// RAW files often store IFD tags and JPEG preview offsets past 256KB while we
 /// still avoid reading 50MB+ sensor payloads into memory.
-pub(crate) const RAW_EXIF_PROBE_LIMIT: usize = 2 * 1024 * 1024;
+pub const RAW_EXIF_PROBE_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Returns true if the lowercase file extension corresponds to a RAW camera format.
-pub(crate) fn is_raw_ext(ext: &str) -> bool {
+pub fn is_raw_ext(ext: &str) -> bool {
     ext.eq_ignore_ascii_case("dng")
         || ext.eq_ignore_ascii_case("cr2")
         || ext.eq_ignore_ascii_case("nef")
@@ -23,7 +23,7 @@ pub(crate) fn is_raw_ext(ext: &str) -> bool {
 
 /// Parses EXIF metadata from `bytes` using tolerant mode (`continue_on_error(true)`),
 /// returning partial results even when maker notes or vendor tags are malformed.
-pub(crate) fn parse_tolerant_exif(bytes: &[u8]) -> Option<exif::Exif> {
+pub fn parse_tolerant_exif(bytes: &[u8]) -> Option<exif::Exif> {
     let mut cursor = std::io::Cursor::new(bytes);
     exif::Reader::new()
         .continue_on_error(true)

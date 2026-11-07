@@ -15,14 +15,14 @@ impl App {
     /// Returns a slice of image adjustments in the active queue.
     #[inline]
     #[cfg(test)]
-    pub(crate) fn adjustments(&self) -> &[crate::app::adjustments::ImageAdjustments] {
+    pub fn adjustments(&self) -> &[crate::app::adjustments::ImageAdjustments] {
         self.queue.adjustments()
     }
 
     /// Returns a mutable slice of image adjustments in the active queue.
     #[inline]
     #[cfg(test)]
-    pub(crate) fn adjustments_mut(&mut self) -> &mut [crate::app::adjustments::ImageAdjustments] {
+    pub fn adjustments_mut(&mut self) -> &mut [crate::app::adjustments::ImageAdjustments] {
         self.queue.adjustments_mut()
     }
 

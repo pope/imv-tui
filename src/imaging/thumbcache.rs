@@ -32,7 +32,7 @@ const S: [u32; 64] = [
 ];
 
 /// Computes the 32-character lowercase hexadecimal MD5 digest of `data` per RFC 1321 in pure safe Rust.
-pub(crate) fn md5_hex(data: &[u8]) -> String {
+pub fn md5_hex(data: &[u8]) -> String {
     let mut a0 = 0x67452301u32;
     let mut b0 = 0xefcdab89u32;
     let mut c0 = 0x98badcfeu32;
@@ -120,7 +120,7 @@ const fn make_crc_table() -> [u32; 256] {
 const CRC_TABLE: [u32; 256] = make_crc_table();
 
 /// Calculates the standard IEEE 802.3 CRC32 checksum for `chunk_type` followed by `data`.
-pub(crate) fn crc32_chunk(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+pub fn crc32_chunk(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in chunk_type {
         let idx = ((crc ^ (byte as u32)) & 0xff) as usize;
@@ -135,7 +135,7 @@ pub(crate) fn crc32_chunk(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
 
 /// Freedesktop thumbnail size tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThumbTier {
+pub enum ThumbTier {
     /// 128x128 max dimension.
     Normal,
     /// 256x256 max dimension.
@@ -148,7 +148,7 @@ pub(crate) enum ThumbTier {
 
 impl ThumbTier {
     /// Maximum dimension (width or height) in pixels.
-    pub(crate) const fn max_dim(self) -> u32 {
+    pub const fn max_dim(self) -> u32 {
         match self {
             Self::Normal => 128,
             Self::Large => 256,
@@ -158,7 +158,7 @@ impl ThumbTier {
     }
 
     /// Freedesktop cache subdirectory name.
-    pub(crate) const fn dir_name(self) -> &'static str {
+    pub const fn dir_name(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Large => "large",
@@ -171,7 +171,7 @@ impl ThumbTier {
 /// Computes the Freedesktop cache key (canonical file URI and MD5 filename) for a given filesystem path.
 ///
 /// Uses `std::path::absolute` to preserve symlink paths rather than `canonicalize` per the Freedesktop spec.
-pub(crate) fn cache_key_for_path(path: &Path) -> Option<(String, String)> {
+pub fn cache_key_for_path(path: &Path) -> Option<(String, String)> {
     let abs_path = std::path::absolute(path).ok()?;
     let path_str = abs_path.to_str()?;
 
@@ -197,7 +197,7 @@ pub(crate) fn cache_key_for_path(path: &Path) -> Option<(String, String)> {
 }
 
 /// Computes aspect-ratio preserving target dimensions within `max_dim x max_dim` without upscaling.
-pub(crate) fn compute_scaled_dims(src_w: u32, src_h: u32, max_dim: u32) -> (u32, u32) {
+pub fn compute_scaled_dims(src_w: u32, src_h: u32, max_dim: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 {
         return (0, 0);
     }
@@ -213,7 +213,7 @@ pub(crate) fn compute_scaled_dims(src_w: u32, src_h: u32, max_dim: u32) -> (u32,
 }
 
 /// Downscales `src_img` to `target_tier` using Mitchell-Netravali filtering with alpha premultiplication.
-pub(crate) fn downscale_for_thumbnail(
+pub fn downscale_for_thumbnail(
     resizer: &mut fir::Resizer,
     src_img: &DynamicImage,
     target_tier: ThumbTier,
@@ -267,7 +267,7 @@ fn make_text_chunk(keyword: &str, text: &str) -> Vec<u8> {
 /// Encodes an RGBA8 thumbnail image to PNG bytes with injected Freedesktop `tEXt` chunks.
 ///
 /// Guaranteed to position `Thumb::MTime` within the first 2,048 bytes of the file.
-pub(crate) fn encode_thumbnail_png(
+pub fn encode_thumbnail_png(
     thumb_rgba: &image::RgbaImage,
     canonical_uri: &str,
     mtime_sec: i64,
@@ -301,7 +301,7 @@ pub(crate) fn encode_thumbnail_png(
 }
 
 /// Parses the `Thumb::MTime` timestamp from a PNG header buffer without heap allocation.
-pub(crate) fn parse_png_mtime(header: &[u8]) -> Option<i64> {
+pub fn parse_png_mtime(header: &[u8]) -> Option<i64> {
     if header.len() < 8 || &header[0..8] != b"\x89PNG\r\n\x1a\n" {
         return None;
     }
@@ -336,7 +336,7 @@ pub(crate) fn parse_png_mtime(header: &[u8]) -> Option<i64> {
 /// Probes a thumbnail file to verify its `Thumb::MTime` matches `expected_mtime`.
 ///
 /// Reads at most 2,048 bytes on the stack without reading or decoding the whole image.
-pub(crate) fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf> {
+pub fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf> {
     let mut file = std::fs::File::open(thumb_path).ok()?;
     let mut buf = [0u8; 2048];
     let n = file.read(&mut buf).ok()?;
@@ -348,7 +348,7 @@ pub(crate) fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<
 }
 
 /// Atomically writes an encoded PNG thumbnail to the Freedesktop thumbnail directory.
-pub(crate) fn write_freedesktop_thumbnail(
+pub fn write_freedesktop_thumbnail(
     cache_root: &Path,
     tier: ThumbTier,
     md5_filename: &str,
@@ -407,7 +407,7 @@ pub(crate) fn write_freedesktop_thumbnail(
 }
 
 /// Returns the default Freedesktop thumbnail cache directory ($XDG_CACHE_HOME/thumbnails or $HOME/.cache/thumbnails).
-pub(crate) fn default_thumbnail_cache_root() -> Option<PathBuf> {
+pub fn default_thumbnail_cache_root() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
         && !xdg.is_empty()
     {
@@ -422,7 +422,7 @@ pub(crate) fn default_thumbnail_cache_root() -> Option<PathBuf> {
 }
 
 /// Loads a valid cached thumbnail for `source_path` if present and fresh in `cache_root`.
-pub(crate) fn load_cached_thumbnail(cache_root: &Path, source_path: &Path) -> Option<DynamicImage> {
+pub fn load_cached_thumbnail(cache_root: &Path, source_path: &Path) -> Option<DynamicImage> {
     let metadata = std::fs::metadata(source_path).ok()?;
     let mtime = metadata
         .modified()
@@ -452,7 +452,7 @@ pub(crate) fn load_cached_thumbnail(cache_root: &Path, source_path: &Path) -> Op
 }
 
 /// Downscales and saves a Freedesktop thumbnail for `source_path` to `cache_root`.
-pub(crate) fn save_cached_thumbnail(
+pub fn save_cached_thumbnail(
     cache_root: &Path,
     resizer: &mut fir::Resizer,
     source_path: &Path,

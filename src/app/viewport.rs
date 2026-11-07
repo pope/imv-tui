@@ -175,7 +175,8 @@ impl App {
         }
     }
 
-    pub(crate) fn get_fit_scale(&self) -> f64 {
+    /// Calculates the scaling factor to fit the image inside the current widget viewport bounds.
+    pub fn get_fit_scale(&self) -> f64 {
         let dims = PixelDimensions::new(self.img_width, self.img_height);
         if dims.is_empty() {
             return 0.0;
@@ -584,7 +585,8 @@ impl App {
         self.needs_update = true;
     }
 
-    pub(crate) fn pan_step_x(&self) -> i64 {
+    /// Calculates the horizontal panning step delta based on viewport cell width and zoom level.
+    pub fn pan_step_x(&self) -> i64 {
         let (widget_w_cells, _) = self.last_widget_size;
         let font_size = self.picker.font_size();
         let cell_w = if font_size.width == 0 {
@@ -615,7 +617,8 @@ impl App {
         }
     }
 
-    pub(crate) fn pan_step_y(&self) -> i64 {
+    /// Calculates the vertical panning step delta based on viewport cell height and zoom level.
+    pub fn pan_step_y(&self) -> i64 {
         let (_, widget_h_cells) = self.last_widget_size;
         let font_size = self.picker.font_size();
         let cell_h = if font_size.height == 0 {

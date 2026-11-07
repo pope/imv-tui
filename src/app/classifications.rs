@@ -87,7 +87,7 @@ pub struct ClassificationJsonItem {
 
 /// Returns true if an image at `index` with `classifications` is visible under `view_mode`.
 #[cfg(test)]
-pub(crate) fn is_image_visible(
+pub fn is_image_visible(
     index: usize,
     classifications: &[Classification],
     view_mode: ViewMode,

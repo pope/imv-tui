@@ -40,7 +40,7 @@ use crate::imaging::{
 
 /// Threshold below which navigation is considered fast scrolling (60ms).
 /// Background prefetching is suspended while navigating faster than this rate.
-pub(crate) const FAST_SCROLL_THRESHOLD: Duration = Duration::from_millis(60);
+pub const FAST_SCROLL_THRESHOLD: Duration = Duration::from_millis(60);
 
 /// Diagnostic and telemetry instrumentation for image decoding, resizing, and protocol delivery.
 #[derive(Debug, Clone, Default)]
@@ -89,7 +89,8 @@ pub struct AppConfig {
     pub scale_mode: ScaleMode,
     pub disable_thumbnail: bool,
     pub infobar: InfoBarPosition,
-    pub(crate) active_protocol: crate::config::ActiveProtocol,
+    /// Active graphics protocol used by the app.
+    pub active_protocol: crate::config::ActiveProtocol,
 }
 
 impl Default for AppConfig {
@@ -116,20 +117,20 @@ pub struct ScanConfig {
 
 #[cfg(test)]
 /// Mock channels used for decoupled synchronous testing of App state transitions.
-pub(crate) struct MockChannels {
+pub struct MockChannels {
     /// Receiver for image load requests dispatched by App.
-    pub(crate) loader_rx: mpsc::Receiver<LoaderRequest>,
+    pub loader_rx: mpsc::Receiver<LoaderRequest>,
     /// Sender to simulate image decoder responses back to App.
-    pub(crate) response_tx: mpsc::Sender<LoaderResponse>,
+    pub response_tx: mpsc::Sender<LoaderResponse>,
     /// Receiver for image resize/protocol requests dispatched by App.
-    pub(crate) resize_rx: mpsc::Receiver<ResizeRequest>,
+    pub resize_rx: mpsc::Receiver<ResizeRequest>,
     /// Sender to simulate resize/protocol responses back to App.
-    pub(crate) protocol_tx: mpsc::Sender<ResizeResponse>,
+    pub protocol_tx: mpsc::Sender<ResizeResponse>,
 }
 
 /// The mutually-exclusive display state for the image viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageDisplayState<'a> {
+pub enum ImageDisplayState<'a> {
     /// Actively loading with debounce threshold elapsed and no preview available.
     LoadingSpinner,
     /// Image protocol is ready for display.
@@ -240,13 +241,13 @@ pub struct App {
     /// Configuration for directory/archive scanning.
     pub scan_config: ScanConfig,
     /// Active sequence counter for cooperative cancellation in worker threads.
-    pub(crate) active_sequence: Arc<AtomicUsize>,
+    pub active_sequence: Arc<AtomicUsize>,
     /// Timestamp of the last navigation action, used to detect fast scrolling.
-    pub(crate) last_nav_time: Option<Instant>,
+    pub last_nav_time: Option<Instant>,
     /// Flag indicating whether background prefetching is currently suspended due to fast scrolling.
-    pub(crate) prefetch_suspended: bool,
+    pub prefetch_suspended: bool,
     /// Active runtime terminal graphics protocol and its protocol-specific options.
-    pub(crate) active_protocol: crate::config::ActiveProtocol,
+    pub active_protocol: crate::config::ActiveProtocol,
 }
 
 impl App {
@@ -597,7 +598,7 @@ impl App {
     #[cfg(test)]
     /// Initializes an App instance with decoupled, synchronous mock channels.
     /// Does NOT spawn any background OS worker threads.
-    pub(crate) fn new_mocked(
+    pub fn new_mocked(
         images: Vec<ImageSource>,
         current_index: usize,
         picker: Picker,
@@ -633,7 +634,7 @@ impl App {
     }
 
     /// Returns the active viewport display state.
-    pub(crate) fn display_state(&self) -> ImageDisplayState<'_> {
+    pub fn display_state(&self) -> ImageDisplayState<'_> {
         let show_loading = self.is_loading
             && self.image_protocol.is_none()
             && self.thumbnail_image.is_none()
@@ -653,7 +654,7 @@ impl App {
     }
 
     /// Sets an error state, terminating loading and clearing image protocol and buffer data.
-    pub(crate) fn set_error_state(&mut self, msg: impl Into<String>) {
+    pub fn set_error_state(&mut self, msg: impl Into<String>) {
         self.error_message = Some(msg.into());
         self.is_loading = false;
         self.loading_start_time = None;
@@ -1077,7 +1078,7 @@ impl App {
 
 #[cfg(test)]
 /// Helper to instantiate a test App with mock channels without spawning worker threads.
-pub(crate) fn setup_test_app_with_channels() -> (App, MockChannels) {
+pub fn setup_test_app_with_channels() -> (App, MockChannels) {
     let images = vec![
         ImageSource::Local(std::path::PathBuf::from("img1.png")),
         ImageSource::Local(std::path::PathBuf::from("img2.png")),
@@ -1102,7 +1103,7 @@ pub(crate) fn setup_test_app_with_channels() -> (App, MockChannels) {
 
 #[cfg(test)]
 /// Helper to instantiate a test App without spawning worker threads.
-pub(crate) fn setup_test_app() -> App {
+pub fn setup_test_app() -> App {
     let (app, _) = setup_test_app_with_channels();
     app
 }

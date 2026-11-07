@@ -40,5 +40,5 @@ ______________________________________________________________________
 5. **API Visibility & Documentation Coverage**:
 
    - Enforce compiler-checked documentation coverage by keeping `#![warn(missing_docs)]` active at the crate root.
-   - Enforce encapsulation by keeping visibility as narrow as possible: always prefer `pub(crate)` or private over standard `pub` for structures, enums, fields, and functions that do not need to be exposed outside the crate boundary.
+   - Use standard `pub` for cross-module structures, enums, fields, and functions so visibility is consistent across the binary crate, while keeping module-internal helpers and state private.
    - All public and internal API surfaces must be thoroughly documented with standard Rust doc comments (`///` and `//!`).

@@ -12,7 +12,7 @@ pub use decoder::*;
 mod worker;
 pub use worker::*;
 
-pub(crate) mod thumbcache;
+pub mod thumbcache;
 
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
@@ -35,7 +35,7 @@ pub enum ImageSource {
 
 impl ImageSource {
     /// Returns a unique identifier string for the image source, using the provided current working directory.
-    pub(crate) fn identifier_with_cwd(&self, cwd: Option<&std::path::Path>) -> String {
+    pub fn identifier_with_cwd(&self, cwd: Option<&std::path::Path>) -> String {
         match self {
             Self::Local(path) => {
                 let abs = if path.is_absolute() {
@@ -94,7 +94,7 @@ impl ImageSource {
     }
 
     /// Returns the file extension of the image source as a string slice, if present.
-    pub(crate) fn extension(&self) -> Option<&str> {
+    pub fn extension(&self) -> Option<&str> {
         let ext = match self {
             Self::Local(path) => path.extension()?,
             Self::Cbz { file_in_zip, .. } => std::path::Path::new(file_in_zip).extension()?,
