@@ -221,12 +221,19 @@ pub fn process_resize(
     req: ResizeRequest,
     resizer: &mut fir::Resizer,
 ) -> (StatefulProtocol, std::time::Duration, std::time::Duration) {
+    let rendered_cells = req.rendered_size_cells;
     let start_process = std::time::Instant::now();
     let canvas = render_resize_canvas(&req, resizer);
     let process_duration = start_process.elapsed();
 
     let start_protocol = std::time::Instant::now();
-    let protocol = req.picker.new_resize_protocol(canvas);
+    let mut protocol = req.picker.new_resize_protocol(canvas);
+    let target_size = ratatui::layout::Size::new(rendered_cells.0, rendered_cells.1);
+    ratatui_image::ResizeEncodeRender::resize_encode(
+        &mut protocol,
+        &ratatui_image::Resize::Crop(None),
+        target_size,
+    );
     let protocol_duration = start_protocol.elapsed();
 
     (protocol, process_duration, protocol_duration)
@@ -432,7 +439,7 @@ mod tests {
             picker,
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
-            rendered_size_cells: (25, 25),
+            rendered_size_cells: (5, 3),
             sequence: 1,
         };
 
@@ -444,8 +451,19 @@ mod tests {
         assert_eq!(rgba.get_pixel(25, 25)[3], 255);
         assert_eq!(rgba.get_pixel(49, 49)[3], 255);
 
-        let (_proto, proc_dur, _proto_dur) = process_resize(req, &mut resizer);
+        let (proto, proc_dur, proto_dur) = process_resize(req, &mut resizer);
         assert!(proc_dur.as_nanos() > 0 || proc_dur.as_secs() == 0);
+        assert!(proto_dur.as_nanos() > 0 || proto_dur.as_secs() == 0);
+        let target_size = ratatui::layout::Size::new(5, 3);
+        assert!(
+            ratatui_image::ResizeEncodeRender::needs_resize(
+                &proto,
+                &ratatui_image::Resize::Crop(None),
+                target_size
+            )
+            .is_none(),
+            "Expected protocol to be pre-encoded for rendered_size_cells"
+        );
     }
 
     #[test]

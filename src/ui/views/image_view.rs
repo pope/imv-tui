@@ -26,7 +26,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 let y = area.y + (area.height.saturating_sub(rect_h)) / 2;
                 let centered_rect = Rect::new(x, y, rect_w, rect_h);
 
-                let image_widget = StatefulImage::default();
+                let image_widget =
+                    StatefulImage::default().resize(ratatui_image::Resize::Crop(None));
                 frame.render_stateful_widget(image_widget, centered_rect, protocol);
             }
         }
