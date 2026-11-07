@@ -239,9 +239,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             )
             .bold(),
         ]));
+        let proto_str = app.active_protocol.display_label();
         lines.push(Line::from(vec![
             "   Protocol Used: ".gray(),
-            format!("{:?}", app.picker.protocol_type()).bold(),
+            proto_str.bold(),
         ]));
         lines.push(Line::from(vec![
             "   Terminal API Write: ".gray(),

@@ -136,10 +136,23 @@ mod tests {
 
         // 4. Stats / Info dialog overlay (show_stats)
         app.palette_mode = PaletteMode::Info;
-        app.palette_height = 19;
+        app.palette_height = 22;
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("Image Details"));
+        assert!(rendered.contains("Halfblocks"));
+
+        // Test Kitty compression display
+        app.active_protocol = crate::config::ActiveProtocol::Kitty { compressed: true };
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let rendered_kitty_on = buffer_to_string(&terminal);
+        assert!(rendered_kitty_on.contains("Kitty (Compressed)"));
+
+        app.active_protocol = crate::config::ActiveProtocol::Kitty { compressed: false };
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let rendered_kitty_off = buffer_to_string(&terminal);
+        assert!(rendered_kitty_off.contains("Kitty"));
+        assert!(!rendered_kitty_off.contains("Compressed"));
     }
 
     #[test]

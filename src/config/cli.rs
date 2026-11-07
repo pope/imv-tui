@@ -1,3 +1,4 @@
+pub(crate) use super::{KittyCompression, ProtocolConfig};
 use crate::config::{InfoBarPosition, SlideshowState};
 use crate::imaging::{FilterType, ScaleMode};
 use ratatui_image::picker::ProtocolType;
@@ -10,8 +11,8 @@ pub struct CliOptions {
     pub initial_path: Option<PathBuf>,
     /// Scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming.
     pub filter: FilterType,
-    /// Terminal graphics protocol option: kitty, sixel, halfblocks, iterm2.
-    pub protocol: Option<ProtocolType>,
+    /// Terminal graphics protocol configuration.
+    pub(crate) protocol: ProtocolConfig,
     /// Image scale mode: none, actual, shrink, full, crop.
     pub scale: ScaleMode,
     /// Delay duration in seconds for slideshow transitions.
@@ -135,7 +136,8 @@ where
     let args: Vec<String> = args_iter.into_iter().collect();
     let mut initial_path: Option<PathBuf> = None;
     let mut filter = FilterType::Nearest;
-    let mut protocol = None;
+    let mut raw_protocol: Option<ProtocolType> = None;
+    let mut explicit_kitty_compress: Option<KittyCompression> = None;
     let mut scale = ScaleMode::Shrink;
     let mut slideshow = None;
     let mut check_magic = false;
@@ -183,7 +185,7 @@ where
                         ));
                     }
                 };
-                protocol = Some(proto);
+                raw_protocol = Some(proto);
             }
             "--scale" | "-s" => {
                 let flag = args[i].clone();
@@ -229,6 +231,22 @@ where
             "--no-thumbnail" => {
                 no_thumbnail = true;
                 i += 1;
+            }
+            "--kitty-compress" => {
+                let flag = args[i].clone();
+                let val = get_arg(&args, &mut i, &flag)?;
+                let mode = match val.to_lowercase().as_str() {
+                    "auto" => KittyCompression::Auto,
+                    "always" => KittyCompression::Always,
+                    "never" => KittyCompression::Never,
+                    other => {
+                        return Err(format!(
+                            "Error: Unknown kitty-compress mode '{}'. Choose from: auto, always, never",
+                            other
+                        ));
+                    }
+                };
+                explicit_kitty_compress = Some(mode);
             }
             "--infobar" => {
                 let flag = args[i].clone();
@@ -290,6 +308,9 @@ where
                     "      --no-thumbnail         Disable low-res EXIF thumbnail placeholder loading"
                 );
                 println!(
+                    "      --kitty-compress <mode>  Kitty zlib compression mode: auto, always, never (defaults to auto)"
+                );
+                println!(
                     "  -i, --import <file>        Import image classification/flagged states from a file (.json or prefix text)"
                 );
                 println!(
@@ -333,6 +354,8 @@ where
         export_path = Some(path);
     }
 
+    let protocol = ProtocolConfig::from_cli(raw_protocol, explicit_kitty_compress)?;
+
     Ok(CliOptions {
         initial_path,
         filter,
@@ -351,6 +374,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ActiveProtocol;
 
     #[test]
     fn test_sync_exclusion() {
@@ -519,7 +543,156 @@ mod tests {
         ];
         let opts = parse_cli_args_from(args).unwrap();
         assert_eq!(opts.filter, FilterType::Lanczos);
-        assert_eq!(opts.protocol, Some(ProtocolType::Kitty));
+        assert_eq!(
+            opts.protocol,
+            ProtocolConfig::Kitty {
+                compression: KittyCompression::Auto,
+            }
+        );
         assert_eq!(opts.scale, ScaleMode::Crop);
+    }
+
+    #[test]
+    fn test_kitty_compress_parsing_and_env_resolution() {
+        // 1. Valid parsing without explicit protocol produces ProtocolConfig::Auto with explicit_kitty_compress
+        for (flag_val, expected) in [
+            ("auto", KittyCompression::Auto),
+            ("AUTO", KittyCompression::Auto),
+            ("Auto", KittyCompression::Auto),
+            ("always", KittyCompression::Always),
+            ("ALWAYS", KittyCompression::Always),
+            ("never", KittyCompression::Never),
+            ("NEVER", KittyCompression::Never),
+        ] {
+            let args = vec![
+                "imv-tui".to_string(),
+                "--kitty-compress".to_string(),
+                flag_val.to_string(),
+            ];
+            let opts = parse_cli_args_from(args).unwrap();
+            assert_eq!(
+                opts.protocol,
+                ProtocolConfig::Auto {
+                    explicit_kitty_compress: Some(expected),
+                }
+            );
+        }
+
+        // 2. Default value
+        let default_opts = parse_cli_args_from(["imv-tui".to_string()]).unwrap();
+        assert_eq!(
+            default_opts.protocol,
+            ProtocolConfig::Auto {
+                explicit_kitty_compress: None,
+            }
+        );
+
+        // 3. Invalid mode rejection
+        let invalid_args = vec![
+            "imv-tui".to_string(),
+            "--kitty-compress".to_string(),
+            "invalid".to_string(),
+        ];
+        let err = parse_cli_args_from(invalid_args).err().unwrap();
+        assert!(err.contains("Unknown kitty-compress mode 'invalid'"));
+
+        // 4. Incompatible protocol combinations fail regardless of argument order
+        for (proto, mode) in [
+            ("iterm2", "always"),
+            ("sixel", "never"),
+            ("halfblocks", "auto"),
+        ] {
+            let args1 = vec![
+                "imv-tui".to_string(),
+                "--protocol".to_string(),
+                proto.to_string(),
+                "--kitty-compress".to_string(),
+                mode.to_string(),
+            ];
+            let err1 = parse_cli_args_from(args1).err().unwrap();
+            assert_eq!(
+                err1,
+                "Error: Option --kitty-compress can only be used with the kitty protocol"
+            );
+
+            let args2 = vec![
+                "imv-tui".to_string(),
+                "--kitty-compress".to_string(),
+                mode.to_string(),
+                "--protocol".to_string(),
+                proto.to_string(),
+            ];
+            let err2 = parse_cli_args_from(args2).err().unwrap();
+            assert_eq!(
+                err2,
+                "Error: Option --kitty-compress can only be used with the kitty protocol"
+            );
+        }
+
+        // 5. Compatible protocol combination with Kitty
+        let kitty_args = vec![
+            "imv-tui".to_string(),
+            "--protocol".to_string(),
+            "kitty".to_string(),
+            "--kitty-compress".to_string(),
+            "always".to_string(),
+        ];
+        let kitty_opts = parse_cli_args_from(kitty_args).unwrap();
+        assert_eq!(
+            kitty_opts.protocol,
+            ProtocolConfig::Kitty {
+                compression: KittyCompression::Always,
+            }
+        );
+
+        // 6. resolve_active_protocol enforcement
+        let auto_explicit = ProtocolConfig::Auto {
+            explicit_kitty_compress: Some(KittyCompression::Always),
+        };
+        let err = auto_explicit
+            .resolve_active_protocol(ProtocolType::Sixel, true)
+            .err()
+            .unwrap();
+        assert!(err.contains("detected terminal protocol is Sixel (not Kitty)"));
+
+        let auto_default = ProtocolConfig::Auto {
+            explicit_kitty_compress: None,
+        };
+        assert_eq!(
+            auto_default
+                .resolve_active_protocol(ProtocolType::Sixel, false)
+                .unwrap(),
+            ActiveProtocol::Sixel
+        );
+        assert_eq!(
+            auto_default
+                .resolve_active_protocol(ProtocolType::Kitty, true)
+                .unwrap(),
+            ActiveProtocol::Kitty { compressed: true }
+        );
+
+        // 7. ActiveProtocol helpers
+        assert_eq!(
+            ActiveProtocol::from_protocol_type(ProtocolType::Kitty, true),
+            ActiveProtocol::Kitty { compressed: true }
+        );
+        assert_eq!(
+            ActiveProtocol::from_protocol_type(ProtocolType::Iterm2, false),
+            ActiveProtocol::Iterm2
+        );
+        assert_eq!(
+            ActiveProtocol::from_protocol_type(ProtocolType::Halfblocks, false),
+            ActiveProtocol::Halfblocks
+        );
+
+        // 8. should_compress_for_env resolution logic
+        assert!(!KittyCompression::Auto.should_compress_for_env(false));
+        assert!(KittyCompression::Auto.should_compress_for_env(true));
+
+        assert!(KittyCompression::Always.should_compress_for_env(false));
+        assert!(KittyCompression::Always.should_compress_for_env(true));
+
+        assert!(!KittyCompression::Never.should_compress_for_env(false));
+        assert!(!KittyCompression::Never.should_compress_for_env(true));
     }
 }

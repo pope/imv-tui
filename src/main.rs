@@ -113,10 +113,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Query terminal protocol before raw mode
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    if let Some(proto) = options.protocol {
+    let kitty_compression = options.protocol.should_enable_kitty_compression();
+    let query_options = ratatui_image::picker::cap_parser::QueryStdioOptions {
+        kitty_compression,
+        ..Default::default()
+    };
+    let mut picker = Picker::from_query_stdio_with_options(query_options)
+        .unwrap_or_else(|_| Picker::halfblocks());
+    if let Some(proto) = options.protocol.forced_protocol_type() {
         picker.set_protocol_type(proto);
     }
+    let active_protocol = options
+        .protocol
+        .resolve_active_protocol(picker.protocol_type(), kitty_compression)?;
 
     // Setup terminal using RAII guard
     let _guard = TerminalGuard::new()?;
@@ -129,6 +138,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         scale_mode,
         disable_thumbnail: options.no_thumbnail,
         infobar: options.infobar,
+        active_protocol,
     };
 
     let scan_config = crate::app::ScanConfig {

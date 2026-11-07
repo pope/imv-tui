@@ -30,6 +30,7 @@ fn test_import_export_text_and_json() {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: PathBuf::from("."),
@@ -168,6 +169,7 @@ fn test_unmapped_classifications_preservation() {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: PathBuf::from("."),
@@ -240,6 +242,7 @@ fn test_refresh_files_preservation() {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: PathBuf::from("target/tmp/refresh_test"),
@@ -310,6 +313,7 @@ fn test_refresh_files_unmapped_migration() {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: PathBuf::from("target/tmp/refresh_unmapped_test"),
@@ -374,6 +378,7 @@ fn test_prefetch_cache_retention_and_hits() {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: PathBuf::from("."),
@@ -792,6 +797,7 @@ fn setup_multi_image_app(count: usize) -> (App, MockChannels) {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: false,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: PathBuf::from("."),

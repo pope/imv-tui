@@ -89,6 +89,19 @@ pub struct AppConfig {
     pub scale_mode: ScaleMode,
     pub disable_thumbnail: bool,
     pub infobar: InfoBarPosition,
+    pub(crate) active_protocol: crate::config::ActiveProtocol,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            filter_type: FilterType::Nearest,
+            scale_mode: ScaleMode::Shrink,
+            disable_thumbnail: false,
+            infobar: InfoBarPosition::Bottom,
+            active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        }
+    }
 }
 
 /// Configuration parameters for directory/archive scanning.
@@ -232,6 +245,8 @@ pub struct App {
     pub(crate) last_nav_time: Option<Instant>,
     /// Flag indicating whether background prefetching is currently suspended due to fast scrolling.
     pub(crate) prefetch_suspended: bool,
+    /// Active runtime terminal graphics protocol and its protocol-specific options.
+    pub(crate) active_protocol: crate::config::ActiveProtocol,
 }
 
 impl App {
@@ -575,6 +590,7 @@ impl App {
             active_sequence,
             last_nav_time: None,
             prefetch_suspended: false,
+            active_protocol: config.active_protocol,
         }
     }
 
@@ -1072,6 +1088,7 @@ pub(crate) fn setup_test_app_with_channels() -> (App, MockChannels) {
         scale_mode: crate::imaging::ScaleMode::Shrink,
         disable_thumbnail: false,
         infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
     };
     let scan_config = ScanConfig {
         initial_scan_path: std::path::PathBuf::from("."),
