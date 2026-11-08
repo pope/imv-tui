@@ -20,7 +20,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
-use crate::app::{App, Classification, ImageDisplayState};
+use crate::app::{App, ImageDisplayState};
 use crate::config::cli::{parse_cli_args, read_piped_stdin, reopen_tty_stdin};
 use crate::imaging::{ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory};
 use crate::ui::ui;
@@ -280,17 +280,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.export_classifications(path).map_err(io::Error::other)?;
     } else {
         // Output flagged files to stdout using tab-separated format
-        for (idx, &class) in app.classifications().iter().enumerate() {
-            if class != Classification::Unflagged {
-                let img = &app.queue.images()[idx];
-                println!("{}\t{}", class.export_prefix(), img.identifier());
-            }
-        }
-        for (key, &(class, _)) in &app.unmapped_classifications {
-            if class != Classification::Unflagged {
-                println!("{}\t{}", class.export_prefix(), key);
-            }
-        }
+        app.write_classifications_tsv(io::stdout().lock())?;
     }
 
     Ok(())

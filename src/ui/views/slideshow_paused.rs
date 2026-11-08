@@ -1,5 +1,4 @@
 use crate::app::App;
-use crate::config::InfoBarPosition;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -14,9 +13,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let w = 34.min(area.width.saturating_sub(1)).max(1);
-    let h = 3.min(area.height.saturating_sub(1)).max(1);
-
     let block = Block::default()
         .title(" Slideshow Paused ")
         .borders(Borders::ALL)
@@ -30,17 +26,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-    let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
-    let y = if app.infobar == InfoBarPosition::Top {
-        area.y
-    } else {
-        area.y.saturating_add(1)
-    };
-
-    let x = x.min(area.right().saturating_sub(w));
-    let y = y.min(area.bottom().saturating_sub(h));
-
-    let popup_area = Rect::new(x, y, w, h);
+    let popup_area = super::top_right_popup_rect(area, 34, 3, app.infobar);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(paragraph, popup_area);
 }

@@ -120,9 +120,71 @@ pub fn filter_commands(
     scratch.clear();
 }
 
+/// Computes the centered scroll offset (`start_idx`) for a palette list of `total_items`
+/// with `visible_count` rows and current selection `selected_index`.
+#[inline]
+pub fn centered_scroll_offset(
+    selected_index: usize,
+    total_items: usize,
+    visible_count: usize,
+) -> usize {
+    let half_visible = visible_count / 2;
+    if total_items <= visible_count || selected_index < half_visible {
+        0
+    } else if selected_index >= total_items.saturating_sub(half_visible) {
+        total_items.saturating_sub(visible_count)
+    } else {
+        selected_index.saturating_sub(half_visible)
+    }
+}
+
+/// Computes the page jump step size for palette `PageUp` / `PageDown` navigation.
+#[inline]
+pub fn palette_page_size(terminal_height: u16, total_items: usize) -> usize {
+    let viewport_h = terminal_height.saturating_sub(1);
+    let max_h = (viewport_h as f64 * 0.5).round() as u16;
+    let palette_h = (total_items.min(u16::MAX as usize) as u16)
+        .saturating_add(4)
+        .max(12)
+        .min(max_h);
+    (palette_h as usize).saturating_sub(4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_centered_scroll_offset() {
+        // total_items <= visible_count: always 0
+        assert_eq!(centered_scroll_offset(0, 5, 10), 0);
+        assert_eq!(centered_scroll_offset(4, 5, 10), 0);
+
+        // total_items = 20, visible_count = 6 (half_visible = 3)
+        // At head
+        assert_eq!(centered_scroll_offset(0, 20, 6), 0);
+        assert_eq!(centered_scroll_offset(2, 20, 6), 0);
+        // In middle
+        assert_eq!(centered_scroll_offset(3, 20, 6), 0);
+        assert_eq!(centered_scroll_offset(5, 20, 6), 2);
+        assert_eq!(centered_scroll_offset(10, 20, 6), 7);
+        // Near tail: total_items - half_visible = 17
+        assert_eq!(centered_scroll_offset(17, 20, 6), 14);
+        assert_eq!(centered_scroll_offset(19, 20, 6), 14);
+    }
+
+    #[test]
+    fn test_palette_page_size() {
+        // Very small terminal height (e.g. 10): viewport_h = 9, max_h = 5, palette_h = 12.min(5) = 5, page_size = 1
+        assert_eq!(palette_page_size(10, 100), 1);
+
+        // Standard terminal height (e.g. 50): viewport_h = 49, max_h = 25
+        // Small item count (e.g. 2): palette_h = (2+4).max(12).min(25) = 12, page_size = 12 - 4 = 8
+        assert_eq!(palette_page_size(50, 2), 8);
+
+        // Large item count (e.g. 100): palette_h = (100+4).max(12).min(25) = 25, page_size = 25 - 4 = 21
+        assert_eq!(palette_page_size(50, 100), 21);
+    }
 
     #[test]
     fn test_filter_files_visibility_predicate() {

@@ -1489,6 +1489,26 @@ impl App {
         })();
         self.close_palette();
     }
+
+    /// Writes all non-unflagged classifications (active queue and unmapped entries) in
+    /// tab-separated `<PREFIX>\t<IDENTIFIER>` format to `writer`.
+    pub fn write_classifications_tsv<W: std::io::Write>(
+        &self,
+        mut writer: W,
+    ) -> std::io::Result<()> {
+        for (idx, &class) in self.classifications().iter().enumerate() {
+            if class != Classification::Unflagged {
+                let img = &self.queue.images()[idx];
+                writeln!(writer, "{}\t{}", class.export_prefix(), img.identifier())?;
+            }
+        }
+        for (key, &(class, _)) in &self.unmapped_classifications {
+            if class != Classification::Unflagged {
+                writeln!(writer, "{}\t{}", class.export_prefix(), key)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -122,10 +122,7 @@ impl App {
                             PaletteMode::Command => self.get_filtered_commands().len(),
                             _ => 0,
                         };
-                        let viewport_h = terminal_height.saturating_sub(1);
-                        let max_h = (viewport_h as f64 * 0.5).round() as u16;
-                        let palette_h = (max_len as u16 + 4).max(12).min(max_h);
-                        let page_size = (palette_h as usize).saturating_sub(4);
+                        let page_size = super::palette::palette_page_size(terminal_height, max_len);
 
                         self.palette_selected_index =
                             self.palette_selected_index.saturating_sub(page_size);
@@ -143,10 +140,8 @@ impl App {
                             _ => 0,
                         };
                         if max_len > 0 {
-                            let viewport_h = terminal_height.saturating_sub(1);
-                            let max_h = (viewport_h as f64 * 0.5).round() as u16;
-                            let palette_h = (max_len as u16 + 4).max(12).min(max_h);
-                            let page_size = (palette_h as usize).saturating_sub(4);
+                            let page_size =
+                                super::palette::palette_page_size(terminal_height, max_len);
 
                             self.palette_selected_index =
                                 (self.palette_selected_index + page_size).min(max_len - 1);

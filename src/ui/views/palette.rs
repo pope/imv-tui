@@ -1,5 +1,4 @@
 use crate::app::{App, PaletteMode};
-use crate::config::InfoBarPosition;
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -43,15 +42,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let filtered_files = app.get_filtered_files();
 
             let total_files = filtered_files.len();
-            let half_visible = visible_count / 2;
-            let start_idx =
-                if total_files <= visible_count || app.palette_selected_index < half_visible {
-                    0
-                } else if app.palette_selected_index >= total_files.saturating_sub(half_visible) {
-                    total_files.saturating_sub(visible_count)
-                } else {
-                    app.palette_selected_index.saturating_sub(half_visible)
-                };
+            let start_idx = crate::app::palette::centered_scroll_offset(
+                app.palette_selected_index,
+                total_files,
+                visible_count,
+            );
             scroll_pos = start_idx;
             total_items = total_files;
 
@@ -92,15 +87,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let all_commands = crate::commands::get_commands();
 
             let total_cmds = filtered_commands.len();
-            let half_visible = visible_count / 2;
-            let start_idx =
-                if total_cmds <= visible_count || app.palette_selected_index < half_visible {
-                    0
-                } else if app.palette_selected_index >= total_cmds.saturating_sub(half_visible) {
-                    total_cmds.saturating_sub(visible_count)
-                } else {
-                    app.palette_selected_index.saturating_sub(half_visible)
-                };
+            let start_idx = crate::app::palette::centered_scroll_offset(
+                app.palette_selected_index,
+                total_cmds,
+                visible_count,
+            );
             scroll_pos = start_idx;
             total_items = total_cmds;
 
@@ -154,22 +145,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .block(palette_block)
         .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-    let w = palette_width.min(area.width.saturating_sub(1));
-    let h = palette_height.min(area.height.saturating_sub(1));
-    let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
-    let y = if app.infobar == InfoBarPosition::Top {
-        area.y
-    } else {
-        area.y.saturating_add(1)
-    };
-
-    // Ensure popup fits entirely within the parent area
-    let w = w.max(1);
-    let h = h.max(1);
-    let x = x.min(area.right().saturating_sub(w));
-    let y = y.min(area.bottom().saturating_sub(h));
-
-    let popup_area = Rect::new(x, y, w, h);
+    let popup_area = super::top_right_popup_rect(area, palette_width, palette_height, app.infobar);
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(palette_paragraph, popup_area);

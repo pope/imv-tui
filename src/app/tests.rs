@@ -121,6 +121,68 @@ fn test_import_export_text_and_json() {
 }
 
 #[test]
+fn test_write_classifications_tsv() {
+    let images = vec![
+        ImageSource::Local(PathBuf::from("img1.png")),
+        ImageSource::Local(PathBuf::from("img2.png")),
+        ImageSource::Cbz {
+            zip_path: PathBuf::from("archive.cbz"),
+            file_in_zip: "page1.png".to_string(),
+        },
+    ];
+
+    let picker = Picker::halfblocks();
+    let app_config = AppConfig {
+        filter_type: crate::imaging::FilterType::Nearest,
+        scale_mode: crate::imaging::ScaleMode::Shrink,
+        disable_thumbnail: true,
+        infobar: InfoBarPosition::Bottom,
+        active_protocol: crate::config::ActiveProtocol::Halfblocks,
+    };
+    let scan_config = ScanConfig::Directory {
+        path: PathBuf::from("."),
+        check_magic: false,
+        recursive: false,
+    };
+    let (mut app, _channels) = App::new_mocked(images, 0, picker, app_config, scan_config).unwrap();
+
+    // Set queue classifications
+    app.queue.set_classification(0, Classification::Pick);
+    app.queue.set_classification(1, Classification::Unflagged);
+    app.queue.set_classification(2, Classification::Reject);
+
+    // Add unmapped classifications: one flagged, one unflagged
+    app.unmapped_classifications.insert(
+        "/abs/path/missing1.png".to_string(),
+        (Classification::Pick, ImageAdjustments::default()),
+    );
+    app.unmapped_classifications.insert(
+        "/abs/path/missing2.png".to_string(),
+        (Classification::Unflagged, ImageAdjustments::default()),
+    );
+
+    let mut buf = Vec::new();
+    app.write_classifications_tsv(&mut buf).unwrap();
+    let output = String::from_utf8(buf).unwrap();
+
+    let lines: Vec<&str> = output.lines().collect();
+    let img1_id = app.queue.images()[0].identifier();
+    let img3_id = app.queue.images()[2].identifier();
+    let expected_img1 = format!("{}\t{}", Classification::Pick.export_prefix(), img1_id);
+    let expected_img3 = format!("{}\t{}", Classification::Reject.export_prefix(), img3_id);
+    let expected_unmapped = format!(
+        "{}\t/abs/path/missing1.png",
+        Classification::Pick.export_prefix()
+    );
+    assert!(lines.contains(&expected_img1.as_str()));
+    assert!(lines.contains(&expected_img3.as_str()));
+    assert!(lines.contains(&expected_unmapped.as_str()));
+    assert!(!lines.iter().any(|l| l.contains("img2.png")));
+    assert!(!lines.iter().any(|l| l.contains("missing2.png")));
+    assert_eq!(lines.len(), 3);
+}
+
+#[test]
 fn test_unmapped_classifications_preservation() {
     let _ = std::fs::create_dir_all("target/tmp");
     let manifest_path = PathBuf::from("target/tmp/unmapped_test.json");
