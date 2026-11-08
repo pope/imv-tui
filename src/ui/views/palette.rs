@@ -57,14 +57,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
             let max_path_len = inner_w.saturating_sub(6);
 
-            for (i, item) in filtered_files
+            for (i, &orig_idx) in filtered_files
                 .iter()
                 .enumerate()
                 .skip(start_idx)
                 .take(visible_count)
             {
-                let orig_idx = item.0;
-                let filename = &item.1;
+                let filename = &app.queue.relative_paths()[orig_idx];
                 let display_path = shorten_path(filename, max_path_len);
                 let class = app.queue.classification(orig_idx);
                 let class_prefix = class.search_prefix();
@@ -72,10 +71,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     Line::from(vec![
                         " > ".bold().yellow().on_blue(),
                         class_prefix.bold().yellow().on_blue(),
-                        display_path.bold().yellow().on_blue(),
+                        Span::from(display_path).bold().yellow().on_blue(),
                     ])
                 } else {
-                    Line::from(vec!["   ".into(), class_prefix.into(), display_path.into()])
+                    Line::from(vec![
+                        "   ".into(),
+                        class_prefix.into(),
+                        Span::from(display_path),
+                    ])
                 };
                 lines.push(line);
             }
@@ -86,6 +89,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
         PaletteMode::Command => {
             let filtered_commands = app.get_filtered_commands();
+            let all_commands = crate::commands::get_commands();
 
             let total_cmds = filtered_commands.len();
             let half_visible = visible_count / 2;
@@ -100,12 +104,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             scroll_pos = start_idx;
             total_items = total_cmds;
 
-            for (i, cmd) in filtered_commands
+            for (i, &cmd_idx) in filtered_commands
                 .iter()
                 .enumerate()
                 .skip(start_idx)
                 .take(visible_count)
             {
+                let cmd = &all_commands[cmd_idx];
                 let mut cmd_line = vec![
                     if i == app.palette_selected_index {
                         " > "
@@ -199,50 +204,58 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn shorten_path(path_str: &str, max_len: usize) -> String {
+fn get_elided_suffix(s: &str, elided_len: usize) -> std::borrow::Cow<'_, str> {
+    if elided_len == 0 {
+        return std::borrow::Cow::Borrowed("...");
+    }
+    if s.char_indices().rev().nth(elided_len).is_some() {
+        let (start_idx, _) = s.char_indices().rev().nth(elided_len - 1).unwrap();
+        std::borrow::Cow::Owned(format!("...{}", &s[start_idx..]))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+fn shorten_path(path_str: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
     if path_str.len() <= max_len {
-        return path_str.to_string();
+        return std::borrow::Cow::Borrowed(path_str);
     }
 
     let path = std::path::Path::new(path_str);
-    let components: Vec<&str> = path
+    let mut first = None;
+    let mut last = None;
+    let mut count = 0usize;
+    for s in path
         .components()
-        .map(|c| c.as_os_str().to_str().unwrap_or(""))
+        .filter_map(|c| c.as_os_str().to_str())
         .filter(|s| !s.is_empty())
-        .collect();
-
-    if components.is_empty() {
-        return path_str.to_string();
+    {
+        if first.is_none() {
+            first = Some(s);
+        }
+        last = Some(s);
+        count += 1;
     }
 
-    let last = components[components.len() - 1];
+    if count == 0 {
+        return std::borrow::Cow::Borrowed(path_str);
+    }
 
-    let get_elided_suffix = |s: &str, elided_len: usize| -> String {
-        if elided_len == 0 {
-            return "...".to_string();
-        }
-        let char_indices: Vec<(usize, char)> = s.char_indices().collect();
-        if char_indices.len() > elided_len {
-            let start_idx = char_indices[char_indices.len() - elided_len].0;
-            format!("...{}", &s[start_idx..])
-        } else {
-            s.to_string()
-        }
-    };
+    let first = first.unwrap();
+    let last = last.unwrap();
 
-    if components.len() <= 2 {
+    if count <= 2 {
         if last.len() <= max_len {
-            last.to_string()
+            std::borrow::Cow::Borrowed(last)
         } else {
             get_elided_suffix(last, max_len.saturating_sub(3))
         }
     } else {
-        let first = components[0];
-        let collapsed = format!("{}/.../{}", first, last);
-        if collapsed.len() <= max_len {
-            collapsed
+        let collapsed_len = first.len() + 5 + last.len();
+        if collapsed_len <= max_len {
+            std::borrow::Cow::Owned(format!("{}/.../{}", first, last))
         } else if last.len() <= max_len {
-            last.to_string()
+            std::borrow::Cow::Borrowed(last)
         } else {
             get_elided_suffix(last, max_len.saturating_sub(3))
         }

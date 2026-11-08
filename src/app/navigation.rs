@@ -180,13 +180,15 @@ impl App {
             .rescan_preserving_state(new_images, &mut self.unmapped_classifications)?;
 
         // Reset search/fuzzy matching filtered files
-        self.filtered_files = self
-            .queue
-            .relative_paths()
-            .iter()
-            .enumerate()
-            .map(|(idx, path)| (idx, path.clone()))
-            .collect();
+        if self.palette_mode == crate::app::PaletteMode::File {
+            self.update_palette_filter();
+        } else {
+            self.filtered_files.clear();
+            if self.filtered_files.capacity() > crate::app::palette::MAX_IDLE_PALETTE_CAPACITY {
+                self.filtered_files
+                    .shrink_to(crate::app::palette::MAX_IDLE_PALETTE_CAPACITY);
+            }
+        }
 
         // Adjust selected index for visibility in case files are filtered out
         self.adjust_current_index_for_visibility();

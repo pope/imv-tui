@@ -8,7 +8,7 @@ use strum::IntoEnumIterator;
 pub mod registry;
 
 pub use crate::config::keys::KeyDef;
-pub use registry::{PaletteCommand, get_commands};
+pub use registry::get_commands;
 
 /// User-facing metadata for a Command.
 #[derive(Debug, Clone, Copy)]

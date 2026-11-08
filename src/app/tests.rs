@@ -1379,3 +1379,27 @@ fn test_total_pipeline_duration_thumbnail_and_cache_hit_math() {
         Duration::from_micros(2200)
     );
 }
+
+#[test]
+fn test_palette_arena_shrink_on_close() {
+    let (mut app, _channels) = setup_test_app_with_channels();
+    // Build a large queue of 2000 images
+    let large_images: Vec<ImageSource> = (0..2000)
+        .map(|i| ImageSource::Local(std::path::PathBuf::from(format!("img_{:04}.png", i))))
+        .collect();
+    app.queue = ImageQueue::new(large_images, 0).unwrap();
+
+    // Open file palette and update filter (empty query returns all 2000 items)
+    app.open_palette(PaletteMode::File);
+    app.update_palette_filter();
+    assert_eq!(app.filtered_files.len(), 2000);
+    assert!(app.filtered_files.capacity() >= 2000);
+
+    // Close palette and assert capacity shrinks to <= MAX_IDLE_PALETTE_CAPACITY
+    app.close_palette();
+    assert_eq!(app.palette_mode, PaletteMode::Closed);
+    assert_eq!(app.filtered_files.len(), 0);
+    assert!(app.filtered_files.capacity() <= crate::app::palette::MAX_IDLE_PALETTE_CAPACITY);
+    assert!(app.palette_scratch.capacity() <= crate::app::palette::MAX_IDLE_PALETTE_CAPACITY);
+    assert!(app.filtered_commands.capacity() <= crate::app::palette::MAX_IDLE_PALETTE_CAPACITY);
+}

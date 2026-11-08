@@ -1,4 +1,7 @@
-use crate::commands::{PaletteCommand, get_commands};
+use crate::commands::get_commands;
+
+/// Maximum retained capacity for idle palette scratch and filter buffers.
+pub const MAX_IDLE_PALETTE_CAPACITY: usize = 1024;
 
 /// The specific input prompt type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,93 +38,86 @@ pub fn filter_files(
     display_names_lowercase: &[String],
     matcher: &mut nucleo::Matcher,
     is_visible: impl Fn(usize) -> bool,
-) -> Vec<(usize, String)> {
-    if query.is_empty() {
-        return display_names
-            .iter()
-            .enumerate()
-            .filter(|&(idx, _)| is_visible(idx))
-            .map(|(idx, name)| (idx, name.clone()))
-            .collect();
+    out: &mut Vec<usize>,
+    scratch: &mut Vec<(u32, usize)>,
+) {
+    out.clear();
+    scratch.clear();
+
+    let q = query.trim();
+    if q.is_empty() {
+        for idx in 0..display_names.len() {
+            if is_visible(idx) {
+                out.push(idx);
+            }
+        }
+        return;
     }
 
     let pattern = nucleo::pattern::Pattern::parse(
-        query,
+        q,
         nucleo::pattern::CaseMatching::Ignore,
         nucleo::pattern::Normalization::Smart,
     );
 
-    #[derive(Clone)]
-    struct FileCandidate<'a> {
-        index: usize,
-        name: &'a str,
-    }
-    impl<'a> AsRef<str> for FileCandidate<'a> {
-        fn as_ref(&self) -> &str {
-            self.name
+    let mut utf32_buf = Vec::new();
+    for (idx, name) in display_names_lowercase.iter().enumerate() {
+        if !is_visible(idx) {
+            continue;
+        }
+        let haystack = nucleo::Utf32Str::new(name, &mut utf32_buf);
+        if let Some(score) = pattern.score(haystack, matcher) {
+            scratch.push((score, idx));
         }
     }
 
-    let candidates: Vec<FileCandidate<'_>> = display_names_lowercase
-        .iter()
-        .enumerate()
-        .filter(|&(index, _)| is_visible(index))
-        .map(|(index, name)| FileCandidate {
-            index,
-            name: name.as_str(),
-        })
-        .collect();
-
-    let mut matches = pattern.match_list(candidates, matcher);
-    matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.index.cmp(&b.0.index)));
-
-    matches
-        .into_iter()
-        .map(|(candidate, _score)| (candidate.index, display_names[candidate.index].clone()))
-        .collect()
+    scratch.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.extend(scratch.iter().map(|&(_, idx)| idx));
+    scratch.clear();
 }
 
-pub fn filter_commands(query: &str, matcher: &mut nucleo::Matcher) -> Vec<PaletteCommand> {
-    if query.is_empty() {
-        return get_commands()
-            .iter()
-            .filter(|cmd| cmd.item.show_in_palette)
-            .cloned()
-            .collect();
+/// Filters palette commands matching an optional query string using nucleo fuzzy search.
+pub fn filter_commands(
+    query: &str,
+    matcher: &mut nucleo::Matcher,
+    out: &mut Vec<usize>,
+    scratch: &mut Vec<(u32, usize)>,
+) {
+    out.clear();
+    scratch.clear();
+
+    let q = query.trim();
+    let commands = get_commands();
+
+    if q.is_empty() {
+        for (idx, cmd) in commands.iter().enumerate() {
+            if cmd.item.show_in_palette {
+                out.push(idx);
+            }
+        }
+        return;
     }
 
     let pattern = nucleo::pattern::Pattern::parse(
-        query,
+        q,
         nucleo::pattern::CaseMatching::Ignore,
         nucleo::pattern::Normalization::Smart,
     );
 
-    #[derive(Clone)]
-    struct CmdCandidate {
-        cmd: PaletteCommand,
-    }
-    impl AsRef<str> for CmdCandidate {
-        fn as_ref(&self) -> &str {
-            &self.cmd.search_text
+    let mut utf32_buf = Vec::new();
+    for (idx, cmd) in commands.iter().enumerate() {
+        if !cmd.item.show_in_palette {
+            continue;
+        }
+        let haystack = nucleo::Utf32Str::new(&cmd.search_text, &mut utf32_buf);
+        if let Some(score) = pattern.score(haystack, matcher) {
+            scratch.push((score, idx));
         }
     }
 
-    let candidates: Vec<CmdCandidate> = get_commands()
-        .iter()
-        .filter(|cmd| cmd.item.show_in_palette)
-        .map(|cmd| CmdCandidate { cmd: cmd.clone() })
-        .collect();
-
-    let mut matches = pattern.match_list(candidates, matcher);
-    matches.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| (a.0.cmd.cmd as usize).cmp(&(b.0.cmd.cmd as usize)))
-    });
-
-    matches
-        .into_iter()
-        .map(|(candidate, _score)| candidate.cmd)
-        .collect()
+    scratch.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.extend(scratch.iter().map(|&(_, idx)| idx));
+    scratch.clear();
 }
 
 #[cfg(test)]
@@ -141,27 +137,58 @@ mod tests {
             "photo2.jpg".to_string(),
             "photo3.png".to_string(),
         ];
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
 
         // Only index 0 and 2 visible
-        let res = filter_files("", &names, &names_lower, &mut matcher, |idx| {
-            idx == 0 || idx == 2
-        });
-        assert_eq!(res.len(), 2);
-        assert_eq!(res[0].0, 0);
-        assert_eq!(res[1].0, 2);
+        filter_files(
+            "",
+            &names,
+            &names_lower,
+            &mut matcher,
+            |idx| idx == 0 || idx == 2,
+            &mut out,
+            &mut scratch,
+        );
+        assert_eq!(out, vec![0, 2]);
 
         // Search with query
-        let res = filter_files("photo3", &names, &names_lower, &mut matcher, |idx| {
-            idx == 0 || idx == 2
-        });
-        assert_eq!(res.len(), 1);
-        assert_eq!(res[0].0, 2);
-        assert_eq!(res[0].1, "photo3.png");
+        filter_files(
+            "photo3",
+            &names,
+            &names_lower,
+            &mut matcher,
+            |idx| idx == 0 || idx == 2,
+            &mut out,
+            &mut scratch,
+        );
+        assert_eq!(out, vec![2]);
 
         // Filtered out by visibility
-        let res = filter_files("photo2", &names, &names_lower, &mut matcher, |idx| {
-            idx == 0 || idx == 2
-        });
-        assert!(res.is_empty());
+        filter_files(
+            "photo2",
+            &names,
+            &names_lower,
+            &mut matcher,
+            |idx| idx == 0 || idx == 2,
+            &mut out,
+            &mut scratch,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_filter_commands_search_and_ordering() {
+        let mut matcher = nucleo::Matcher::new(nucleo::Config::DEFAULT);
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+
+        filter_commands("", &mut matcher, &mut out, &mut scratch);
+        assert!(!out.is_empty());
+
+        filter_commands("quit", &mut matcher, &mut out, &mut scratch);
+        assert!(!out.is_empty());
+        let top_cmd = &get_commands()[out[0]];
+        assert_eq!(top_cmd.cmd, crate::commands::Command::Quit);
     }
 }

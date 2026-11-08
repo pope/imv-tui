@@ -17,8 +17,7 @@ impl App {
         {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    self.palette_mode = PaletteMode::Closed;
-                    self.needs_clear = true;
+                    self.close_palette();
                     return;
                 }
                 KeyCode::Char('d') => {
@@ -26,8 +25,7 @@ impl App {
                         .last_info_toggle
                         .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(200))
                     {
-                        self.palette_mode = PaletteMode::Closed;
-                        self.needs_clear = true;
+                        self.close_palette();
                         self.last_info_toggle = Some(std::time::Instant::now());
                     }
                     return;
@@ -57,31 +55,30 @@ impl App {
 
                 match key.code {
                     KeyCode::Esc => {
-                        self.palette_mode = PaletteMode::Closed;
+                        self.close_palette();
                         self.needs_update = true;
-                        self.needs_clear = true;
                     }
                     KeyCode::Enter => match self.palette_mode {
                         PaletteMode::File => {
                             let files = self.get_filtered_files();
                             if !files.is_empty() && self.palette_selected_index < files.len() {
-                                self.queue.current_index = files[self.palette_selected_index].0;
+                                self.queue.current_index = files[self.palette_selected_index];
                                 self.start_load_image();
                             }
-                            self.palette_mode = PaletteMode::Closed;
+                            self.close_palette();
                             self.needs_update = true;
-                            self.needs_clear = true;
                         }
                         PaletteMode::Command => {
                             let cmds = self.get_filtered_commands();
                             if !cmds.is_empty() && self.palette_selected_index < cmds.len() {
-                                let cmd = cmds[self.palette_selected_index].cmd;
+                                let cmd = crate::commands::get_commands()
+                                    [cmds[self.palette_selected_index]]
+                                    .cmd;
                                 self.execute_command(cmd);
                             }
                             if self.palette_mode == PaletteMode::Command {
-                                self.palette_mode = PaletteMode::Closed;
+                                self.close_palette();
                                 self.needs_update = true;
-                                self.needs_clear = true;
                             }
                         }
                         PaletteMode::Prompt(prompt_type) => {

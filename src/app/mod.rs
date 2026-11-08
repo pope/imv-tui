@@ -18,7 +18,7 @@ use crate::config::{InfoBarPosition, SlideshowState};
 pub use adjustments::{Adjustment, ImageAdjustments};
 pub use cache::PrefetchCache;
 pub use classifications::{Classification, ViewMode};
-pub use palette::{PaletteMode, PromptType, filter_commands, filter_files};
+pub use palette::{PaletteMode, PromptType};
 pub use queue::ImageQueue;
 
 use fast_image_resize as fir;
@@ -30,7 +30,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::commands::{Command, PaletteCommand, get_commands};
+use crate::commands::{Command, get_commands};
 use crate::imaging::{
     Brightness, CancellationToken, Contrast, DecodedImage, FilterType, ImageSource, LoaderRequest,
     LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ThumbnailSource,
@@ -207,10 +207,11 @@ pub enum ImageDisplayState<'a> {
 pub struct App {
     /// The encapsulated image queue and navigation state.
     pub queue: ImageQueue,
-    /// Cached filtered files matching current search query.
-    pub filtered_files: Vec<(usize, String)>,
-    /// Cached filtered commands matching current search query.
-    pub filtered_commands: Vec<PaletteCommand>,
+    /// Cached filtered file indices matching current search query.
+    pub filtered_files: Vec<usize>,
+    /// Cached filtered command indices matching current search query.
+    pub filtered_commands: Vec<usize>,
+    palette_scratch: Vec<(u32, usize)>,
     /// Shared reference to the decoded dynamic image.
     pub original_image: Option<Arc<DynamicImage>>,
     /// Extracted thumbnail placeholder image, if any.
@@ -654,6 +655,7 @@ impl App {
             queue,
             filtered_files: Vec::new(),
             filtered_commands: Vec::new(),
+            palette_scratch: Vec::new(),
             original_image: None,
             thumbnail_image: None,
             show_thumbnail_only: false,
@@ -792,13 +794,13 @@ impl App {
         (cache.len(), total_bytes)
     }
 
-    /// Returns cached filtered files matching the current search query.
-    pub fn get_filtered_files(&self) -> &[(usize, String)] {
+    /// Returns cached filtered file indices matching the current search query.
+    pub fn get_filtered_files(&self) -> &[usize] {
         &self.filtered_files
     }
 
-    /// Returns cached filtered commands matching the current search query.
-    pub fn get_filtered_commands(&self) -> &[PaletteCommand] {
+    /// Returns cached filtered command indices matching the current search query.
+    pub fn get_filtered_commands(&self) -> &[usize] {
         &self.filtered_commands
     }
 
@@ -806,7 +808,17 @@ impl App {
     pub fn update_palette_filter(&mut self) {
         match self.palette_mode {
             PaletteMode::File => {
-                self.filtered_files = self.get_filtered_files_uncached();
+                let view_mode = self.view_mode;
+                let queue = &self.queue;
+                palette::filter_files(
+                    self.palette_query.value(),
+                    queue.relative_paths(),
+                    queue.relative_paths_lowercase(),
+                    &mut self.matcher,
+                    |idx| queue.is_visible(idx, view_mode),
+                    &mut self.filtered_files,
+                    &mut self.palette_scratch,
+                );
                 if !self.filtered_files.is_empty() {
                     self.palette_selected_index = self
                         .palette_selected_index
@@ -816,7 +828,12 @@ impl App {
                 }
             }
             PaletteMode::Command => {
-                self.filtered_commands = self.get_filtered_commands_uncached();
+                palette::filter_commands(
+                    self.palette_query.value(),
+                    &mut self.matcher,
+                    &mut self.filtered_commands,
+                    &mut self.palette_scratch,
+                );
                 if !self.filtered_commands.is_empty() {
                     self.palette_selected_index = self
                         .palette_selected_index
@@ -829,20 +846,25 @@ impl App {
         }
     }
 
-    fn get_filtered_files_uncached(&mut self) -> Vec<(usize, String)> {
-        let queue = &self.queue;
-        let view_mode = self.view_mode;
-        filter_files(
-            self.palette_query.value(),
-            queue.relative_paths(),
-            queue.relative_paths_lowercase(),
-            &mut self.matcher,
-            |idx| queue.is_visible(idx, view_mode),
-        )
-    }
-
-    fn get_filtered_commands_uncached(&mut self) -> Vec<PaletteCommand> {
-        filter_commands(self.palette_query.value(), &mut self.matcher)
+    /// Closes any active palette overlay and shrinks palette arena buffers if they exceeded `MAX_IDLE_PALETTE_CAPACITY`.
+    pub fn close_palette(&mut self) {
+        self.palette_mode = PaletteMode::Closed;
+        self.needs_clear = true;
+        self.palette_scratch.clear();
+        if self.palette_scratch.capacity() > palette::MAX_IDLE_PALETTE_CAPACITY {
+            self.palette_scratch
+                .shrink_to(palette::MAX_IDLE_PALETTE_CAPACITY);
+        }
+        self.filtered_files.clear();
+        if self.filtered_files.capacity() > palette::MAX_IDLE_PALETTE_CAPACITY {
+            self.filtered_files
+                .shrink_to(palette::MAX_IDLE_PALETTE_CAPACITY);
+        }
+        self.filtered_commands.clear();
+        if self.filtered_commands.capacity() > palette::MAX_IDLE_PALETTE_CAPACITY {
+            self.filtered_commands
+                .shrink_to(palette::MAX_IDLE_PALETTE_CAPACITY);
+        }
     }
 
     /// Returns the human-readable string name of the active filter type.
@@ -993,8 +1015,7 @@ impl App {
                         .last_info_toggle
                         .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(200))
                     {
-                        self.palette_mode = PaletteMode::Closed;
-                        self.needs_clear = true;
+                        self.close_palette();
                         self.last_info_toggle = Some(std::time::Instant::now());
                     }
                 } else {
@@ -1198,8 +1219,7 @@ impl App {
                 }
             }
         })();
-        self.palette_mode = PaletteMode::Closed;
-        self.needs_clear = true;
+        self.close_palette();
     }
 }
 
