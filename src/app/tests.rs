@@ -1,5 +1,5 @@
 use super::*;
-use crate::app::cache::CachedImage;
+use crate::app::cache::{CachedImage, CachedThumbnail};
 use crate::app::classifications::ClassificationJsonItem;
 use crate::config::InfoBarPosition;
 use crate::imaging::types::{Brightness, Contrast, Rotation};
@@ -386,12 +386,10 @@ fn test_prefetch_cache_retention_and_hits() {
         CachedImage {
             image: Some(shared_img.clone()),
             thumbnail: None,
-            thumbnail_source: None,
             width: 10,
             height: 10,
             format: Some(image::ImageFormat::Png),
             decode_duration: std::time::Duration::from_millis(5),
-            thumbnail_decode_duration: std::time::Duration::ZERO,
             disk_size: 100,
             raw_dimensions: None,
         },
@@ -423,7 +421,6 @@ fn test_sequence_number_protection() {
     let resp = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: 9,
         result: Ok(DecodedImage {
@@ -454,7 +451,6 @@ fn test_error_propagation_boundary() {
     let resp_prefetch_err = LoaderResponse {
         idx: 1,
         is_prefetch: true,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: app.current_sequence,
         result: Err("Failed to load prefetch".to_string()),
@@ -468,7 +464,6 @@ fn test_error_propagation_boundary() {
     let resp_active_err = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: app.current_sequence,
         result: Err("Corrupt image file".to_string()),
@@ -537,7 +532,6 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     let thumb_resp = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: true,
         thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
         sequence: app.current_sequence,
         result: Ok(DecodedImage {
@@ -583,7 +577,6 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     let full_resp = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: app.current_sequence,
         result: Ok(DecodedImage {
@@ -636,7 +629,6 @@ fn test_sequence_number_invalidation() {
     let stale_loader = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: 9,
         result: Ok(DecodedImage {
@@ -696,7 +688,6 @@ fn test_sequence_number_invalidation() {
     let stale_filter_resp = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: seq_before,
         result: Ok(DecodedImage {
@@ -728,7 +719,6 @@ fn test_decode_error_handling() {
     let error_resp = LoaderResponse {
         idx: 0,
         is_prefetch: false,
-        is_thumbnail: false,
         thumbnail_source: None,
         sequence: app.current_sequence,
         result: Err("Corrupt image data: decode failed".to_string()),
@@ -1259,13 +1249,15 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
         0,
         CachedImage {
             image: None,
-            thumbnail: Some(cached_thumb),
-            thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
+            thumbnail: Some(CachedThumbnail {
+                image: cached_thumb,
+                source: crate::imaging::ThumbnailSource::Exif,
+                decode_duration: Duration::from_millis(3),
+            }),
             width: 240,
             height: 240,
             format: Some(image::ImageFormat::Jpeg),
             decode_duration: Duration::from_millis(15),
-            thumbnail_decode_duration: Duration::from_millis(3),
             disk_size: 1024,
             raw_dimensions: None,
         },
@@ -1294,13 +1286,15 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
         0,
         CachedImage {
             image: Some(img),
-            thumbnail: Some(thumb),
-            thumbnail_source: Some(crate::imaging::ThumbnailSource::XdgCache),
+            thumbnail: Some(CachedThumbnail {
+                image: thumb,
+                source: crate::imaging::ThumbnailSource::XdgCache,
+                decode_duration: std::time::Duration::from_millis(2),
+            }),
             width: 10,
             height: 10,
             format: Some(image::ImageFormat::Png),
             decode_duration: std::time::Duration::from_millis(10),
-            thumbnail_decode_duration: std::time::Duration::from_millis(2),
             disk_size: 500,
             raw_dimensions: None,
         },
@@ -1416,7 +1410,6 @@ fn test_wait_for_frame_ready_and_frame_ready_pending() {
         .send(LoaderResponse {
             idx: 0,
             is_prefetch: false,
-            is_thumbnail: true,
             thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
             sequence: app.current_sequence,
             result: Ok(DecodedImage {

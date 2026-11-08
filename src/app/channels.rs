@@ -1,6 +1,6 @@
 //! Background channel communication, image loading, and cache prefetching for `App`.
 
-use crate::app::cache::VisibleWindow;
+use crate::app::cache::{CachedThumbnail, VisibleWindow};
 use crate::app::palette::PaletteMode;
 use crate::app::{App, InitialLoadState, LoadPhase, ThumbnailTelemetry};
 use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
@@ -88,23 +88,23 @@ impl App {
                 };
                 self.original_image = Some(display_img);
 
-                self.thumbnail_image = cached_img
-                    .thumbnail
-                    .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
-                self.show_thumbnail_only = false;
-                self.load_phase = LoadPhase::Complete;
-
-                if let (Some(thumb), Some(src)) =
-                    (&self.thumbnail_image, cached_img.thumbnail_source)
-                {
+                if let Some(cached_thumb) = cached_img.thumbnail {
+                    let rotated_thumb = adj
+                        .rotate_image(&cached_thumb.image)
+                        .map(Arc::new)
+                        .unwrap_or(cached_thumb.image);
                     self.stats.thumbnail = Some(ThumbnailTelemetry {
-                        load_duration: cached_img.thumbnail_decode_duration,
-                        dimensions: (thumb.width(), thumb.height()),
-                        source: src,
+                        load_duration: cached_thumb.decode_duration,
+                        dimensions: (rotated_thumb.width(), rotated_thumb.height()),
+                        source: cached_thumb.source,
                     });
+                    self.thumbnail_image = Some(rotated_thumb);
                 } else {
+                    self.thumbnail_image = None;
                     self.stats.thumbnail = None;
                 }
+                self.show_thumbnail_only = false;
+                self.load_phase = LoadPhase::Complete;
 
                 self.zoom_factor = ZoomFactor::DEFAULT;
                 self.pan_offset = PanOffset::ZERO;
@@ -124,12 +124,16 @@ impl App {
                     self.trigger_prefetch();
                 }
                 return;
-            } else if let Some(ref thumb) = cached_img.thumbnail {
+            } else if let Some(cached_thumb) = cached_img.thumbnail {
                 // If we only have a thumbnail, display it immediately as a fast placeholder,
                 // but continue loading the full resolution image in the background.
-                self.thumbnail_image = Some(thumb.clone())
-                    .map(|thumb| adj.rotate_image(&thumb).map(Arc::new).unwrap_or(thumb));
-                self.original_image = self.thumbnail_image.clone();
+                let rotated_thumb = adj
+                    .rotate_image(&cached_thumb.image)
+                    .map(Arc::new)
+                    .unwrap_or(cached_thumb.image);
+                let (tw, th) = (rotated_thumb.width(), rotated_thumb.height());
+                self.thumbnail_image = Some(rotated_thumb.clone());
+                self.original_image = Some(rotated_thumb);
 
                 let (orig_w, orig_h) =
                     if adj.rotation == Rotation::D90 || adj.rotation == Rotation::D270 {
@@ -144,19 +148,11 @@ impl App {
                 self.resize_state.mark_dirty_with_init_zoom();
                 loaded_cached_thumb = true;
                 self.stats.is_prefetch_cache_hit = true;
-                let (tw, th) = self
-                    .thumbnail_image
-                    .as_ref()
-                    .map_or((thumb.width(), thumb.height()), |t| (t.width(), t.height()));
-                if let Some(src) = cached_img.thumbnail_source {
-                    self.stats.thumbnail = Some(ThumbnailTelemetry {
-                        load_duration: cached_img.thumbnail_decode_duration,
-                        dimensions: (tw, th),
-                        source: src,
-                    });
-                } else {
-                    self.stats.thumbnail = None;
-                }
+                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                    load_duration: cached_thumb.decode_duration,
+                    dimensions: (tw, th),
+                    source: cached_thumb.source,
+                });
                 self.stats.raw_dimensions = cached_img.raw_dimensions;
             }
         }
@@ -234,12 +230,14 @@ impl App {
                     let shared_img = Arc::new(img);
                     let window = self.get_sliding_window();
                     if window.contains(resp.idx) {
-                        if resp.is_thumbnail {
+                        if let Some(thumb_src) = resp.thumbnail_source {
                             self.prefetch_cache.upsert_thumbnail(
                                 resp.idx,
-                                shared_img.clone(),
-                                resp.thumbnail_source,
-                                resp.decode_duration,
+                                CachedThumbnail {
+                                    image: shared_img.clone(),
+                                    source: thumb_src,
+                                    decode_duration: resp.decode_duration,
+                                },
                                 w,
                                 h,
                                 format,
@@ -267,7 +265,7 @@ impl App {
                             .map(Arc::new)
                             .unwrap_or(shared_img);
 
-                        if resp.is_thumbnail {
+                        if let Some(thumb_src) = resp.thumbnail_source {
                             if self.load_phase == LoadPhase::ThumbnailInFlightDeferred {
                                 self.load_phase = LoadPhase::FullDeferred;
                             }
@@ -288,15 +286,11 @@ impl App {
                             self.error_message = None;
                             self.resize_state.mark_dirty_with_init_zoom();
 
-                            if let Some(src) = resp.thumbnail_source {
-                                self.stats.thumbnail = Some(ThumbnailTelemetry {
-                                    load_duration: resp.decode_duration,
-                                    dimensions: (thumb_w, thumb_h),
-                                    source: src,
-                                });
-                            } else {
-                                self.stats.thumbnail = None;
-                            }
+                            self.stats.thumbnail = Some(ThumbnailTelemetry {
+                                load_duration: resp.decode_duration,
+                                dimensions: (thumb_w, thumb_h),
+                                source: thumb_src,
+                            });
                             self.stats.is_prefetch_cache_hit = false;
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;

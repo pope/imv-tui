@@ -731,7 +731,6 @@ impl App {
                                     is_prefetch: r.mode.is_prefetch(),
                                     sequence: r.sequence,
                                     decode_duration: thumb_dur,
-                                    is_thumbnail: true,
                                     thumbnail_source: Some(ThumbnailSource::Exif),
                                 });
                                 has_thumbnail = true;
@@ -795,7 +794,6 @@ impl App {
                                 is_prefetch: r.mode.is_prefetch(),
                                 sequence: r.sequence,
                                 decode_duration: thumb_dur,
-                                is_thumbnail: true,
                                 thumbnail_source: Some(ThumbnailSource::XdgCache),
                             });
                             has_thumbnail = true;
@@ -862,7 +860,6 @@ impl App {
                             is_prefetch: r.mode.is_prefetch(),
                             sequence: r.sequence,
                             decode_duration,
-                            is_thumbnail: false,
                             thumbnail_source: None,
                         });
                     }

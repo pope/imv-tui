@@ -217,9 +217,9 @@ pub struct LoaderResponse {
     pub sequence: u64,
     /// Time taken to load and decode.
     pub decode_duration: std::time::Duration,
-    /// Whether this response carries a fast-load low-res thumbnail image placeholder.
-    pub is_thumbnail: bool,
     /// Source of the fast thumbnail placeholder, if any.
+    /// `Some(source)` indicates a fast-load low-resolution thumbnail placeholder from `source`,
+    /// while `None` indicates a full-resolution decoded image.
     pub thumbnail_source: Option<ThumbnailSource>,
 }
 

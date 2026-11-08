@@ -5,15 +5,24 @@ use image::DynamicImage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A cached low-resolution thumbnail image and its associated provenance and decode timing.
+#[derive(Debug, Clone)]
+pub struct CachedThumbnail {
+    /// The cached low-resolution thumbnail image.
+    pub image: Arc<DynamicImage>,
+    /// Source of the thumbnail placeholder.
+    pub source: ThumbnailSource,
+    /// Time taken to decode the thumbnail image.
+    pub decode_duration: std::time::Duration,
+}
+
 /// A cached image and its associated metadata in the prefetch cache.
 #[derive(Clone)]
 pub struct CachedImage {
     /// The cached full-resolution decoded image, if loaded.
     pub image: Option<Arc<DynamicImage>>,
-    /// The cached low-resolution thumbnail image, if loaded.
-    pub thumbnail: Option<Arc<DynamicImage>>,
-    /// Source of the thumbnail placeholder, if any.
-    pub thumbnail_source: Option<ThumbnailSource>,
+    /// The cached low-resolution thumbnail image and metadata, if loaded.
+    pub thumbnail: Option<CachedThumbnail>,
     /// The width of the image.
     pub width: u32,
     /// The height of the image.
@@ -22,8 +31,6 @@ pub struct CachedImage {
     pub format: Option<image::ImageFormat>,
     /// Time taken to decode the full-resolution image.
     pub decode_duration: std::time::Duration,
-    /// Time taken to decode the thumbnail image.
-    pub thumbnail_decode_duration: std::time::Duration,
     /// Size of the raw source file on disk in bytes.
     pub disk_size: u64,
     /// Un-cropped native raw/sensor dimensions (`(width, height)`), if available.
@@ -98,9 +105,7 @@ impl PrefetchCache {
     pub fn upsert_thumbnail(
         &mut self,
         idx: usize,
-        thumb: Arc<DynamicImage>,
-        thumbnail_source: Option<ThumbnailSource>,
-        decode_duration: std::time::Duration,
+        thumbnail: CachedThumbnail,
         width: u32,
         height: u32,
         format: Option<image::ImageFormat>,
@@ -108,22 +113,18 @@ impl PrefetchCache {
         raw_dimensions: Option<(u32, u32)>,
     ) {
         if let Some(cached) = self.entries.get_mut(&idx) {
-            cached.thumbnail = Some(thumb);
-            cached.thumbnail_source = thumbnail_source;
-            cached.thumbnail_decode_duration = decode_duration;
+            cached.thumbnail = Some(thumbnail);
             cached.raw_dimensions = raw_dimensions;
         } else {
             self.entries.insert(
                 idx,
                 CachedImage {
                     image: None,
-                    thumbnail: Some(thumb),
-                    thumbnail_source,
+                    thumbnail: Some(thumbnail),
                     width,
                     height,
                     format,
                     decode_duration: std::time::Duration::ZERO,
-                    thumbnail_decode_duration: decode_duration,
                     disk_size,
                     raw_dimensions,
                 },
@@ -158,12 +159,10 @@ impl PrefetchCache {
                 CachedImage {
                     image: Some(image),
                     thumbnail: None,
-                    thumbnail_source: None,
                     width,
                     height,
                     format,
                     decode_duration,
-                    thumbnail_decode_duration: std::time::Duration::ZERO,
                     disk_size,
                     raw_dimensions,
                 },
@@ -179,7 +178,7 @@ impl PrefetchCache {
                 total_bytes = total_bytes.saturating_add(img.as_bytes().len() as u64);
             }
             if let Some(ref thumb) = entry.thumbnail {
-                total_bytes = total_bytes.saturating_add(thumb.as_bytes().len() as u64);
+                total_bytes = total_bytes.saturating_add(thumb.image.as_bytes().len() as u64);
             }
         }
         (self.entries.len(), total_bytes)
@@ -379,9 +378,11 @@ mod cache_sliding_window_tests {
         let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
         cache.upsert_thumbnail(
             1,
-            thumb,
-            Some(ThumbnailSource::Exif),
-            std::time::Duration::from_millis(2),
+            CachedThumbnail {
+                image: thumb,
+                source: ThumbnailSource::Exif,
+                decode_duration: std::time::Duration::from_millis(2),
+            },
             100,
             100,
             Some(image::ImageFormat::Jpeg),
@@ -392,7 +393,10 @@ mod cache_sliding_window_tests {
         let entry = cache.get(1).expect("entry must exist");
         assert!(entry.image.is_none());
         assert!(entry.thumbnail.is_some());
-        assert_eq!(entry.thumbnail_source, Some(ThumbnailSource::Exif));
+        assert_eq!(
+            entry.thumbnail.as_ref().map(|t| t.source),
+            Some(ThumbnailSource::Exif)
+        );
 
         let full = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
         cache.upsert_full(
