@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub struct CliOptions {
     /// Initial path to display (can be a local file or directory, or cbz archive).
     pub initial_path: Option<PathBuf>,
-    /// Scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming.
+    /// Scaling filter: nearest, box, linear, mitchell, lanczos.
     pub filter: FilterType,
     /// Terminal graphics protocol configuration.
     pub protocol: ProtocolConfig,
@@ -157,15 +157,13 @@ where
                 let val = get_arg(&args, &mut i, &flag)?;
                 filter = match val.to_lowercase().as_str() {
                     "nearest" => FilterType::Nearest,
+                    "box" => FilterType::Box,
                     "linear" => FilterType::Linear,
-                    "cubic" => FilterType::Cubic,
                     "mitchell" => FilterType::Mitchell,
-                    "gaussian" => FilterType::Gaussian,
                     "lanczos" => FilterType::Lanczos,
-                    "hamming" => FilterType::Hamming,
                     other => {
                         return Err(format!(
-                            "Error: Unknown filter '{}'. Choose from: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming",
+                            "Error: Unknown filter '{}'. Choose from: nearest, box, linear, mitchell, lanczos",
                             other
                         ));
                     }
@@ -294,7 +292,7 @@ where
                 println!();
                 println!("Options:");
                 println!(
-                    "  -f, --filter <filter>      Initial image scaling filter: nearest, linear, cubic, mitchell, gaussian, lanczos, hamming"
+                    "  -f, --filter <filter>      Initial image scaling filter: nearest, box, linear, mitchell, lanczos"
                 );
                 println!(
                     "  -p, --protocol <protocol>  Force terminal graphics protocol: kitty, sixel, halfblocks, iterm2"
@@ -560,6 +558,14 @@ mod tests {
             }
         );
         assert_eq!(opts.scale, ScaleMode::Crop);
+
+        let args_box = vec![
+            "imv-tui".to_string(),
+            "--filter".to_string(),
+            "BOX".to_string(),
+        ];
+        let opts_box = parse_cli_args_from(args_box).unwrap();
+        assert_eq!(opts_box.filter, FilterType::Box);
     }
 
     #[test]

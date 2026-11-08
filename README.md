@@ -134,8 +134,8 @@ nix build
 # Run on a file, directory, or CBZ comic archive
 ./target/release/imv-tui <path-to-image-or-directory-or-cbz>
 
-# Run with a specific starting filter (nearest, linear, cubic, gaussian, lanczos)
-./target/release/imv-tui <path-to-image> --filter cubic
+# Run with a specific starting filter (nearest, box, linear, mitchell, lanczos)
+./target/release/imv-tui <path-to-image> --filter mitchell
 
 # Pipe a list of file paths from another command (like fd or find) via stdin
 fd -e png -e jpg . ~/Pictures | ./target/release/imv-tui
@@ -145,17 +145,20 @@ If no path is specified, it scans and opens images from the current directory (`
 
 ### Command Line Options
 
-- `-f, --filter <nearest|linear|cubic|mitchell|gaussian|lanczos|hamming>`: Set the initial image scaling filter (defaults to `nearest`).
+- `-f, --filter <nearest|box|linear|mitchell|lanczos>`: Set the initial image scaling filter (defaults to `nearest`).
 - `-s, --scale <none|actual|shrink|full|crop>`: Set the initial image scaling mode (defaults to `shrink`). `actual` maps to `none`, and `fit` maps to `full`.
 - `-p, --protocol <kitty|sixel|halfblocks|iterm2>`: Force a specific terminal graphics protocol (bypassing auto-detection). `halfblock` maps to `halfblocks`.
 - `-t, --slideshow <seconds>`: Start the slideshow with the given delay in seconds.
 - `-m, --check-magic`: Check file magic bytes on startup (slower on network drives).
 - `-R, --recursive`: Scan directories recursively.
 - `--no-thumbnail`: Disable low-res EXIF thumbnail placeholder loading entirely.
+- `--kitty-compress <auto|always|never>`: Kitty zlib compression mode: auto, always, never (defaults to `auto`).
+- `--no-kitty-shm`: Disable Kitty POSIX shared memory (t=s) image transmission.
 - `--infobar <top|bottom|none>`: Set the position of the status infobar (defaults to `bottom`).
 - `-i, --import <file>`: Import image classification/flagged states from a file (.json or prefix text).
 - `-o, --export <file>`: Export image classification/flagged states to a file on exit (.json or prefix text).
 - `-r, --sync <file>`: Sync image classification/flagged states with a file (imports on startup if it exists, and exports on exit). Cannot be used together with `-i` or `-o`.
+- `-v, --version`: Show version information.
 - `-h, --help`: Displays the help menu outlining CLI usage and flags.
 
 ______________________________________________________________________

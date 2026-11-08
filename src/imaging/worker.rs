@@ -73,38 +73,21 @@ pub fn fast_mitchell_kernel(mut x: f64) -> f64 {
     }
 }
 
-/// Gaussian ($\sigma = 0.5$) filter kernel with precomputed normalization.
-///
-/// Evaluates $\frac{1}{\sigma \sqrt{2\pi}} e^{-\frac{x^2}{2\sigma^2}}$ with compile-time $\sqrt{\frac{2}{\pi}}$ constant.
-pub fn fast_gaussian_kernel(x: f64) -> f64 {
-    if (-3.0..3.0).contains(&x) {
-        const INV_SQRT_2PI_HALF: f64 = 0.7978845608028654;
-        INV_SQRT_2PI_HALF * (-2.0 * x * x).exp()
-    } else {
-        0.0
-    }
-}
-
-/// Maps `FilterType` to `fir::ResizeAlg`, utilizing optimized custom analytical kernels
-/// for Mitchell, Gaussian, and Lanczos.
+/// Maps `FilterType` to `fir::ResizeAlg`, utilizing pure SIMD Convolution kernels
+/// with analytical formulations for Mitchell and Lanczos.
 pub fn to_fir_resize_alg(filter_type: FilterType) -> fir::ResizeAlg {
     match filter_type {
         FilterType::Nearest => fir::ResizeAlg::Nearest,
+        FilterType::Box => fir::ResizeAlg::Convolution(fir::FilterType::Box),
         FilterType::Linear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
-        FilterType::Cubic => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
         FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
             fir::Filter::new("Mitchell", fast_mitchell_kernel, 2.0)
                 .expect("Valid custom Mitchell filter"),
-        )),
-        FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
-            fir::Filter::new("Gaussian", fast_gaussian_kernel, 3.0)
-                .expect("Valid custom Gaussian filter"),
         )),
         FilterType::Lanczos => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
             fir::Filter::new("Lanczos3", fast_lanczos3_kernel, 3.0)
                 .expect("Valid custom Lanczos3 filter"),
         )),
-        FilterType::Hamming => fir::ResizeAlg::Convolution(fir::FilterType::Hamming),
     }
 }
 
@@ -147,11 +130,8 @@ pub fn fast_resize(
         None => (src_img.width() as f64, src_img.height() as f64),
     };
     let is_magnified = dst_w as f64 >= crop_w && dst_h as f64 >= crop_h;
-    let needs_anti_ringing = is_magnified
-        && matches!(
-            filter_type,
-            FilterType::Lanczos | FilterType::Mitchell | FilterType::Cubic
-        );
+    let needs_anti_ringing =
+        is_magnified && matches!(filter_type, FilterType::Lanczos | FilterType::Mitchell);
 
     match src_img {
         DynamicImage::ImageRgb8(rgb_src) => {
@@ -673,12 +653,10 @@ mod tests {
 
         let filters = [
             FilterType::Nearest,
+            FilterType::Box,
             FilterType::Linear,
-            FilterType::Cubic,
             FilterType::Mitchell,
-            FilterType::Gaussian,
             FilterType::Lanczos,
-            FilterType::Hamming,
         ];
 
         for filter in filters {
@@ -1355,30 +1333,6 @@ mod tests {
                 expected
             );
         }
-
-        // 3. Gaussian reference formula (sigma = 0.5)
-        fn ref_gaussian(x: f64) -> f64 {
-            if (-3.0..3.0).contains(&x) {
-                let sigma = 0.5;
-                (1.0 / (sigma * (2.0 * std::f64::consts::PI).sqrt()))
-                    * (-0.5 * (x / sigma).powi(2)).exp()
-            } else {
-                0.0
-            }
-        }
-
-        for i in -3500..=3500 {
-            let x = i as f64 / 1000.0;
-            let expected = ref_gaussian(x);
-            let actual = fast_gaussian_kernel(x);
-            assert!(
-                (actual - expected).abs() < 1e-14,
-                "Gaussian mismatch at x = {}: actual = {}, expected = {}",
-                x,
-                actual,
-                expected
-            );
-        }
     }
 
     #[test]
@@ -1394,12 +1348,10 @@ mod tests {
 
         let filters = [
             FilterType::Nearest,
+            FilterType::Box,
             FilterType::Linear,
-            FilterType::Cubic,
             FilterType::Mitchell,
-            FilterType::Gaussian,
             FilterType::Lanczos,
-            FilterType::Hamming,
         ];
 
         for filter in filters {
@@ -1440,19 +1392,11 @@ mod tests {
         resizer.reset_internal_buffers();
         assert_eq!(resizer.size_of_internal_buffers(), 0);
 
-        fast_resize(&mut resizer, &large_rgb, 50, 50, FilterType::Mitchell, None).unwrap();
+        fast_resize(&mut resizer, &large_rgb, 50, 50, FilterType::Box, None).unwrap();
         let rgb_internal_buf_size = resizer.size_of_internal_buffers();
 
         resizer.reset_internal_buffers();
-        fast_resize(
-            &mut resizer,
-            &large_rgba,
-            50,
-            50,
-            FilterType::Mitchell,
-            None,
-        )
-        .unwrap();
+        fast_resize(&mut resizer, &large_rgba, 50, 50, FilterType::Box, None).unwrap();
         let rgba_internal_buf_size = resizer.size_of_internal_buffers();
 
         // RGBA allocates 1 MB alpha_buffer, whereas RGB8 avoids alpha_buffer entirely

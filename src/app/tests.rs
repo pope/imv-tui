@@ -3,7 +3,7 @@ use crate::app::cache::{CachedImage, CachedThumbnail};
 use crate::app::classifications::ClassificationJsonItem;
 use crate::config::InfoBarPosition;
 use crate::imaging::types::{Brightness, Contrast, Rotation};
-use crate::imaging::{ImageSource, LoaderMode, ScaleMode};
+use crate::imaging::{FilterType, ImageSource, LoaderMode, ScaleMode};
 use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use std::fs;
@@ -2011,4 +2011,40 @@ fn test_tiny_terminal_rendering_defensive_clamping() {
             height
         );
     }
+}
+
+#[test]
+fn test_filter_cycling_and_naming() {
+    let (mut app, _channels) = setup_test_app_with_channels();
+    app.initial_load = InitialLoadState::Idle;
+
+    // Default filter is Nearest
+    assert_eq!(app.filter_type, FilterType::Nearest);
+    assert_eq!(app.filter_name(), "Nearest");
+
+    // Cycle order: Nearest -> Box -> Linear -> Mitchell -> Lanczos -> Nearest
+    app.cycle_filter();
+    assert_eq!(app.filter_type, FilterType::Box);
+    assert_eq!(app.filter_name(), "Box");
+
+    app.cycle_filter();
+    assert_eq!(app.filter_type, FilterType::Linear);
+    assert_eq!(app.filter_name(), "Linear");
+
+    app.cycle_filter();
+    assert_eq!(app.filter_type, FilterType::Mitchell);
+    assert_eq!(app.filter_name(), "Mitchell");
+
+    app.cycle_filter();
+    assert_eq!(app.filter_type, FilterType::Lanczos);
+    assert_eq!(app.filter_name(), "Lanczos");
+
+    app.cycle_filter();
+    assert_eq!(app.filter_type, FilterType::Nearest);
+    assert_eq!(app.filter_name(), "Nearest");
+
+    // Command::SetFilterBox
+    app.execute_command(Command::SetFilterBox);
+    assert_eq!(app.filter_type, FilterType::Box);
+    assert_eq!(app.filter_name(), "Box");
 }

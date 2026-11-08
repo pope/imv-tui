@@ -25,6 +25,7 @@ description: Guidelines on aspect ratio crop mapping, high-performance resizing,
   ```rust
   screen_canvas[dest_start..dest_end].copy_from_slice(&src_rgba[src_start..src_end]);
   ```
+- **5-Filter SIMD Scaling Lineup**: Cycle scaling filters in monotonic order of support radius: `Nearest -> Box -> Linear -> Mitchell -> Lanczos -> Nearest`. Mapped via `to_fir_resize_alg` to `fir::ResizeAlg::Nearest` and pure SIMD `fir::ResizeAlg::Convolution(...)` (using custom analytical kernels for Mitchell and Lanczos with $2\\times2$ neighborhood anti-ringing clamping on magnification).
 
 ### 3. Lock-Free Prefetch Caching ($2N+1$ Sliding Window)
 

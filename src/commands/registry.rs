@@ -89,18 +89,14 @@ pub enum Command {
     // Non-help/derived commands:
     /// Force nearest-neighbor scaling.
     SetFilterNearest,
+    /// Force box (area-averaging) scaling.
+    SetFilterBox,
     /// Force linear scaling.
     SetFilterLinear,
-    /// Force cubic scaling.
-    SetFilterCubic,
     /// Force mitchell scaling.
     SetFilterMitchell,
-    /// Force gaussian scaling.
-    SetFilterGaussian,
     /// Force lanczos scaling.
     SetFilterLanczos,
-    /// Force hamming scaling.
-    SetFilterHamming,
     /// Navigate to a specific image index by number.
     GoToImage,
     /// Set a precise brightness value.
@@ -275,15 +271,15 @@ impl Command {
                 show_in_palette: true,
                 shortcuts: None,
             },
-            Self::SetFilterLinear => CommandItem {
-                name: "Set Filter: Linear",
-                description: "Use Bilinear scaling",
+            Self::SetFilterBox => CommandItem {
+                name: "Set Filter: Box",
+                description: "Use Box area-averaging scaling (fast anti-aliased downscale, crisp upscale)",
                 show_in_palette: true,
                 shortcuts: None,
             },
-            Self::SetFilterCubic => CommandItem {
-                name: "Set Filter: Cubic",
-                description: "Use Bicubic scaling (Catmull-Rom)",
+            Self::SetFilterLinear => CommandItem {
+                name: "Set Filter: Linear",
+                description: "Use Bilinear scaling",
                 show_in_palette: true,
                 shortcuts: None,
             },
@@ -293,21 +289,9 @@ impl Command {
                 show_in_palette: true,
                 shortcuts: None,
             },
-            Self::SetFilterGaussian => CommandItem {
-                name: "Set Filter: Gaussian",
-                description: "Use Gaussian scaling",
-                show_in_palette: true,
-                shortcuts: None,
-            },
             Self::SetFilterLanczos => CommandItem {
                 name: "Set Filter: Lanczos",
                 description: "Use Lanczos3 scaling (high quality)",
-                show_in_palette: true,
-                shortcuts: None,
-            },
-            Self::SetFilterHamming => CommandItem {
-                name: "Set Filter: Hamming",
-                description: "Use Hamming scaling",
                 show_in_palette: true,
                 shortcuts: None,
             },

@@ -7,18 +7,14 @@ use std::path::{Path, PathBuf};
 pub enum FilterType {
     /// Nearest neighbor.
     Nearest,
+    /// Box / area-averaging filter.
+    Box,
     /// Linear interpolation.
     Linear,
-    /// Cubic spline filter.
-    Cubic,
-    /// Mitchell Netravali.
+    /// Mitchell-Netravali cubic filter.
     Mitchell,
-    /// Gaussian filter.
-    Gaussian,
-    /// Lanczos windowed sinc.
+    /// Lanczos3 windowed sinc filter.
     Lanczos,
-    /// Hamming filter.
-    Hamming,
 }
 
 impl FilterType {
@@ -26,12 +22,10 @@ impl FilterType {
     pub fn to_image_filter(self) -> image::imageops::FilterType {
         match self {
             FilterType::Nearest => image::imageops::FilterType::Nearest,
+            FilterType::Box => image::imageops::FilterType::Triangle,
             FilterType::Linear => image::imageops::FilterType::Triangle,
-            FilterType::Cubic => image::imageops::FilterType::CatmullRom,
             FilterType::Mitchell => image::imageops::FilterType::CatmullRom,
-            FilterType::Gaussian => image::imageops::FilterType::Gaussian,
             FilterType::Lanczos => image::imageops::FilterType::Lanczos3,
-            FilterType::Hamming => image::imageops::FilterType::Triangle,
         }
     }
 }

@@ -1238,12 +1238,10 @@ impl App {
     pub fn filter_name(&self) -> &'static str {
         match self.filter_type {
             FilterType::Nearest => "Nearest",
+            FilterType::Box => "Box",
             FilterType::Linear => "Linear",
-            FilterType::Cubic => "Cubic",
             FilterType::Mitchell => "Mitchell",
-            FilterType::Gaussian => "Gaussian",
             FilterType::Lanczos => "Lanczos",
-            FilterType::Hamming => "Hamming",
         }
     }
 
@@ -1253,12 +1251,10 @@ impl App {
             return;
         }
         self.filter_type = match self.filter_type {
-            FilterType::Nearest => FilterType::Hamming,
-            FilterType::Hamming => FilterType::Linear,
-            FilterType::Linear => FilterType::Cubic,
-            FilterType::Cubic => FilterType::Mitchell,
-            FilterType::Mitchell => FilterType::Gaussian,
-            FilterType::Gaussian => FilterType::Lanczos,
+            FilterType::Nearest => FilterType::Box,
+            FilterType::Box => FilterType::Linear,
+            FilterType::Linear => FilterType::Mitchell,
+            FilterType::Mitchell => FilterType::Lanczos,
             FilterType::Lanczos => FilterType::Nearest,
         };
         self.resize_state.mark_dirty();
@@ -1281,28 +1277,20 @@ impl App {
                 self.filter_type = FilterType::Nearest;
                 self.resize_state.mark_dirty();
             }
-            Command::SetFilterLinear => {
-                self.filter_type = FilterType::Linear;
+            Command::SetFilterBox => {
+                self.filter_type = FilterType::Box;
                 self.resize_state.mark_dirty();
             }
-            Command::SetFilterCubic => {
-                self.filter_type = FilterType::Cubic;
+            Command::SetFilterLinear => {
+                self.filter_type = FilterType::Linear;
                 self.resize_state.mark_dirty();
             }
             Command::SetFilterMitchell => {
                 self.filter_type = FilterType::Mitchell;
                 self.resize_state.mark_dirty();
             }
-            Command::SetFilterGaussian => {
-                self.filter_type = FilterType::Gaussian;
-                self.resize_state.mark_dirty();
-            }
             Command::SetFilterLanczos => {
                 self.filter_type = FilterType::Lanczos;
-                self.resize_state.mark_dirty();
-            }
-            Command::SetFilterHamming => {
-                self.filter_type = FilterType::Hamming;
                 self.resize_state.mark_dirty();
             }
             Command::NextFilter => self.cycle_filter(),
