@@ -278,6 +278,40 @@ pub fn downscale_for_thumbnail(
     }
 }
 
+/// Metadata parsed from a cached Freedesktop PNG header (`IHDR` + `tEXt` chunks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PngThumbMetadata {
+    /// Encoded width of the thumbnail PNG from `IHDR`.
+    pub thumb_w: u32,
+    /// Encoded height of the thumbnail PNG from `IHDR`.
+    pub thumb_h: u32,
+    /// Modification timestamp (`Thumb::MTime`) in seconds since `UNIX_EPOCH`.
+    pub mtime_sec: Option<i64>,
+    /// Original full-resolution image dimensions `(width, height)` from `Thumb::Image::Width`/`Height`.
+    pub source_dims: Option<(u32, u32)>,
+}
+
+/// Metadata written into Freedesktop PNG `tEXt` chunks.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteThumbMetadata<'a> {
+    /// Canonical `file://` URI of the source image.
+    pub canonical_uri: &'a str,
+    /// Source file modification timestamp in seconds since `UNIX_EPOCH`.
+    pub mtime_sec: i64,
+    /// Optional source file size in bytes (`Thumb::Size`).
+    pub file_size: Option<u64>,
+    /// Optional original full-resolution dimensions `(width, height)` (`Thumb::Image::Width` / `Height`).
+    pub source_dims: Option<(u32, u32)>,
+}
+
+/// Decoded Freedesktop cached thumbnail image and optional original source dimensions.
+pub struct CachedThumbnail {
+    /// Decoded thumbnail image.
+    pub image: DynamicImage,
+    /// Original full-resolution image dimensions `(width, height)` stored in PNG `tEXt` metadata, if present.
+    pub source_dims: Option<(u32, u32)>,
+}
+
 /// Constructs a PNG `tEXt` chunk from a keyword and text value.
 fn make_text_chunk(keyword: &str, text: &str) -> Vec<u8> {
     let mut data = Vec::with_capacity(keyword.len() + 1 + text.len());
@@ -296,13 +330,11 @@ fn make_text_chunk(keyword: &str, text: &str) -> Vec<u8> {
     chunk
 }
 
-/// Encodes an RGBA8 thumbnail image to PNG bytes with injected Freedesktop `tEXt` chunks.
-///
-/// Guaranteed to position `Thumb::MTime` within the first 2,048 bytes of the file.
-pub fn encode_thumbnail_png(
+/// Encodes an RGBA8 thumbnail image to PNG bytes with injected Freedesktop `tEXt` chunks
+/// containing URI, modification time, file size, software, and source dimensions.
+pub fn encode_thumbnail_png_with_metadata(
     thumb_rgba: &image::RgbaImage,
-    canonical_uri: &str,
-    mtime_sec: i64,
+    meta: WriteThumbMetadata<'_>,
 ) -> Result<Vec<u8>, String> {
     let mut png_bytes = Vec::new();
     thumb_rgba
@@ -316,45 +348,122 @@ pub fn encode_thumbnail_png(
         return Err("Invalid PNG generated".to_string());
     }
 
-    let chunk_uri = make_text_chunk("Thumb::URI", canonical_uri);
-    let chunk_mtime = make_text_chunk("Thumb::MTime", &mtime_sec.to_string());
     let chunk_sw = make_text_chunk("Software", "imv-tui");
+    let chunk_uri = make_text_chunk("Thumb::URI", meta.canonical_uri);
+    let chunk_mtime = make_text_chunk("Thumb::MTime", &meta.mtime_sec.to_string());
 
-    let total_len = png_bytes.len() + chunk_uri.len() + chunk_mtime.len() + chunk_sw.len();
-    let mut result = Vec::with_capacity(total_len);
+    let chunk_size = meta
+        .file_size
+        .map(|s| make_text_chunk("Thumb::Size", &s.to_string()));
+
+    let (chunk_w, chunk_h) = if let Some((w, h)) = meta.source_dims
+        && w > 0
+        && h > 0
+    {
+        (
+            Some(make_text_chunk("Thumb::Image::Width", &w.to_string())),
+            Some(make_text_chunk("Thumb::Image::Height", &h.to_string())),
+        )
+    } else {
+        (None, None)
+    };
+
+    let extra_len = chunk_sw.len()
+        + chunk_uri.len()
+        + chunk_mtime.len()
+        + chunk_size.as_ref().map(|c| c.len()).unwrap_or(0)
+        + chunk_w.as_ref().map(|c| c.len()).unwrap_or(0)
+        + chunk_h.as_ref().map(|c| c.len()).unwrap_or(0);
+
+    let mut result = Vec::with_capacity(png_bytes.len() + extra_len);
     // Standard PNG header + IHDR chunk is exactly 33 bytes
     result.extend_from_slice(&png_bytes[..33]);
+    result.extend_from_slice(&chunk_sw);
     result.extend_from_slice(&chunk_uri);
     result.extend_from_slice(&chunk_mtime);
-    result.extend_from_slice(&chunk_sw);
+    if let Some(ref c) = chunk_size {
+        result.extend_from_slice(c);
+    }
+    if let Some(ref c) = chunk_w {
+        result.extend_from_slice(c);
+    }
+    if let Some(ref c) = chunk_h {
+        result.extend_from_slice(c);
+    }
     result.extend_from_slice(&png_bytes[33..]);
 
     Ok(result)
 }
 
-/// Parses the `Thumb::MTime` timestamp from a PNG header buffer without heap allocation.
-pub fn parse_png_mtime(header: &[u8]) -> Option<i64> {
+/// Encodes an RGBA8 thumbnail image to PNG bytes with injected Freedesktop `tEXt` chunks.
+///
+/// Guaranteed to position `Thumb::MTime` within the first 2,048 bytes of the file.
+#[cfg(test)]
+pub fn encode_thumbnail_png(
+    thumb_rgba: &image::RgbaImage,
+    canonical_uri: &str,
+    mtime_sec: i64,
+) -> Result<Vec<u8>, String> {
+    encode_thumbnail_png_with_metadata(
+        thumb_rgba,
+        WriteThumbMetadata {
+            canonical_uri,
+            mtime_sec,
+            file_size: None,
+            source_dims: None,
+        },
+    )
+}
+
+/// Parses `IHDR` thumbnail dimensions and Freedesktop `tEXt` chunks (`Thumb::MTime`,
+/// `Thumb::Image::Width`, `Thumb::Image::Height`) from a PNG byte buffer without heap allocation.
+pub fn parse_png_thumbnail_metadata(header: &[u8]) -> Option<PngThumbMetadata> {
     if header.len() < 8 || &header[0..8] != b"\x89PNG\r\n\x1a\n" {
         return None;
     }
+    let mut thumb_w = 0u32;
+    let mut thumb_h = 0u32;
+    let mut mtime_sec = None;
+    let mut full_w_opt = None;
+    let mut full_h_opt = None;
     let mut offset = 8;
+
     while offset + 8 <= header.len() {
         let length = u32::from_be_bytes(header[offset..offset + 4].try_into().ok()?) as usize;
         let chunk_type = &header[offset + 4..offset + 8];
         let data_start = offset + 8;
         let data_end = (data_start + length).min(header.len());
 
-        if chunk_type == b"tEXt" && data_start <= header.len() {
+        if chunk_type == b"IEND" || chunk_type == b"IDAT" {
+            break;
+        }
+
+        if chunk_type == b"IHDR" && data_start + 8 <= header.len() {
+            thumb_w = u32::from_be_bytes(header[data_start..data_start + 4].try_into().ok()?);
+            thumb_h = u32::from_be_bytes(header[data_start + 4..data_start + 8].try_into().ok()?);
+        } else if chunk_type == b"tEXt" && data_start <= header.len() {
             let data = &header[data_start..data_end];
             if let Some(null_pos) = data.iter().position(|&b| b == 0) {
                 let keyword = &data[..null_pos];
+                let value = &data[null_pos + 1..];
                 if keyword == b"Thumb::MTime" {
-                    let value_str = std::str::from_utf8(&data[null_pos + 1..]).ok()?;
-                    return value_str.trim().parse::<i64>().ok();
+                    if let Ok(s) = std::str::from_utf8(value) {
+                        mtime_sec = s.trim().parse::<i64>().ok();
+                    }
+                } else if keyword == b"Thumb::Image::Width"
+                    && let Ok(s) = std::str::from_utf8(value)
+                    && let Ok(w) = s.trim().parse::<u32>()
+                    && w > 0
+                {
+                    full_w_opt = Some(w);
+                } else if keyword == b"Thumb::Image::Height"
+                    && let Ok(s) = std::str::from_utf8(value)
+                    && let Ok(h) = s.trim().parse::<u32>()
+                    && h > 0
+                {
+                    full_h_opt = Some(h);
                 }
             }
-        } else if chunk_type == b"IDAT" {
-            break;
         }
 
         offset = match offset.checked_add(12 + length) {
@@ -362,12 +471,29 @@ pub fn parse_png_mtime(header: &[u8]) -> Option<i64> {
             None => break,
         };
     }
-    None
+
+    if thumb_w == 0 || thumb_h == 0 {
+        return None;
+    }
+    let source_dims = full_w_opt.zip(full_h_opt);
+    Some(PngThumbMetadata {
+        thumb_w,
+        thumb_h,
+        mtime_sec,
+        source_dims,
+    })
+}
+
+/// Parses the `Thumb::MTime` timestamp from a PNG header buffer without heap allocation.
+#[cfg(test)]
+pub fn parse_png_mtime(header: &[u8]) -> Option<i64> {
+    parse_png_thumbnail_metadata(header).and_then(|m| m.mtime_sec)
 }
 
 /// Probes a thumbnail file to verify its `Thumb::MTime` matches `expected_mtime`.
 ///
 /// Reads at most 2,048 bytes on the stack without reading or decoding the whole image.
+#[cfg(test)]
 pub fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf> {
     let mut file = std::fs::File::open(thumb_path).ok()?;
     let mut buf = [0u8; 2048];
@@ -379,14 +505,13 @@ pub fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf
     }
 }
 
-/// Atomically writes an encoded PNG thumbnail to the Freedesktop thumbnail directory.
-pub fn write_freedesktop_thumbnail(
+/// Atomically writes an encoded PNG thumbnail with full Freedesktop metadata to the thumbnail directory.
+pub fn write_freedesktop_thumbnail_with_metadata(
     cache_root: &Path,
     tier: ThumbTier,
     md5_filename: &str,
     thumb_rgba: &image::RgbaImage,
-    canonical_uri: &str,
-    mtime_sec: i64,
+    meta: WriteThumbMetadata<'_>,
 ) -> Result<PathBuf, String> {
     let target_dir = cache_root.join(tier.dir_name());
 
@@ -402,7 +527,7 @@ pub fn write_freedesktop_thumbnail(
         let _ = std::fs::create_dir_all(&target_dir);
     }
 
-    let encoded_bytes = encode_thumbnail_png(thumb_rgba, canonical_uri, mtime_sec)?;
+    let encoded_bytes = encode_thumbnail_png_with_metadata(thumb_rgba, meta)?;
 
     let pid = std::process::id();
     let now = std::time::SystemTime::now()
@@ -438,6 +563,30 @@ pub fn write_freedesktop_thumbnail(
     Ok(final_path)
 }
 
+/// Atomically writes an encoded PNG thumbnail to the Freedesktop thumbnail directory.
+#[cfg(test)]
+pub fn write_freedesktop_thumbnail(
+    cache_root: &Path,
+    tier: ThumbTier,
+    md5_filename: &str,
+    thumb_rgba: &image::RgbaImage,
+    canonical_uri: &str,
+    mtime_sec: i64,
+) -> Result<PathBuf, String> {
+    write_freedesktop_thumbnail_with_metadata(
+        cache_root,
+        tier,
+        md5_filename,
+        thumb_rgba,
+        WriteThumbMetadata {
+            canonical_uri,
+            mtime_sec,
+            file_size: None,
+            source_dims: None,
+        },
+    )
+}
+
 /// Returns the default Freedesktop thumbnail cache directory ($XDG_CACHE_HOME/thumbnails or $HOME/.cache/thumbnails).
 pub fn default_thumbnail_cache_root() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
@@ -453,8 +602,12 @@ pub fn default_thumbnail_cache_root() -> Option<PathBuf> {
     None
 }
 
-/// Loads a valid cached thumbnail for `source_path` if present and fresh in `cache_root`.
-pub fn load_cached_thumbnail(cache_root: &Path, source_path: &Path) -> Option<DynamicImage> {
+/// Loads a valid cached thumbnail with original source dimensions for `source_path` if present and fresh in `cache_root`,
+/// reading and decoding the thumbnail file in a single file open.
+pub fn load_cached_thumbnail_with_metadata(
+    cache_root: &Path,
+    source_path: &Path,
+) -> Option<CachedThumbnail> {
     let metadata = std::fs::metadata(source_path).ok()?;
     let mtime = metadata
         .modified()
@@ -474,21 +627,55 @@ pub fn load_cached_thumbnail(cache_root: &Path, source_path: &Path) -> Option<Dy
     ];
     for tier in tiers {
         let p = cache_root.join(tier.dir_name()).join(&md5_filename);
-        if let Some(valid_path) = probe_thumbnail(&p, mtime)
-            && let Ok(img) = image::open(&valid_path)
-        {
-            return Some(img);
+        let mut file = match std::fs::File::open(&p) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let file_meta = match file.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let file_len = file_meta.len();
+        if !(33..=2 * 1024 * 1024).contains(&file_len) {
+            continue;
         }
+        let mut png_bytes = Vec::with_capacity(file_len as usize);
+        if file.read_to_end(&mut png_bytes).is_err() || png_bytes.len() != file_len as usize {
+            continue;
+        }
+        let meta = match parse_png_thumbnail_metadata(&png_bytes) {
+            Some(m) if m.mtime_sec == Some(mtime) => m,
+            _ => continue,
+        };
+        let img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
+            Ok(loaded) => match loaded {
+                DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => loaded,
+                other => DynamicImage::ImageRgba8(crate::imaging::into_rgba8_fast(other)),
+            },
+            Err(_) => continue,
+        };
+        return Some(CachedThumbnail {
+            image: img,
+            source_dims: meta.source_dims,
+        });
     }
     None
 }
 
-/// Downscales and saves a Freedesktop thumbnail for `source_path` to `cache_root`.
-pub fn save_cached_thumbnail(
+/// Loads a valid cached thumbnail for `source_path` if present and fresh in `cache_root`.
+#[cfg(test)]
+pub fn load_cached_thumbnail(cache_root: &Path, source_path: &Path) -> Option<DynamicImage> {
+    load_cached_thumbnail_with_metadata(cache_root, source_path).map(|c| c.image)
+}
+
+/// Downscales and saves a Freedesktop thumbnail for `source_path` to `cache_root`,
+/// recording original source dimensions and file size into PNG `tEXt` metadata.
+pub fn save_cached_thumbnail_with_dims(
     cache_root: &Path,
     resizer: &mut fir::Resizer,
     source_path: &Path,
     img: &DynamicImage,
+    source_dims: (u32, u32),
 ) -> Option<PathBuf> {
     if img.width() <= 256 && img.height() <= 256 {
         return None;
@@ -503,19 +690,41 @@ pub fn save_cached_thumbnail(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
+    let file_size = metadata.len();
 
     let (canonical_uri, md5_filename) = cache_key_for_path(source_path)?;
 
     let thumb_rgba = downscale_for_thumbnail(resizer, img, ThumbTier::Large).ok()?;
-    write_freedesktop_thumbnail(
+    write_freedesktop_thumbnail_with_metadata(
         cache_root,
         ThumbTier::Large,
         &md5_filename,
         &thumb_rgba,
-        &canonical_uri,
-        mtime,
+        WriteThumbMetadata {
+            canonical_uri: &canonical_uri,
+            mtime_sec: mtime,
+            file_size: Some(file_size),
+            source_dims: Some(source_dims),
+        },
     )
     .ok()
+}
+
+/// Downscales and saves a Freedesktop thumbnail for `source_path` to `cache_root`.
+#[cfg(test)]
+pub fn save_cached_thumbnail(
+    cache_root: &Path,
+    resizer: &mut fir::Resizer,
+    source_path: &Path,
+    img: &DynamicImage,
+) -> Option<PathBuf> {
+    save_cached_thumbnail_with_dims(
+        cache_root,
+        resizer,
+        source_path,
+        img,
+        (img.width(), img.height()),
+    )
 }
 
 #[cfg(test)]
@@ -635,6 +844,94 @@ mod tests {
         let loaded_img = loaded.unwrap();
         assert_eq!(loaded_img.width(), 256);
         assert_eq!(loaded_img.height(), 171);
+    }
+
+    #[test]
+    fn test_freedesktop_thumbnail_metadata_source_dims_and_single_open_load() {
+        let temp_dir = TempDir::new("imv_thumb_meta_test");
+        let cache_root = temp_dir.path().join("thumbnails");
+        let source_path = temp_dir.path().join("mock_raw.cr2");
+
+        // 1. Create a 600x400 mock source image on disk
+        let src_img = DynamicImage::ImageRgb8(image::RgbImage::new(600, 400));
+        src_img
+            .save_with_format(&source_path, image::ImageFormat::Png)
+            .unwrap();
+
+        let source_mtime_sec = std::fs::metadata(&source_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // 2. Save cached thumbnail with custom source_dims (e.g. true RAW sensor dims 6000x4000)
+        let mut resizer = fir::Resizer::new();
+        let saved_path = save_cached_thumbnail_with_dims(
+            &cache_root,
+            &mut resizer,
+            &source_path,
+            &src_img,
+            (6000, 4000),
+        )
+        .expect("save_cached_thumbnail_with_dims should succeed");
+        assert!(saved_path.exists());
+
+        // 3. Inspect raw bytes of saved PNG thumbnail
+        let written_bytes = std::fs::read(&saved_path).unwrap();
+        assert!(
+            written_bytes
+                .windows(b"Thumb::Size".len())
+                .any(|w| w == b"Thumb::Size")
+        );
+        assert!(
+            written_bytes
+                .windows(b"Thumb::Image::Width".len())
+                .any(|w| w == b"Thumb::Image::Width")
+        );
+        assert!(
+            written_bytes
+                .windows(b"Thumb::Image::Height".len())
+                .any(|w| w == b"Thumb::Image::Height")
+        );
+        assert!(
+            written_bytes
+                .windows(b"Software\0imv-tui".len())
+                .any(|w| w == b"Software\0imv-tui")
+        );
+
+        let meta = parse_png_thumbnail_metadata(&written_bytes)
+            .expect("parse_png_thumbnail_metadata should succeed");
+        assert_eq!(meta.thumb_w, 256);
+        assert_eq!(meta.thumb_h, 171);
+        assert_eq!(meta.mtime_sec, Some(source_mtime_sec));
+        assert_eq!(meta.source_dims, Some((6000, 4000)));
+
+        // 4. Test load_cached_thumbnail_with_metadata: loads decoded image and retains source_dims
+        let cached = load_cached_thumbnail_with_metadata(&cache_root, &source_path)
+            .expect("load_cached_thumbnail_with_metadata should succeed");
+        assert_eq!(cached.image.width(), 256);
+        assert_eq!(cached.image.height(), 171);
+        assert_eq!(cached.source_dims, Some((6000, 4000)));
+
+        // 5. Invalidate source mtime and ensure cache miss
+        #[cfg(unix)]
+        {
+            let new_time = libc::timespec {
+                tv_sec: source_mtime_sec + 10,
+                tv_nsec: 0,
+            };
+            let times = [new_time, new_time];
+            let path_c = std::ffi::CString::new(source_path.to_str().unwrap()).unwrap();
+            unsafe {
+                assert_eq!(
+                    libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0),
+                    0
+                );
+            }
+            assert!(load_cached_thumbnail_with_metadata(&cache_root, &source_path).is_none());
+        }
     }
 
     #[test]

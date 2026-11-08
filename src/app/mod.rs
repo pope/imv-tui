@@ -496,12 +496,14 @@ impl App {
                             && !cancel.is_cancelled()
                             && let Some(ref path) = local_path
                             && let Some(ref cache_root) = thumb_cache_root
-                            && let Some(cached_thumb) =
-                                crate::imaging::thumbcache::load_cached_thumbnail(cache_root, path)
+                            && let Some(cached) =
+                                crate::imaging::thumbcache::load_cached_thumbnail_with_metadata(
+                                    cache_root, path,
+                                )
                         {
-                            let (mut real_w, mut real_h) = if is_raw
-                                && let Some(ref hb) = raw_header_opt
-                            {
+                            let (mut real_w, mut real_h) = if let Some(dims) = cached.source_dims {
+                                dims
+                            } else if is_raw && let Some(ref hb) = raw_header_opt {
                                 let probe = crate::imaging::probe_raw_header(hb, Some(&r.source));
                                 if let Some((w, h)) = probe.sensor_dims {
                                     let swaps = matches!(
@@ -514,15 +516,15 @@ impl App {
                                     if swaps { (h, w) } else { (w, h) }
                                 } else {
                                     image::image_dimensions(path)
-                                        .unwrap_or((cached_thumb.width(), cached_thumb.height()))
+                                        .unwrap_or((cached.image.width(), cached.image.height()))
                                 }
                             } else {
                                 image::image_dimensions(path)
-                                    .unwrap_or((cached_thumb.width(), cached_thumb.height()))
+                                    .unwrap_or((cached.image.width(), cached.image.height()))
                             };
-                            if cached_thumb.width() != cached_thumb.height()
+                            if cached.image.width() != cached.image.height()
                                 && (real_w > real_h)
-                                    != (cached_thumb.width() > cached_thumb.height())
+                                    != (cached.image.width() > cached.image.height())
                             {
                                 std::mem::swap(&mut real_w, &mut real_h);
                             }
@@ -530,7 +532,7 @@ impl App {
                             let _ = response_tx.send(LoaderResponse {
                                 idx: r.idx,
                                 result: Ok(DecodedImage {
-                                    image: cached_thumb,
+                                    image: cached.image,
                                     width: real_w,
                                     height: real_h,
                                     format: Some(image::ImageFormat::Png),
@@ -590,11 +592,14 @@ impl App {
                             && let Some(ref path) = local_path
                             && let Some(ref cache_root) = thumb_cache_root
                         {
-                            crate::imaging::thumbcache::save_cached_thumbnail(
+                            crate::imaging::thumbcache::save_cached_thumbnail_with_dims(
                                 cache_root,
                                 &mut thumb_resizer,
                                 path,
                                 &decoded.image,
+                                decoded
+                                    .raw_dimensions
+                                    .unwrap_or((decoded.width, decoded.height)),
                             );
                         }
 
