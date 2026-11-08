@@ -1,4 +1,4 @@
-use crate::app::{App, ImageDisplayState};
+use crate::ui::{ImageDisplayState, ViewportModel};
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
@@ -8,8 +8,8 @@ use ratatui::{
 use ratatui_image::StatefulImage;
 
 /// Renders the main image viewport, handling loading spinners, error details, and empty states.
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
-    match app.display_state() {
+pub fn draw(frame: &mut Frame, model: &mut ViewportModel<'_>, area: Rect) {
+    match model.display_state {
         ImageDisplayState::LoadingSpinner => {
             let loading_paragraph = Paragraph::new("\n\nLoading Image...")
                 .alignment(Alignment::Center)
@@ -17,9 +17,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(loading_paragraph, area);
         }
         ImageDisplayState::Ready => {
-            if let Some(ref mut protocol) = app.image_protocol {
+            if let Some(ref mut protocol) = model.image_protocol {
                 // Calculate the centered Rect inside area
-                let (rect_w, rect_h) = app.rendered_size_cells;
+                let (rect_w, rect_h) = model.rendered_size_cells;
                 let rect_w = rect_w.min(area.width);
                 let rect_h = rect_h.min(area.height);
                 let x = area.x + (area.width.saturating_sub(rect_w)) / 2;
@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 let image_widget =
                     StatefulImage::default().resize(ratatui_image::Resize::Crop(None));
-                frame.render_stateful_widget(image_widget, centered_rect, protocol);
+                frame.render_stateful_widget(image_widget, centered_rect, *protocol);
             }
         }
         ImageDisplayState::Error(err) => {
@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(err_paragraph, area);
         }
         ImageDisplayState::Empty => {
-            if !app.is_loading() {
+            if !model.is_loading {
                 let loading_paragraph = Paragraph::new("No image loaded.")
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(Color::Yellow));

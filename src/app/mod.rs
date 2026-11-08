@@ -451,18 +451,7 @@ pub struct MockChannels {
     pub protocol_tx: mpsc::Sender<ResizeResponse>,
 }
 
-/// The mutually-exclusive display state for the image viewport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageDisplayState<'a> {
-    /// Actively loading with debounce threshold elapsed and no preview available.
-    LoadingSpinner,
-    /// Image protocol is ready for display.
-    Ready,
-    /// An error occurred during loading.
-    Error(&'a str),
-    /// No image is currently loaded.
-    Empty,
-}
+pub use crate::ui::ImageDisplayState;
 
 /// The central application state controller.
 pub struct App {
@@ -1005,20 +994,186 @@ impl App {
 
     /// Returns the active viewport display state.
     pub fn display_state(&self) -> ImageDisplayState<'_> {
-        let show_loading = self.image_protocol.is_none()
-            && self.thumbnail_image.is_none()
-            && self
-                .initial_load
-                .should_show_spinner(Duration::from_millis(150));
+        Self::compute_display_state(
+            self.image_protocol.is_some(),
+            self.thumbnail_image.is_some(),
+            self.initial_load
+                .should_show_spinner(Duration::from_millis(150)),
+            self.error_message.as_deref(),
+        )
+    }
 
+    #[inline]
+    fn compute_display_state<'a>(
+        has_protocol: bool,
+        has_thumbnail: bool,
+        show_spinner: bool,
+        error_message: Option<&'a str>,
+    ) -> ImageDisplayState<'a> {
+        let show_loading = !has_protocol && !has_thumbnail && show_spinner;
         if show_loading {
             ImageDisplayState::LoadingSpinner
-        } else if self.image_protocol.is_some() {
+        } else if has_protocol {
             ImageDisplayState::Ready
-        } else if let Some(ref err) = self.error_message {
-            ImageDisplayState::Error(err.as_str())
+        } else if let Some(err) = error_message {
+            ImageDisplayState::Error(err)
         } else {
             ImageDisplayState::Empty
+        }
+    }
+
+    /// Constructs a self-contained `UiModel` presentation snapshot for the active frame.
+    pub fn ui_model(&mut self) -> crate::ui::UiModel<'_> {
+        let display_state = Self::compute_display_state(
+            self.image_protocol.is_some(),
+            self.thumbnail_image.is_some(),
+            self.initial_load
+                .should_show_spinner(Duration::from_millis(150)),
+            self.error_message.as_deref(),
+        );
+        let is_loading = self.is_loading();
+        let rendered_size_cells = self.rendered_size_cells;
+        let infobar_position = self.infobar;
+
+        let infobar = if infobar_position == InfoBarPosition::None {
+            None
+        } else if self.queue.is_empty() {
+            Some(crate::ui::InfoBarModel::Empty)
+        } else {
+            let classification = self.current_classification();
+            let relative_path = self.queue.current_relative_path(self.view_mode);
+            let view_mode_name = self.view_mode_name();
+            let visible_position_1based =
+                self.get_visible_position().map(|pos| pos + 1).unwrap_or(0);
+            let visible_count = self.get_visible_count();
+            let is_raw = self
+                .queue
+                .images()
+                .get(self.queue.current_index)
+                .map(|src| src.is_raw())
+                .unwrap_or(false);
+
+            Some(crate::ui::InfoBarModel::Active {
+                classification,
+                relative_path,
+                view_mode_name,
+                visible_position_1based,
+                visible_count,
+                img_width: self.img_width,
+                img_height: self.img_height,
+                show_thumbnail_only: self.show_thumbnail_only,
+                is_raw,
+                scale_mode: self.scale_mode,
+                filter_name: self.filter_name(),
+                current_zoom_pct: self.current_zoom_pct,
+                pan_offset: self.pan_offset,
+                brightness: self.current_brightness(),
+                contrast: self.current_contrast(),
+                slideshow_state: self.slideshow_state,
+            })
+        };
+
+        let overlay = match self.palette_mode {
+            PaletteMode::Closed => {
+                if self.slideshow_state.is_paused() {
+                    crate::ui::OverlayModel::SlideshowPaused {
+                        infobar: infobar_position,
+                    }
+                } else {
+                    crate::ui::OverlayModel::None
+                }
+            }
+            PaletteMode::Prompt(prompt_type) => {
+                crate::ui::OverlayModel::Prompt(crate::ui::PromptViewModel {
+                    prompt_type,
+                    query: self.palette_query.value(),
+                    cursor_byte_offset: self.palette_query.cursor_byte_offset(),
+                    palette_height: self.palette_height,
+                    infobar: infobar_position,
+                })
+            }
+            PaletteMode::Info => crate::ui::OverlayModel::Info(if self.queue.is_empty() {
+                crate::ui::InfoBoxModel::Empty {
+                    palette_height: self.palette_height,
+                    infobar: infobar_position,
+                }
+            } else {
+                let source = &self.queue.images()[self.queue.current_index];
+                let uncompressed_mem_bytes = self
+                    .original_image
+                    .as_ref()
+                    .map(|img| img.as_bytes().len() as u64)
+                    .unwrap_or(0);
+                let rotation_degrees = self
+                    .queue
+                    .adjustment(self.queue.current_index)
+                    .rotation
+                    .to_degrees();
+
+                crate::ui::InfoBoxModel::Populated {
+                    palette_height: self.palette_height,
+                    infobar: infobar_position,
+                    source,
+                    uncompressed_mem_bytes,
+                    img_width: self.img_width,
+                    img_height: self.img_height,
+                    classification: self.current_classification(),
+                    brightness: self.current_brightness(),
+                    contrast: self.current_contrast(),
+                    rotation_degrees,
+                    stats: &self.stats,
+                    disable_thumbnail: self.disable_thumbnail,
+                    show_thumbnail_only: self.show_thumbnail_only,
+                    prefetch_cache_stats: self.prefetch_cache_stats(),
+                    filter_name: self.filter_name(),
+                    current_zoom_pct: self.current_zoom_pct,
+                    active_protocol: self.active_protocol,
+                }
+            }),
+            PaletteMode::File => {
+                let filtered_files = &self.filtered_files[..];
+                let relative_paths = self.queue.relative_paths();
+                let classifications = self.queue.classifications();
+
+                crate::ui::OverlayModel::Palette(crate::ui::PaletteViewModel {
+                    kind: crate::ui::PaletteListKind::File {
+                        filtered_files,
+                        relative_paths,
+                        classifications,
+                    },
+                    query: self.palette_query.value(),
+                    cursor_byte_offset: self.palette_query.cursor_byte_offset(),
+                    selected_index: self.palette_selected_index,
+                    palette_width: self.palette_width,
+                    palette_height: self.palette_height,
+                    infobar: infobar_position,
+                })
+            }
+            PaletteMode::Command => {
+                let filtered_commands = &self.filtered_commands[..];
+
+                crate::ui::OverlayModel::Palette(crate::ui::PaletteViewModel {
+                    kind: crate::ui::PaletteListKind::Command { filtered_commands },
+                    query: self.palette_query.value(),
+                    cursor_byte_offset: self.palette_query.cursor_byte_offset(),
+                    selected_index: self.palette_selected_index,
+                    palette_width: self.palette_width,
+                    palette_height: self.palette_height,
+                    infobar: infobar_position,
+                })
+            }
+        };
+
+        crate::ui::UiModel {
+            infobar_position,
+            viewport: crate::ui::ViewportModel {
+                display_state,
+                is_loading,
+                rendered_size_cells,
+                image_protocol: self.image_protocol.as_mut(),
+            },
+            infobar,
+            overlay,
         }
     }
 

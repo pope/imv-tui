@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::config::InfoBarPosition;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 /// Renders a pop-up dialog indicating that the slideshow is paused.
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw(frame: &mut Frame, infobar: InfoBarPosition, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -26,7 +26,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-    let popup_area = super::top_right_popup_rect(area, 34, 3, app.infobar);
+    let popup_area = super::top_right_popup_rect(area, 34, 3, infobar);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(paragraph, popup_area);
 }

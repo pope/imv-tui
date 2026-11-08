@@ -248,15 +248,9 @@ impl App {
     }
 
     /// Returns the display path of the currently selected image, or an informative string if empty.
+    #[cfg(test)]
     pub fn current_relative_path(&self) -> &str {
-        if self.queue.is_empty() || self.get_visible_count() == 0 {
-            return "No file loaded";
-        }
-        self.queue
-            .relative_paths()
-            .get(self.queue.current_index)
-            .map(|s| s.as_str())
-            .unwrap_or("Unknown file")
+        self.queue.current_relative_path(self.view_mode)
     }
 
     /// Navigates to the next visible image in the active queue.

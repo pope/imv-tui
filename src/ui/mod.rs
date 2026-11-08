@@ -1,66 +1,73 @@
+/// Pure presentation view models decoupled from application state.
+pub mod model;
 /// Presentation submodules for overlay and layout widgets.
 pub mod views;
 
+pub use model::*;
+
+use crate::config::InfoBarPosition;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
 };
 
-use crate::app::{App, PaletteMode};
-use crate::config::InfoBarPosition;
-
 /// Renders the entire view layout: including centered images, bottom status HUD,
 /// and interactive command/file palette overlays.
-pub fn ui(frame: &mut Frame, app: &mut App) {
-    let (viewport_area, status_area) = match app.infobar {
+pub fn ui(frame: &mut Frame, model: &mut UiModel<'_>) {
+    let (viewport_area, status_area) = match model.infobar_position {
         InfoBarPosition::None => (frame.area(), None),
         InfoBarPosition::Top => {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(app.infobar.height()), Constraint::Min(0)])
+                .constraints([
+                    Constraint::Length(model.infobar_position.height()),
+                    Constraint::Min(0),
+                ])
                 .split(frame.area());
             (chunks[1], Some(chunks[0]))
         }
         InfoBarPosition::Bottom => {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(app.infobar.height())])
+                .constraints([
+                    Constraint::Min(0),
+                    Constraint::Length(model.infobar_position.height()),
+                ])
                 .split(frame.area());
             (chunks[0], Some(chunks[1]))
         }
     };
 
     // Render image viewport
-    views::image_view::draw(frame, app, viewport_area);
+    views::image_view::draw(frame, &mut model.viewport, viewport_area);
 
     // Render infobar if configured
-    if let Some(s_area) = status_area {
-        views::infobar::draw(frame, app, s_area);
+    if let (Some(s_area), Some(info_model)) = (status_area, &model.infobar) {
+        views::infobar::draw(frame, info_model, s_area);
     }
 
     // Render active overlay widgets
-    if app.palette_mode != PaletteMode::Closed {
-        match app.palette_mode {
-            PaletteMode::Prompt(prompt_type) => {
-                views::prompt::draw(frame, app, viewport_area, prompt_type);
-            }
-            PaletteMode::Info => {
-                views::info_box::draw(frame, app, viewport_area);
-            }
-            PaletteMode::Command | PaletteMode::File => {
-                views::palette::draw(frame, app, viewport_area);
-            }
-            _ => {}
+    match &model.overlay {
+        OverlayModel::None => {}
+        OverlayModel::Prompt(prompt_model) => {
+            views::prompt::draw(frame, prompt_model, viewport_area);
         }
-    } else if app.slideshow_state.is_paused() {
-        views::slideshow_paused::draw(frame, app, viewport_area);
+        OverlayModel::Info(info_model) => {
+            views::info_box::draw(frame, info_model, viewport_area);
+        }
+        OverlayModel::Palette(palette_model) => {
+            views::palette::draw(frame, palette_model, viewport_area);
+        }
+        OverlayModel::SlideshowPaused { infobar } => {
+            views::slideshow_paused::draw(frame, *infobar, viewport_area);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{PromptType, setup_test_app};
+    use crate::app::{PaletteMode, PromptType, setup_test_app};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -85,7 +92,12 @@ mod tests {
         // 1. Bottom infobar
         app.infobar = InfoBarPosition::Bottom;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("img1.png"));
         assert!(rendered.contains("[1/2]"));
@@ -94,7 +106,12 @@ mod tests {
         // 2. Top infobar
         app.infobar = InfoBarPosition::Top;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("img1.png"));
         assert!(rendered.contains("[1/2]"));
@@ -103,7 +120,12 @@ mod tests {
         // 3. Off (None) infobar
         app.infobar = InfoBarPosition::None;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(!rendered.contains("Zoom: 100%"));
         assert!(!rendered.contains("[1/2]"));
@@ -118,19 +140,34 @@ mod tests {
 
         // 1. Command Palette overlay (show_help)
         app.open_palette(PaletteMode::Command);
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("Command Palette"));
 
         // 2. File search overlay
         app.open_palette(PaletteMode::File);
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("File Search"));
 
         // 3. Goto image prompt overlay
         app.open_prompt(PromptType::GoToImage);
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("Go to Image"));
 
@@ -138,7 +175,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         app.palette_mode = PaletteMode::Info;
         app.palette_height = 23;
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered = buffer_to_string(&terminal);
         assert!(rendered.contains("Image Details"));
         assert!(rendered.contains("Halfblocks"));
@@ -149,13 +191,23 @@ mod tests {
         // Test Kitty compression and SHM display
         app.active_protocol =
             crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::Compressed);
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered_kitty_on = buffer_to_string(&terminal);
         assert!(rendered_kitty_on.contains("Kitty (Compressed)"));
 
         app.active_protocol =
             crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::Direct);
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered_kitty_off = buffer_to_string(&terminal);
         assert!(rendered_kitty_off.contains("Kitty"));
         assert!(!rendered_kitty_off.contains("Compressed"));
@@ -163,7 +215,12 @@ mod tests {
 
         app.active_protocol =
             crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::SharedMemory);
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered_kitty_shm = buffer_to_string(&terminal);
         assert!(rendered_kitty_shm.contains("Kitty (SHM)"));
     }
@@ -179,7 +236,12 @@ mod tests {
 
         // 1. Loading started immediately (< 150ms debounce) -> "Loading Image..." must NOT be rendered
         app.initial_load = crate::app::InitialLoadState::start();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered_early = buffer_to_string(&terminal);
         assert!(
             !rendered_early.contains("Loading Image..."),
@@ -190,7 +252,12 @@ mod tests {
         app.initial_load = crate::app::InitialLoadState::start_at(
             std::time::Instant::now() - std::time::Duration::from_millis(200),
         );
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered_late = buffer_to_string(&terminal);
         assert!(
             rendered_late.contains("Loading Image..."),
@@ -201,7 +268,12 @@ mod tests {
         app.thumbnail_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
             image::RgbImage::new(100, 100),
         )));
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })
+            .unwrap();
         let rendered_thumb = buffer_to_string(&terminal);
         assert!(
             !rendered_thumb.contains("Loading Image..."),
@@ -232,7 +304,10 @@ mod tests {
                 app.palette_height = height;
 
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                let res = terminal.draw(|f| ui(f, &mut app));
+                let res = terminal.draw(|f| {
+                    let mut model = app.ui_model();
+                    ui(f, &mut model);
+                });
                 assert!(
                     res.is_ok(),
                     "Failed rendering mode {:?} in {}x{} terminal",
@@ -248,7 +323,10 @@ mod tests {
                 delay: std::time::Duration::from_secs(5),
             };
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            let res = terminal.draw(|f| ui(f, &mut app));
+            let res = terminal.draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            });
             assert!(
                 res.is_ok(),
                 "Failed rendering paused slideshow in {}x{} terminal",
@@ -256,5 +334,44 @@ mod tests {
                 height
             );
         }
+    }
+
+    #[test]
+    fn test_ui_model_standalone_rendering() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut model = UiModel {
+            infobar_position: InfoBarPosition::Bottom,
+            viewport: ViewportModel {
+                display_state: ImageDisplayState::Empty,
+                is_loading: false,
+                rendered_size_cells: (0, 0),
+                image_protocol: None,
+            },
+            infobar: Some(InfoBarModel::Active {
+                classification: crate::app::Classification::Pick,
+                relative_path: "test.png",
+                view_mode_name: "All",
+                visible_position_1based: 1,
+                visible_count: 1,
+                img_width: 800,
+                img_height: 600,
+                show_thumbnail_only: false,
+                is_raw: false,
+                scale_mode: crate::imaging::ScaleMode::Shrink,
+                filter_name: "Triangle",
+                current_zoom_pct: 100.0,
+                pan_offset: crate::imaging::PanOffset::ZERO,
+                brightness: crate::imaging::Brightness::ZERO,
+                contrast: crate::imaging::Contrast::ZERO,
+                slideshow_state: crate::config::SlideshowState::Stopped,
+            }),
+            overlay: OverlayModel::None,
+        };
+
+        terminal.draw(|f| ui(f, &mut model)).unwrap();
+        let rendered = buffer_to_string(&terminal);
+        assert!(rendered.contains("test.png"));
+        assert!(rendered.contains("[1/1]"));
+        assert!(rendered.contains("Zoom: 100%"));
     }
 }

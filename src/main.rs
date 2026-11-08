@@ -226,7 +226,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         if draw_needed {
             draw_needed = false;
-            terminal.draw(|f| ui(f, &mut app))?;
+            terminal.draw(|f| {
+                let mut model = app.ui_model();
+                ui(f, &mut model);
+            })?;
         }
 
         let poll_timeout = if app.has_pending_work() {

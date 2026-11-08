@@ -1,4 +1,4 @@
-use crate::app::{App, PaletteMode};
+use crate::ui::{PaletteListKind, PaletteViewModel};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -11,44 +11,40 @@ use ratatui::{
 };
 
 /// Renders the searchable command palette or file search input overlays.
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw(frame: &mut Frame, model: &PaletteViewModel<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let title = match app.palette_mode {
-        PaletteMode::File => " File Search ",
-        PaletteMode::Command => " Command Palette ",
-        _ => "",
+    let title = match model.kind {
+        PaletteListKind::File { .. } => " File Search ",
+        PaletteListKind::Command { .. } => " Command Palette ",
     };
 
-    let mut palette_width = app.palette_width;
+    let mut palette_width = model.palette_width;
     let cap_width = (area.width as f64 * 0.75).round() as u16;
     palette_width = palette_width.max(40).min(cap_width);
     let inner_w = palette_width.saturating_sub(2) as usize;
 
-    let visible_count = (app.palette_height as usize).saturating_sub(4);
-    let palette_height = app.palette_height;
-    let mut scroll_pos = 0;
-    let mut total_items = 0;
+    let visible_count = (model.palette_height as usize).saturating_sub(4);
 
     let mut lines = vec![
-        Line::from(vec![" > ".bold().cyan(), app.palette_query.value().into()]),
+        Line::from(vec![" > ".bold().cyan(), model.query.into()]),
         Line::from("─".repeat(inner_w).gray()),
     ];
 
-    match app.palette_mode {
-        PaletteMode::File => {
-            let filtered_files = app.get_filtered_files();
-
+    let (scroll_pos, total_items) = match &model.kind {
+        PaletteListKind::File {
+            filtered_files,
+            relative_paths,
+            classifications,
+        } => {
             let total_files = filtered_files.len();
             let start_idx = crate::app::palette::centered_scroll_offset(
-                app.palette_selected_index,
+                model.selected_index,
                 total_files,
                 visible_count,
             );
-            scroll_pos = start_idx;
-            total_items = total_files;
 
             let max_path_len = inner_w.saturating_sub(6);
 
@@ -58,11 +54,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 .skip(start_idx)
                 .take(visible_count)
             {
-                let filename = &app.queue.relative_paths()[orig_idx];
+                let filename = &relative_paths[orig_idx];
                 let display_path = shorten_path(filename, max_path_len);
-                let class = app.queue.classification(orig_idx);
+                let class = classifications[orig_idx];
                 let class_prefix = class.search_prefix();
-                let line = if i == app.palette_selected_index {
+                let line = if i == model.selected_index {
                     Line::from(vec![
                         " > ".bold().yellow().on_blue(),
                         class_prefix.bold().yellow().on_blue(),
@@ -81,19 +77,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             if filtered_files.is_empty() {
                 lines.push(Line::from("   No matches found.".gray().italic()));
             }
+
+            (start_idx, total_files)
         }
-        PaletteMode::Command => {
-            let filtered_commands = app.get_filtered_commands();
+        PaletteListKind::Command { filtered_commands } => {
             let all_commands = crate::commands::get_commands();
 
             let total_cmds = filtered_commands.len();
             let start_idx = crate::app::palette::centered_scroll_offset(
-                app.palette_selected_index,
+                model.selected_index,
                 total_cmds,
                 visible_count,
             );
-            scroll_pos = start_idx;
-            total_items = total_cmds;
 
             for (i, &cmd_idx) in filtered_commands
                 .iter()
@@ -103,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             {
                 let cmd = &all_commands[cmd_idx];
                 let mut cmd_line = vec![
-                    if i == app.palette_selected_index {
+                    if i == model.selected_index {
                         " > "
                     } else {
                         "   "
@@ -121,7 +116,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 cmd_line.push(" - ".into());
                 cmd_line.push(cmd.item.description.gray());
                 let mut line = Line::from(cmd_line);
-                if i == app.palette_selected_index {
+                if i == model.selected_index {
                     line = line.yellow().on_blue();
                 }
                 lines.push(line);
@@ -130,9 +125,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             if filtered_commands.is_empty() {
                 lines.push(Line::from("   No matches found.".gray().italic()));
             }
+
+            (start_idx, total_cmds)
         }
-        _ => {}
-    }
+    };
 
     let palette_block = Block::default()
         .title(title)
@@ -145,7 +141,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .block(palette_block)
         .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-    let popup_area = super::top_right_popup_rect(area, palette_width, palette_height, app.infobar);
+    let popup_area =
+        super::top_right_popup_rect(area, palette_width, model.palette_height, model.infobar);
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(palette_paragraph, popup_area);
@@ -171,8 +168,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
 
-    let cursor_byte_offset = app.palette_query.cursor_byte_offset();
-    let prefix = &app.palette_query.value()[..cursor_byte_offset];
+    let cursor_byte_offset = model.cursor_byte_offset;
+    let prefix = &model.query[..cursor_byte_offset];
     let cursor_col = Span::raw(prefix).width() as u16;
 
     let cursor_x = (popup_area.x + 4 + cursor_col).min(popup_area.right().saturating_sub(1));

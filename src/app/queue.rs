@@ -322,6 +322,17 @@ impl ImageQueue {
         &self.relative_paths
     }
 
+    /// Returns the display path of the currently selected image, or an informative string if empty.
+    pub fn current_relative_path(&self, view_mode: ViewMode) -> &str {
+        if self.is_empty() || self.visible_count(view_mode) == 0 {
+            return "No file loaded";
+        }
+        self.relative_paths
+            .get(self.current_index)
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown file")
+    }
+
     /// Returns a slice of lowercase relative paths for matching.
     #[inline]
     pub fn relative_paths_lowercase(&self) -> &[String] {

@@ -1,4 +1,5 @@
-use crate::app::{App, Classification};
+use crate::app::Classification;
+use crate::ui::InfoBarModel;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -7,154 +8,161 @@ use ratatui::{
 };
 
 /// Renders the infobar displaying the file path, index, dimensions, scaling/panning parameters, and active filters.
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    if app.queue.is_empty() {
-        let status_block = Block::default()
-            .title(" imv-tui ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title_style(Style::default().fg(Color::Yellow).bold());
-        let inner_rect = status_block.inner(area);
-        frame.render_widget(status_block, area);
-        let empty_para = Paragraph::new(" No files found. Press 'q' to quit. ")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-        frame.render_widget(empty_para, inner_rect);
-    } else {
-        let mut extra_info = String::new();
-        let curr_brightness = app.current_brightness();
-        if !curr_brightness.is_zero() {
-            extra_info.push_str(&format!(" | Brightness: {:+}", curr_brightness.value()));
+pub fn draw(frame: &mut Frame, model: &InfoBarModel<'_>, area: Rect) {
+    match model {
+        InfoBarModel::Empty => {
+            let status_block = Block::default()
+                .title(" imv-tui ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title_style(Style::default().fg(Color::Yellow).bold());
+            let inner_rect = status_block.inner(area);
+            frame.render_widget(status_block, area);
+            let empty_para = Paragraph::new(" No files found. Press 'q' to quit. ")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+            frame.render_widget(empty_para, inner_rect);
         }
-        let curr_contrast = app.current_contrast();
-        if !curr_contrast.is_zero() {
-            extra_info.push_str(&format!(
-                " | Contrast: {:+}%",
-                curr_contrast.value().round() as i32
-            ));
-        }
-        if app.slideshow_state.is_active() {
-            if app.slideshow_state.is_paused() {
+        InfoBarModel::Active {
+            classification,
+            relative_path,
+            view_mode_name,
+            visible_position_1based,
+            visible_count,
+            img_width,
+            img_height,
+            show_thumbnail_only,
+            is_raw,
+            scale_mode,
+            filter_name,
+            current_zoom_pct,
+            pan_offset,
+            brightness,
+            contrast,
+            slideshow_state,
+        } => {
+            let mut extra_info = String::new();
+            if !brightness.is_zero() {
+                extra_info.push_str(&format!(" | Brightness: {:+}", brightness.value()));
+            }
+            if !contrast.is_zero() {
                 extra_info.push_str(&format!(
-                    " | Slideshow: Paused ({}s)",
-                    app.slideshow_state.seconds()
+                    " | Contrast: {:+}%",
+                    contrast.value().round() as i32
                 ));
-            } else {
-                extra_info.push_str(&format!(" | Slideshow: {}s", app.slideshow_state.seconds()));
             }
-        }
+            if slideshow_state.is_active() {
+                if slideshow_state.is_paused() {
+                    extra_info.push_str(&format!(
+                        " | Slideshow: Paused ({}s)",
+                        slideshow_state.seconds()
+                    ));
+                } else {
+                    extra_info.push_str(&format!(" | Slideshow: {}s", slideshow_state.seconds()));
+                }
+            }
 
-        let classification = app.current_classification();
-        let flag_icon = classification.icon();
+            let flag_icon = classification.icon();
 
-        let filename_color = match classification {
-            Classification::Pick => Color::Green,
-            Classification::Reject => Color::Red,
-            Classification::Unflagged => Color::Yellow,
-        };
+            let filename_color = match classification {
+                Classification::Pick => Color::Green,
+                Classification::Reject => Color::Red,
+                Classification::Unflagged => Color::Yellow,
+            };
 
-        let relative_path = app.current_relative_path();
-        let path = std::path::Path::new(relative_path);
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(relative_path);
+            let path = std::path::Path::new(relative_path);
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(relative_path);
 
-        let parent_str = if let Some(parent) = path.parent() {
-            let p_str = parent.to_string_lossy();
-            if p_str.is_empty() {
+            let parent_str = if let Some(parent) = path.parent() {
+                let p_str = parent.to_string_lossy();
+                if p_str.is_empty() {
+                    "".to_string()
+                } else {
+                    format!("[{}]", p_str)
+                }
+            } else {
                 "".to_string()
-            } else {
-                format!("[{}]", p_str)
-            }
-        } else {
-            "".to_string()
-        };
+            };
 
-        let left_title_line = ratatui::text::Line::from(vec![
-            ratatui::text::Span::raw(format!(" {} ", flag_icon)),
-            ratatui::text::Span::styled(
-                format!("[{}]", filename),
-                Style::default().fg(filename_color).bold(),
-            ),
-            ratatui::text::Span::styled(parent_str, Style::default().fg(Color::White)),
-            ratatui::text::Span::raw(" "),
-        ])
-        .left_aligned();
+            let left_title_line = ratatui::text::Line::from(vec![
+                ratatui::text::Span::raw(format!(" {} ", flag_icon)),
+                ratatui::text::Span::styled(
+                    format!("[{}]", filename),
+                    Style::default().fg(filename_color).bold(),
+                ),
+                ratatui::text::Span::styled(parent_str, Style::default().fg(Color::White)),
+                ratatui::text::Span::raw(" "),
+            ])
+            .left_aligned();
 
-        let right_title_line =
-            ratatui::text::Line::from(format!(" [{}] ", app.view_mode_name())).right_aligned();
+            let right_title_line =
+                ratatui::text::Line::from(format!(" [{}] ", view_mode_name)).right_aligned();
 
-        let status_block = Block::default()
-            .title(left_title_line)
-            .title(right_title_line)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title_style(Style::default().fg(Color::Yellow).bold());
-        let inner_rect = status_block.inner(area);
-        frame.render_widget(status_block, area);
+            let status_block = Block::default()
+                .title(left_title_line)
+                .title(right_title_line)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title_style(Style::default().fg(Color::Yellow).bold());
+            let inner_rect = status_block.inner(area);
+            frame.render_widget(status_block, area);
 
-        let is_raw = app
-            .queue
-            .images()
-            .get(app.queue.current_index)
-            .map(|src| src.is_raw())
-            .unwrap_or(false);
-        let left_text = format!(
-            " [{}/{}] ({}x{}){} ",
-            app.get_visible_position().map(|pos| pos + 1).unwrap_or(0),
-            app.get_visible_count(),
-            app.img_width,
-            app.img_height,
-            if app.show_thumbnail_only {
+            let thumb_str = if *show_thumbnail_only {
                 " [THUMB]"
-            } else if is_raw {
+            } else if *is_raw {
                 " [PREVIEW]"
             } else {
                 ""
-            }
-        );
+            };
+            let left_text = format!(
+                " [{}/{}] ({}x{}){} ",
+                visible_position_1based, visible_count, img_width, img_height, thumb_str
+            );
 
-        let mid_text = format!(
-            "Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){}",
-            app.scale_mode.name(),
-            app.filter_name(),
-            app.current_zoom_pct.round() as i64,
-            app.pan_offset.x,
-            app.pan_offset.y,
-            extra_info
-        );
+            let mid_text = format!(
+                "Scale: {} | Filter: {} | Zoom: {}% | Pan: ({}, {}){}",
+                scale_mode.name(),
+                filter_name,
+                current_zoom_pct.round() as i64,
+                pan_offset.x,
+                pan_offset.y,
+                extra_info
+            );
 
-        let right_text = "Press '?' for commands ";
+            let right_text = "Press '?' for commands ";
 
-        let left_len = left_text.chars().count() as u16;
-        let right_len = right_text.chars().count() as u16;
-        let side_len = left_len.max(right_len);
+            let left_len = left_text.chars().count() as u16;
+            let right_len = right_text.chars().count() as u16;
+            let side_len = left_len.max(right_len);
 
-        let status_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(side_len),
-                Constraint::Min(0),
-                Constraint::Length(side_len),
-            ])
-            .split(inner_rect);
+            let status_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(side_len),
+                    Constraint::Min(0),
+                    Constraint::Length(side_len),
+                ])
+                .split(inner_rect);
 
-        let left_para = Paragraph::new(left_text)
-            .alignment(Alignment::Left)
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-        frame.render_widget(left_para, status_chunks[0]);
+            let left_para = Paragraph::new(left_text)
+                .alignment(Alignment::Left)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+            frame.render_widget(left_para, status_chunks[0]);
 
-        let mid_para = Paragraph::new(mid_text)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-        frame.render_widget(mid_para, status_chunks[1]);
+            let mid_para = Paragraph::new(mid_text)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+            frame.render_widget(mid_para, status_chunks[1]);
 
-        let right_para = Paragraph::new(right_text)
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(Color::White).bg(Color::Reset));
-        frame.render_widget(right_para, status_chunks[2]);
+            let right_para = Paragraph::new(right_text)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(Color::White).bg(Color::Reset));
+            frame.render_widget(right_para, status_chunks[2]);
+        }
     }
 }

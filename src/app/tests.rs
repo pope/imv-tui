@@ -1677,3 +1677,23 @@ fn test_app_state_machine_invariants() {
     assert!(cad.poll_settled());
     assert!(!cad.is_prefetch_suspended());
 }
+
+#[test]
+fn test_current_relative_path() {
+    let mut app = setup_test_app();
+    assert_eq!(app.current_relative_path(), "img1.png");
+
+    app.next_image();
+    assert_eq!(app.current_relative_path(), "img2.png");
+
+    // When view mode filters out all images, visible_count is 0 -> "No file loaded"
+    app.view_mode = ViewMode::Picks;
+    assert_eq!(app.current_relative_path(), "No file loaded");
+
+    // When queue is emptied -> "No file loaded"
+    app.view_mode = ViewMode::Default;
+    app.queue.swap_remove(0);
+    app.queue.swap_remove(0);
+    assert!(app.queue.is_empty());
+    assert_eq!(app.current_relative_path(), "No file loaded");
+}

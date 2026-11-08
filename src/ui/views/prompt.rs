@@ -1,5 +1,5 @@
-use crate::app::{App, PromptType};
-use crate::config::InfoBarPosition;
+use crate::commands::PromptType;
+use crate::ui::PromptViewModel;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -9,18 +9,18 @@ use ratatui::{
 };
 
 /// Renders the confirm or value input prompt box (for delays, indexes, biases).
-pub fn draw(frame: &mut Frame, app: &App, area: Rect, prompt_type: PromptType) {
+pub fn draw(frame: &mut Frame, model: &PromptViewModel<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let prompt_title = match prompt_type {
+    let prompt_title = match model.prompt_type {
         PromptType::GoToImage => " Go to Image ",
         PromptType::SetBrightness => " Set Brightness ",
         PromptType::SetContrast => " Set Contrast ",
         PromptType::SetSlideshow => " Set Slideshow ",
     };
-    let prompt_label = match prompt_type {
+    let prompt_label = match model.prompt_type {
         PromptType::GoToImage => "Enter index (e.g. 40, +10, -10):",
         PromptType::SetBrightness => "Enter brightness (e.g. 50, +10, -10):",
         PromptType::SetContrast => "Enter contrast % (e.g. 20, +5, -5):",
@@ -29,11 +29,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, prompt_type: PromptType) {
 
     let lines = vec![
         Line::from(format!("   {}", prompt_label).gray()),
-        Line::from(vec![" > ".bold().cyan(), app.palette_query.value().into()]),
+        Line::from(vec![" > ".bold().cyan(), model.query.into()]),
     ];
-
-    let w = 45.min(area.width.saturating_sub(1));
-    let h = app.palette_height.min(area.height.saturating_sub(1));
 
     let palette_block = Block::default()
         .title(prompt_title)
@@ -46,25 +43,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, prompt_type: PromptType) {
         .block(palette_block)
         .style(Style::default().fg(Color::White).bg(Color::Reset));
 
-    let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
-    let y = if app.infobar == InfoBarPosition::Top {
-        area.y
-    } else {
-        area.y.saturating_add(1)
-    };
-
-    // Ensure popup fits entirely within the parent area
-    let w = w.max(1);
-    let h = h.max(1);
-    let x = x.min(area.right().saturating_sub(w));
-    let y = y.min(area.bottom().saturating_sub(h));
-
-    let popup_area = Rect::new(x, y, w, h);
+    let popup_area = super::top_right_popup_rect(area, 45, model.palette_height, model.infobar);
     frame.render_widget(Clear, popup_area);
     frame.render_widget(palette_paragraph, popup_area);
 
-    let cursor_byte_offset = app.palette_query.cursor_byte_offset();
-    let prefix = &app.palette_query.value()[..cursor_byte_offset];
+    let prefix = &model.query[..model.cursor_byte_offset];
     let cursor_col = Span::raw(prefix).width() as u16;
 
     let cursor_x = (popup_area.x + 4 + cursor_col).min(popup_area.right().saturating_sub(1));
