@@ -1,7 +1,7 @@
 //! CPU-bound image scaling, panning, and resizing worker pools.
 
 use fast_image_resize as fir;
-use image::{DynamicImage, GenericImage};
+use image::DynamicImage;
 
 use crate::imaging::types::*;
 use crate::imaging::{ResizeRequest, ViewportProtocol};
@@ -300,27 +300,28 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
             let copy_h = target_inter_h.min(req.target_h.saturating_sub(paste_y));
 
             if copy_w > 0 && copy_h > 0 {
-                let mut part_to_copy = if copy_w < target_inter_w || copy_h < target_inter_h {
-                    resized_part.crop_imm(0, 0, copy_w, copy_h)
-                } else {
-                    resized_part
+                let mut src_rgba = match resized_part {
+                    DynamicImage::ImageRgba8(rgba) => rgba,
+                    other => crate::imaging::into_rgba8_fast(other),
                 };
+                let src_stride = (src_rgba.width() as usize) * 4;
+                let row_bytes = (copy_w as usize) * 4;
+                let active_src_len = ((copy_h as usize) - 1) * src_stride + row_bytes;
+                apply_adjustments_lut(
+                    &mut src_rgba.as_mut()[..active_src_len],
+                    req.brightness.value(),
+                    req.contrast.value(),
+                );
+                let src_raw = src_rgba.as_raw();
+                let dest_stride = (req.target_w as usize) * 4;
+                let dest_raw = screen_canvas.as_mut();
 
-                if let Some(rgba_part) = part_to_copy.as_mut_rgba8() {
-                    apply_adjustments_lut(
-                        rgba_part.as_mut(),
-                        req.brightness.value(),
-                        req.contrast.value(),
-                    );
-                    let _ = screen_canvas.copy_from(rgba_part, paste_x, paste_y);
-                } else {
-                    let mut rgba_part = part_to_copy.to_rgba8();
-                    apply_adjustments_lut(
-                        rgba_part.as_mut(),
-                        req.brightness.value(),
-                        req.contrast.value(),
-                    );
-                    let _ = screen_canvas.copy_from(&rgba_part, paste_x, paste_y);
+                for y in 0..(copy_h as usize) {
+                    let src_start = y * src_stride;
+                    let src_slice = &src_raw[src_start..src_start + row_bytes];
+                    let dest_start =
+                        ((paste_y as usize) + y) * dest_stride + (paste_x as usize) * 4;
+                    dest_raw[dest_start..dest_start + row_bytes].copy_from_slice(src_slice);
                 }
             }
         }
@@ -382,14 +383,34 @@ pub fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
     }
     if value > 0 {
         let delta = value.min(255) as u8;
-        for chunk in pixels.as_chunks_mut::<4>().0 {
+        let mask: [u8; 16] = [
+            delta, delta, delta, 0, delta, delta, delta, 0, delta, delta, delta, 0, delta, delta,
+            delta, 0,
+        ];
+        let (chunks16, tail) = pixels.as_chunks_mut::<16>();
+        for chunk in chunks16 {
+            for i in 0..16 {
+                chunk[i] = chunk[i].saturating_add(mask[i]);
+            }
+        }
+        for chunk in tail.as_chunks_mut::<4>().0 {
             chunk[0] = chunk[0].saturating_add(delta);
             chunk[1] = chunk[1].saturating_add(delta);
             chunk[2] = chunk[2].saturating_add(delta);
         }
     } else {
         let delta = (-value).min(255) as u8;
-        for chunk in pixels.as_chunks_mut::<4>().0 {
+        let mask: [u8; 16] = [
+            delta, delta, delta, 0, delta, delta, delta, 0, delta, delta, delta, 0, delta, delta,
+            delta, 0,
+        ];
+        let (chunks16, tail) = pixels.as_chunks_mut::<16>();
+        for chunk in chunks16 {
+            for i in 0..16 {
+                chunk[i] = chunk[i].saturating_sub(mask[i]);
+            }
+        }
+        for chunk in tail.as_chunks_mut::<4>().0 {
             chunk[0] = chunk[0].saturating_sub(delta);
             chunk[1] = chunk[1].saturating_sub(delta);
             chunk[2] = chunk[2].saturating_sub(delta);
@@ -926,7 +947,50 @@ mod tests {
         assert_eq!(pixels[8..11], [50, 50, 50]);
         assert_eq!(pixels[11], 255);
 
-        // 2. Contrast LUT
+        // 2. Test buffer sizes of 1..=8 pixels to cover tail-only (1..=3), exact 16-byte SIMD
+        // chunks (4, 8), and combined 16-byte chunk + tail remainders (5..=7).
+        for num_pixels in 1..=8 {
+            // Populate `num_pixels` RGBA pixels with distinct alpha values per pixel index `i`.
+            let mut buf = Vec::with_capacity(num_pixels * 4);
+            for i in 0..num_pixels {
+                let alpha = ((i * 37) % 256) as u8;
+                buf.extend_from_slice(&[200, 100, 50, alpha]);
+            }
+
+            // Test positive delta with saturation
+            let mut test_buf = buf.clone();
+            apply_brightness_simd(&mut test_buf, 70);
+            for i in 0..num_pixels {
+                let px = &test_buf[i * 4..(i + 1) * 4];
+                assert_eq!(px[0], 255, "R must saturate to 255 at pixel {}", i);
+                assert_eq!(px[1], 170, "G must be 170 at pixel {}", i);
+                assert_eq!(px[2], 120, "B must be 120 at pixel {}", i);
+                assert_eq!(
+                    px[3],
+                    ((i * 37) % 256) as u8,
+                    "Alpha must be preserved at pixel {}",
+                    i
+                );
+            }
+
+            // Test negative delta with underflow saturation
+            let mut test_buf_neg = buf.clone();
+            apply_brightness_simd(&mut test_buf_neg, -150);
+            for i in 0..num_pixels {
+                let px = &test_buf_neg[i * 4..(i + 1) * 4];
+                assert_eq!(px[0], 50, "R must be 50 at pixel {}", i);
+                assert_eq!(px[1], 0, "G must saturate to 0 at pixel {}", i);
+                assert_eq!(px[2], 0, "B must saturate to 0 at pixel {}", i);
+                assert_eq!(
+                    px[3],
+                    ((i * 37) % 256) as u8,
+                    "Alpha must be preserved at pixel {}",
+                    i
+                );
+            }
+        }
+
+        // 3. Contrast LUT
         apply_contrast_lut(&mut pixels, 25.0);
         assert_eq!(pixels[3], 0);
         assert_eq!(pixels[7], 128);
@@ -992,6 +1056,73 @@ mod tests {
         // Active image pixel at (30, 30) was brightened and contrasted
         assert!(canvas.get_pixel(30, 30)[0] > 120);
         assert_eq!(canvas.get_pixel(30, 30)[3], 255);
+    }
+
+    #[test]
+    fn test_render_resize_canvas_clipped_copy_and_adjustments() {
+        let mut resizer = fir::Resizer::new();
+        // 50x50 gray image with pixel value 100
+        let src = Arc::new(make_gray_test_image(50, 50, 100));
+
+        // 1. Offscreen panning where intersection is 40x40, but target viewport is 25x20.
+        // paste_x will be 0, paste_y will be 0, so copy_w = 25 < target_inter_w (40)
+        // and copy_h = 20 < target_inter_h (40).
+        let req = ResizeRequest {
+            img: src.clone(),
+            original_size: (50, 50),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 25, 20),
+            intersection: ImageIntersection::new(0, 0, 40, 40),
+            target_w: 25,
+            target_h: 20,
+            filter_type: FilterType::Nearest,
+            picker: Picker::halfblocks(),
+            brightness: Brightness::new(30),
+            contrast: Contrast::new(10.0),
+            rendered_size_cells: (12, 10),
+            sequence: 1,
+            use_kitty_shm: false,
+        };
+
+        let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
+        assert_eq!(canvas.width(), 25);
+        assert_eq!(canvas.height(), 20);
+
+        // Copied pixels must have brightness + contrast applied
+        let px = canvas.get_pixel(10, 10);
+        assert!(px[0] > 100, "Pixel must be brightened: got {}", px[0]);
+        assert_eq!(px[3], 255, "Alpha must be preserved as 255");
+
+        // 2. Asymmetric clipping with margins: target_w = 40, target_h = 40,
+        // intersection at (0, 0..30, 30), scale 1.0, crop from -5, -5.
+        // Margin at (0, 0) should remain transparent black (0, 0, 0, 0).
+        let req_margin = ResizeRequest {
+            img: src,
+            original_size: (50, 50),
+            scale: 1.0,
+            crop: CropBox::new(-5, -5, 35, 35),
+            intersection: ImageIntersection::new(0, 0, 30, 30),
+            target_w: 40,
+            target_h: 40,
+            filter_type: FilterType::Nearest,
+            picker: Picker::halfblocks(),
+            brightness: Brightness::new(40),
+            contrast: Contrast::new(15.0),
+            rendered_size_cells: (20, 20),
+            sequence: 2,
+            use_kitty_shm: false,
+        };
+
+        let canvas_margin = render_resize_canvas(&req_margin, &mut resizer).to_rgba8();
+        assert_eq!(*canvas_margin.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
+        // Active image pixel at (10, 10) should have adjustments applied
+        let active_px = canvas_margin.get_pixel(10, 10);
+        assert!(
+            active_px[0] > 100,
+            "Active pixel must have adjustments applied: got {}",
+            active_px[0]
+        );
+        assert_eq!(active_px[3], 255, "Alpha must be 255");
     }
 
     #[test]

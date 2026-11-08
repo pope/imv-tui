@@ -694,11 +694,7 @@ fn is_row_black(img: &DynamicImage, y: u32, threshold: u8) -> bool {
             let stride = (w as usize) * 3;
             let row_start = (y as usize) * stride;
             let row_bytes = &rgb.as_raw()[row_start..row_start + stride];
-            row_bytes
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .all(|p| p[0] <= threshold && p[1] <= threshold && p[2] <= threshold)
+            row_bytes.iter().all(|&b| b <= threshold)
         }
         DynamicImage::ImageRgba8(rgba) => {
             let stride = (w as usize) * 4;
