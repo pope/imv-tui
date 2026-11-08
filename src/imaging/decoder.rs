@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::imaging::DecodedImage;
 use crate::imaging::ImageSource;
 use crate::imaging::raw::*;
-use image::{DynamicImage, ImageDecoder};
+use image::{DynamicImage, GenericImageView, ImageDecoder};
 
 /// Cooperative cancellation token checked at multi-step I/O and decode checkpoints.
 #[derive(Clone, Copy, Debug, Default)]
@@ -684,41 +684,214 @@ fn decode_jpeg_thumbnail_bytes(thumb_bytes: &[u8]) -> Option<DynamicImage> {
     }
 }
 
+fn is_row_black(img: &DynamicImage, y: u32, threshold: u8) -> bool {
+    let w = img.width();
+    if y >= img.height() || w == 0 {
+        return false;
+    }
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            let stride = (w as usize) * 3;
+            let row_start = (y as usize) * stride;
+            let row_bytes = &rgb.as_raw()[row_start..row_start + stride];
+            row_bytes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|p| p[0] <= threshold && p[1] <= threshold && p[2] <= threshold)
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let stride = (w as usize) * 4;
+            let row_start = (y as usize) * stride;
+            let row_bytes = &rgba.as_raw()[row_start..row_start + stride];
+            row_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] <= threshold && p[1] <= threshold && p[2] <= threshold)
+        }
+        other => (0..w).all(|x| {
+            let p = other.get_pixel(x, y);
+            p[0] <= threshold && p[1] <= threshold && p[2] <= threshold
+        }),
+    }
+}
+
+fn is_col_black(img: &DynamicImage, x: u32, threshold: u8) -> bool {
+    let h = img.height();
+    let w = img.width();
+    if x >= w || h == 0 {
+        return false;
+    }
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            let raw = rgb.as_raw();
+            let stride = (w as usize) * 3;
+            let x_off = (x as usize) * 3;
+            (0..h as usize).all(|y| {
+                let off = y * stride + x_off;
+                raw[off] <= threshold && raw[off + 1] <= threshold && raw[off + 2] <= threshold
+            })
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let raw = rgba.as_raw();
+            let stride = (w as usize) * 4;
+            let x_off = (x as usize) * 4;
+            (0..h as usize).all(|y| {
+                let off = y * stride + x_off;
+                raw[off] <= threshold && raw[off + 1] <= threshold && raw[off + 2] <= threshold
+            })
+        }
+        other => (0..h).all(|y| {
+            let p = other.get_pixel(x, y);
+            p[0] <= threshold && p[1] <= threshold && p[2] <= threshold
+        }),
+    }
+}
+
+/// Inspects a decoded thumbnail to detect whether letterbox (or pillarbox) black bars
+/// have been padded and snapped to 8-pixel DCT block boundaries by in-camera preview encoders.
+///
+/// Requires candidate DCT boundary lines to be black (`<= 16u8`) AND active image content to begin
+/// at the 8px boundary (step-transition). If candidate boundary lines contain image data OR if the scene
+/// itself is an extended solid black background (e.g. astrophotography), returns `false`.
+pub fn detect_thumbnail_dct_padding(img: &DynamicImage, full_w: u32, full_h: u32) -> bool {
+    let thumb_w = img.width();
+    let thumb_h = img.height();
+    if full_w == 0 || full_h == 0 || thumb_w == 0 || thumb_h == 0 {
+        return false;
+    }
+
+    let ar_full = full_w as f64 / full_h as f64;
+    let ar_thumb = thumb_w as f64 / thumb_h as f64;
+
+    if (ar_full - ar_thumb).abs() <= 0.01 {
+        return false;
+    }
+
+    const THRESHOLD: u8 = 16;
+
+    if ar_full > ar_thumb {
+        // Letterboxing: full image is wider than container -> black bars on top and bottom
+        let raw_pad_px = (thumb_h as f64 - (thumb_w as f64 / ar_full)) / 2.0;
+        let nearest_block_px = (raw_pad_px / 8.0).round() * 8.0;
+
+        if nearest_block_px > 0.0
+            && nearest_block_px * 2.0 < thumb_h as f64
+            && (raw_pad_px - nearest_block_px).abs() <= 2.0
+        {
+            let block_px = nearest_block_px as u32;
+            let test_row_top = block_px - 1;
+            let test_row_bot = thumb_h - block_px;
+
+            if is_row_black(img, test_row_top, THRESHOLD)
+                && is_row_black(img, test_row_bot, THRESHOLD)
+            {
+                let first_image_row_top = block_px;
+                let last_image_row_bot = thumb_h - block_px - 1;
+
+                if !is_row_black(img, first_image_row_top, THRESHOLD)
+                    || !is_row_black(img, last_image_row_bot, THRESHOLD)
+                {
+                    return true;
+                }
+            }
+        }
+    } else {
+        // Pillarboxing: full image is taller than container -> black bars on left and right
+        let raw_pad_px = (thumb_w as f64 - (thumb_h as f64 * ar_full)) / 2.0;
+        let nearest_block_px = (raw_pad_px / 8.0).round() * 8.0;
+
+        if nearest_block_px > 0.0
+            && nearest_block_px * 2.0 < thumb_w as f64
+            && (raw_pad_px - nearest_block_px).abs() <= 2.0
+        {
+            let block_px = nearest_block_px as u32;
+            let test_col_left = block_px - 1;
+            let test_col_right = thumb_w - block_px;
+
+            if is_col_black(img, test_col_left, THRESHOLD)
+                && is_col_black(img, test_col_right, THRESHOLD)
+            {
+                let first_image_col_left = block_px;
+                let last_image_col_right = thumb_w - block_px - 1;
+
+                if !is_col_black(img, first_image_col_left, THRESHOLD)
+                    || !is_col_black(img, last_image_col_right, THRESHOLD)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Crops letterbox (or pillarbox) black padding from embedded camera thumbnails,
+/// snapping to 8-pixel DCT block boundaries when detected and guaranteeing symmetric cropping.
+pub fn crop_thumbnail_padding(thumb_img: DynamicImage, full_w: u32, full_h: u32) -> DynamicImage {
+    let thumb_w = thumb_img.width();
+    let thumb_h = thumb_img.height();
+    if full_w == 0 || full_h == 0 || thumb_w == 0 || thumb_h == 0 {
+        return thumb_img;
+    }
+
+    let ar_full = full_w as f64 / full_h as f64;
+    let ar_thumb = thumb_w as f64 / thumb_h as f64;
+
+    if (ar_full - ar_thumb).abs() <= 0.01 {
+        return thumb_img;
+    }
+
+    let dct_snapped = detect_thumbnail_dct_padding(&thumb_img, full_w, full_h);
+
+    if ar_full > ar_thumb {
+        // Letterboxing: black bars on top and bottom
+        let raw_pad_px = (thumb_h as f64 - (thumb_w as f64 / ar_full)) / 2.0;
+        let pad_y = if dct_snapped {
+            ((raw_pad_px / 8.0).round() * 8.0) as u32
+        } else {
+            raw_pad_px.round() as u32
+        };
+        let content_h = thumb_h.saturating_sub(pad_y.saturating_mul(2));
+        if pad_y > 0 && content_h > 0 {
+            thumb_img.crop_imm(0, pad_y, thumb_w, content_h)
+        } else {
+            thumb_img
+        }
+    } else {
+        // Pillarboxing: black bars on left and right
+        let raw_pad_px = (thumb_w as f64 - (thumb_h as f64 * ar_full)) / 2.0;
+        let pad_x = if dct_snapped {
+            ((raw_pad_px / 8.0).round() * 8.0) as u32
+        } else {
+            raw_pad_px.round() as u32
+        };
+        let content_w = thumb_w.saturating_sub(pad_x.saturating_mul(2));
+        if pad_x > 0 && content_w > 0 {
+            thumb_img.crop_imm(pad_x, 0, content_w, thumb_h)
+        } else {
+            thumb_img
+        }
+    }
+}
+
 /// Reads image dimensions and decodes its embedded thumbnail with optional positional I/O fallback
 /// for Camera RAW and TIFF files where the thumbnail or root IFD is stored in file segments past the initial header slice.
 fn decode_thumbnail_and_dimensions_impl(
     bytes: &[u8],
     source: Option<&ImageSource>,
+    thumb_only: bool,
 ) -> Option<(DynamicImage, u32, u32)> {
-    // Check if this is a RAW / TIFF container
-    if is_raw_container_header(bytes) {
+    let is_raw = is_raw_container_header(bytes);
+    let is_jpeg = bytes.starts_with(&[0xFF, 0xD8]);
+
+    if is_raw || is_jpeg {
         let probe = probe_raw_header(bytes, source);
 
-        // Try candidate order: thumbnail, medium, preview (if <= 2MB)
-        let mut candidate_order = Vec::new();
-        if let Some(t) = probe.thumbnail {
-            candidate_order.push(t);
-        }
-        if let Some(m) = probe.medium
-            && !candidate_order.contains(&m)
-        {
-            candidate_order.push(m);
-        }
-        if let Some(p) = probe.preview
-            && p.length <= 2 * 1024 * 1024
-            && !candidate_order.contains(&p)
-        {
-            candidate_order.push(p);
-        }
-        // Also fallback to any remaining candidate in reverse order (smallest first)
-        for c in probe.candidates_desc.iter().rev() {
-            if !candidate_order.contains(c) && c.length <= 2 * 1024 * 1024 {
-                candidate_order.push(*c);
-            }
-        }
-
         let mut decoded_thumb = None;
-        for loc in candidate_order {
+        for loc in probe.placeholder_candidates(thumb_only) {
             if let Some(thumb_bytes) = read_location_bytes(bytes, source, loc)
                 && is_decodable_jpeg(&thumb_bytes)
                 && let Some(img) = decode_jpeg_thumbnail_bytes(&thumb_bytes)
@@ -728,13 +901,41 @@ fn decode_thumbnail_and_dimensions_impl(
             }
         }
 
-        let mut thumb_img = decoded_thumb?;
-        let orientation = probe.orientation;
-        thumb_img.apply_orientation(orientation);
+        if is_jpeg
+            && decoded_thumb.is_none()
+            && let Some(thumb_bytes) = extract_jpeg_thumbnail(bytes)
+            && let Some(img) = decode_jpeg_thumbnail_bytes(&thumb_bytes)
+        {
+            decoded_thumb = Some(img);
+        }
 
-        let (mut raw_w, mut raw_h) = probe
-            .sensor_dims
-            .unwrap_or((thumb_img.width(), thumb_img.height()));
+        let mut thumb_img = decoded_thumb?;
+
+        let unoriented_dims = if is_jpeg {
+            scan_jpeg_sof_dimensions(bytes)
+                .or(probe.sensor_dims)
+                .or_else(|| {
+                    image::ImageReader::new(std::io::Cursor::new(bytes))
+                        .with_guessed_format()
+                        .ok()?
+                        .into_decoder()
+                        .ok()
+                        .map(|d| d.dimensions())
+                })
+        } else {
+            probe
+                .sensor_dims
+                .or(Some((thumb_img.width(), thumb_img.height())))
+        };
+
+        let (mut raw_w, mut raw_h) = unoriented_dims?;
+
+        let orientation = if probe.orientation != image::metadata::Orientation::NoTransforms {
+            probe.orientation
+        } else {
+            get_exif_orientation(bytes)
+        };
+        thumb_img.apply_orientation(orientation);
 
         let swaps = matches!(
             orientation,
@@ -747,36 +948,7 @@ fn decode_thumbnail_and_dimensions_impl(
             std::mem::swap(&mut raw_w, &mut raw_h);
         }
 
-        // Crop out any black padding/letterboxing in the thumbnail frame
-        let ar_main = raw_w as f64 / raw_h as f64;
-        let thumb_w = thumb_img.width();
-        let thumb_h = thumb_img.height();
-        let ar_thumb = thumb_w as f64 / thumb_h as f64;
-
-        let cropped_thumb = if (ar_main - ar_thumb).abs() > 0.01 {
-            if ar_main > ar_thumb {
-                let content_h = (thumb_w as f64 / ar_main).round() as u32;
-                let padding_y = (thumb_h.saturating_sub(content_h)) / 2;
-                let content_h = content_h.min(thumb_h.saturating_sub(padding_y));
-                if content_h > 0 {
-                    thumb_img.crop_imm(0, padding_y, thumb_w, content_h)
-                } else {
-                    thumb_img
-                }
-            } else {
-                let content_w = (thumb_h as f64 * ar_main).round() as u32;
-                let padding_x = (thumb_w.saturating_sub(content_w)) / 2;
-                let content_w = content_w.min(thumb_w.saturating_sub(padding_x));
-                if content_w > 0 {
-                    thumb_img.crop_imm(padding_x, 0, content_w, thumb_h)
-                } else {
-                    thumb_img
-                }
-            }
-        } else {
-            thumb_img
-        };
-
+        let cropped_thumb = crop_thumbnail_padding(thumb_img, raw_w, raw_h);
         let final_thumb = match cropped_thumb {
             DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => cropped_thumb,
             other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
@@ -792,7 +964,7 @@ fn decode_thumbnail_and_dimensions_impl(
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let (raw_w, raw_h) = decoder.dimensions();
+    let (mut raw_w, mut raw_h) = decoder.dimensions();
 
     let thumb_bytes = extract_jpeg_thumbnail(bytes)?;
     let mut thumb_img = decode_jpeg_thumbnail_bytes(&thumb_bytes)?;
@@ -808,66 +980,44 @@ fn decode_thumbnail_and_dimensions_impl(
             | image::metadata::Orientation::Rotate90FlipH
             | image::metadata::Orientation::Rotate270FlipH
     );
-
-    let (mut oriented_raw_w, mut oriented_raw_h) = (raw_w, raw_h);
     if swaps {
-        std::mem::swap(&mut oriented_raw_w, &mut oriented_raw_h);
+        std::mem::swap(&mut raw_w, &mut raw_h);
     }
 
-    // Crop out any black padding/letterboxing in the thumbnail frame
-    let ar_main = oriented_raw_w as f64 / oriented_raw_h as f64;
-    let thumb_w = thumb_img.width();
-    let thumb_h = thumb_img.height();
-    let ar_thumb = thumb_w as f64 / thumb_h as f64;
-
-    let cropped_thumb = if (ar_main - ar_thumb).abs() > 0.01 {
-        if ar_main > ar_thumb {
-            let content_h = (thumb_w as f64 / ar_main).round() as u32;
-            let padding_y = (thumb_h.saturating_sub(content_h)) / 2;
-            let content_h = content_h.min(thumb_h.saturating_sub(padding_y));
-            if content_h > 0 {
-                thumb_img.crop_imm(0, padding_y, thumb_w, content_h)
-            } else {
-                thumb_img
-            }
-        } else {
-            let content_w = (thumb_h as f64 * ar_main).round() as u32;
-            let padding_x = (thumb_w.saturating_sub(content_w)) / 2;
-            let content_w = content_w.min(thumb_w.saturating_sub(padding_x));
-            if content_w > 0 {
-                thumb_img.crop_imm(padding_x, 0, content_w, thumb_h)
-            } else {
-                thumb_img
-            }
-        }
-    } else {
-        thumb_img
-    };
-
+    let cropped_thumb = crop_thumbnail_padding(thumb_img, raw_w, raw_h);
     let final_thumb = match cropped_thumb {
         DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => cropped_thumb,
         other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
     };
 
-    Some((final_thumb, oriented_raw_w, oriented_raw_h))
+    Some((final_thumb, raw_w, raw_h))
 }
 
-/// Reads the image dimensions extremely quickly from header headers, and decodes/scales
-/// its embedded EXIF thumbnail to serve as a fast low-res placeholder for large cold loads.
+/// Reads image dimensions and decodes its embedded thumbnail according to the requested `thumb_only` mode,
+/// with positional I/O fallback for Camera RAW and TIFF files.
+pub fn decode_thumbnail_and_dimensions_for_mode(
+    bytes: &[u8],
+    source: Option<&ImageSource>,
+    thumb_only: bool,
+) -> Option<(DynamicImage, u32, u32)> {
+    decode_thumbnail_and_dimensions_impl(bytes, source, thumb_only)
+}
+
+/// Reads the image dimensions extremely quickly from header bytes, and decodes
+/// its embedded thumbnail to serve as a fast low-res placeholder for large cold loads.
+#[cfg(test)]
 pub fn decode_thumbnail_and_dimensions(bytes: &[u8]) -> Option<(DynamicImage, u32, u32)> {
-    decode_thumbnail_and_dimensions_impl(bytes, None)
+    decode_thumbnail_and_dimensions_for_mode(bytes, None, false)
 }
 
 /// Reads image dimensions and decodes its embedded thumbnail with optional positional I/O fallback
 /// for Camera RAW and TIFF files where the thumbnail or root IFD is stored in file segments past the initial header slice.
+#[cfg(test)]
 pub fn decode_thumbnail_and_dimensions_with_source(
     bytes: &[u8],
     source: Option<&ImageSource>,
 ) -> Option<(DynamicImage, u32, u32)> {
-    match source {
-        Some(_) => decode_thumbnail_and_dimensions_impl(bytes, source),
-        None => decode_thumbnail_and_dimensions(bytes),
-    }
+    decode_thumbnail_and_dimensions_for_mode(bytes, source, false)
 }
 
 #[cfg(test)]
@@ -1550,9 +1700,9 @@ mod tests {
         // Thumbnail mode: extracts small thumbnail
         let (thumb, rw, rh) = decode_thumbnail_and_dimensions(&container)
             .expect("decode_thumbnail_and_dimensions must succeed");
-        // Thumbnail was 10x20 rotated by 90° into 20x10, and cropped to 7x10 to match 4000:6000 aspect ratio
+        // Thumbnail was 10x20 rotated by 90° into 20x10, and symmetrically cropped to 6x10 to match 4000:6000 aspect ratio
         assert_eq!(thumb.height(), 10);
-        assert_eq!(thumb.width(), 7);
+        assert_eq!(thumb.width(), 6);
         // Sensor dimensions rotated by 90° into 4000x6000
         assert_eq!((rw, rh), (4000, 6000));
 
@@ -1897,5 +2047,201 @@ mod tests {
             corrupt_res.is_err(),
             "Must return Err cleanly when all candidates are corrupt"
         );
+    }
+
+    #[test]
+    fn test_detect_thumbnail_dct_padding_and_symmetric_crop() {
+        // 1. Matching aspect ratio (160x120 thumb for 1600x1200 image) -> false, untouched
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(160, 120));
+        assert!(!detect_thumbnail_dct_padding(&img, 1600, 1200));
+        let cropped = crop_thumbnail_padding(img, 1600, 1200);
+        assert_eq!(cropped.width(), 160);
+        assert_eq!(cropped.height(), 120);
+
+        // 2. 8px DCT block snapping: 160x120 thumb for 6000x4000 (3:2) image.
+        // Rows 0..8 and 112..120 are black (0 <= 16), rows 8..112 are bright (200).
+        let mut rgb = image::RgbImage::new(160, 120);
+        for y in 0..120 {
+            let val = if !(8..112).contains(&y) { 0 } else { 200 };
+            for x in 0..160 {
+                rgb.put_pixel(x, y, image::Rgb([val, val, val]));
+            }
+        }
+        let img = DynamicImage::ImageRgb8(rgb);
+        assert!(detect_thumbnail_dct_padding(&img, 6000, 4000));
+        let cropped = crop_thumbnail_padding(img, 6000, 4000);
+        // Symmetrically cropped by 8px top and bottom: 120 - 16 = 104
+        assert_eq!(cropped.width(), 160);
+        assert_eq!(cropped.height(), 104);
+
+        // 3. Non-snapped theoretical padding: 160x120 thumb for 6000x4000 (3:2) image
+        // where row 7 has bright pixels (200), so not snapped to 8px block.
+        let mut rgb = image::RgbImage::new(160, 120);
+        for y in 0..120 {
+            let val = if !(7..113).contains(&y) { 0 } else { 200 };
+            for x in 0..160 {
+                rgb.put_pixel(x, y, image::Rgb([val, val, val]));
+            }
+        }
+        let img = DynamicImage::ImageRgb8(rgb);
+        assert!(!detect_thumbnail_dct_padding(&img, 6000, 4000));
+        let cropped = crop_thumbnail_padding(img, 6000, 4000);
+        // raw_pad_px = (120 - 160 / 1.5) / 2 = 6.666..., round() = 7.
+        // Symmetric crop: 120 - 2 * 7 = 106.
+        assert_eq!(cropped.width(), 160);
+        assert_eq!(cropped.height(), 106);
+
+        // 4. Solid black background / astrophotography: entire 160x120 thumb is pure black (0).
+        let rgb = image::RgbImage::new(160, 120);
+        let img = DynamicImage::ImageRgb8(rgb);
+        // Step-transition check prevents false positive detection!
+        assert!(!detect_thumbnail_dct_padding(&img, 6000, 4000));
+
+        // 5. Pillarbox 8px DCT snapping: 160x120 thumb for 4000x6000 (2:3) portrait image.
+        // Cols 0..40 and 120..160 are black (0), cols 40..120 are bright (200).
+        let mut rgb = image::RgbImage::new(160, 120);
+        for x in 0..160 {
+            let val = if !(40..120).contains(&x) { 0 } else { 200 };
+            for y in 0..120 {
+                rgb.put_pixel(x, y, image::Rgb([val, val, val]));
+            }
+        }
+        let img = DynamicImage::ImageRgb8(rgb);
+        assert!(detect_thumbnail_dct_padding(&img, 4000, 6000));
+        let cropped = crop_thumbnail_padding(img, 4000, 6000);
+        // Symmetrically cropped by 40px left and right: 160 - 80 = 80
+        assert_eq!(cropped.width(), 80);
+        assert_eq!(cropped.height(), 120);
+    }
+
+    #[test]
+    fn test_jpeg_header_thumbnail_when_sof_past_256kb_and_adaptive_raw_placeholder() {
+        // --- Part 1: JPEG with SOF past 256 KB ---
+        let thumb_jpeg = encode_test_jpeg(10, 20, 255, 0, 0);
+
+        let mut app1_tiff = vec![0u8; 1500];
+        // TIFF header: II*\0, IFD0 at offset 8
+        app1_tiff[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let exif_ifd_off = 100u32;
+        let ifd1_off = 300u32;
+        let thumb_off = 500u32;
+
+        app1_tiff[thumb_off as usize..thumb_off as usize + thumb_jpeg.len()]
+            .copy_from_slice(&thumb_jpeg);
+
+        // IFD0 at 8: Orientation = 6 (Rotate90), ExifIFD at exif_ifd_off, next IFD = ifd1_off
+        write_ifd(
+            &mut app1_tiff,
+            8,
+            &[(0x0112, 3, 1, 6), (0x8769, 4, 1, exif_ifd_off)],
+            ifd1_off,
+        );
+
+        // ExifIFD at 100: PixelXDimension = 6000, PixelYDimension = 4000
+        write_ifd(
+            &mut app1_tiff,
+            exif_ifd_off as usize,
+            &[(0xA002, 4, 1, 6000), (0xA003, 4, 1, 4000)],
+            0,
+        );
+
+        // IFD1 at 300: JPEGInterchangeFormat and Length for embedded thumbnail
+        write_ifd(
+            &mut app1_tiff,
+            ifd1_off as usize,
+            &[
+                (0x0201, 4, 1, thumb_off),
+                (0x0202, 4, 1, thumb_jpeg.len() as u32),
+            ],
+            0,
+        );
+
+        // Construct 256 KB JPEG header:
+        // SOI -> APP1 -> APP2 segments filling 256 KB (no SOF marker in the 256 KB buffer!)
+        let mut jpeg_buf = Vec::with_capacity(260 * 1024);
+        jpeg_buf.extend_from_slice(&[0xFF, 0xD8]); // SOI
+
+        // APP1 with Exif
+        let app1_payload_len = 6 + app1_tiff.len();
+        let app1_seg_len = (2 + app1_payload_len) as u16;
+        jpeg_buf.extend_from_slice(&[0xFF, 0xE1]);
+        jpeg_buf.extend_from_slice(&app1_seg_len.to_be_bytes());
+        jpeg_buf.extend_from_slice(b"Exif\0\0");
+        jpeg_buf.extend_from_slice(&app1_tiff);
+
+        // Fill up to 256 KB using APP2 segments (each max ~65535 bytes)
+        while jpeg_buf.len() < 256 * 1024 {
+            let remain = (256 * 1024usize).saturating_sub(jpeg_buf.len());
+            let seg_payload = remain.min(65000);
+            let seg_len = (seg_payload + 2) as u16;
+            jpeg_buf.extend_from_slice(&[0xFF, 0xE2]);
+            jpeg_buf.extend_from_slice(&seg_len.to_be_bytes());
+            jpeg_buf.resize(jpeg_buf.len() + seg_payload, 0xAA);
+        }
+
+        let res = decode_thumbnail_and_dimensions(&jpeg_buf)
+            .expect("decode_thumbnail_and_dimensions must succeed even when SOF is past 256 KB");
+        let (thumb, w, h) = res;
+        // Rotated from 6000x4000 to 4000x6000
+        assert_eq!((w, h), (4000, 6000));
+        assert!(thumb.width() > 0 && thumb.height() > 0);
+
+        // --- Part 2: 3-tier RAW container ---
+        let thumb_16x12 = encode_test_jpeg(16, 12, 10, 20, 30);
+        let medium_64x48 = encode_test_jpeg(64, 48, 50, 60, 70);
+
+        let mut container = vec![0u8; 15000];
+        container[0..8].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let t_off = 1000u32;
+        container[t_off as usize..t_off as usize + thumb_16x12.len()].copy_from_slice(&thumb_16x12);
+
+        let m_off = 3000u32;
+        container[m_off as usize..m_off as usize + medium_64x48.len()]
+            .copy_from_slice(&medium_64x48);
+
+        let subifd_off = 100u32;
+
+        // IFD0 at 8:
+        // JPEGInterchangeFormat -> t_off (16x12 thumbnail <= 512 KB)
+        // SubIFDs -> subifd_off
+        write_ifd(
+            &mut container,
+            8,
+            &[
+                (0x0201, 4, 1, t_off),
+                (0x0202, 4, 1, thumb_16x12.len() as u32),
+                (0x014A, 4, 1, subifd_off),
+            ],
+            0,
+        );
+
+        // SubIFD at 100 has 2 entries:
+        // 1. Medium preview at m_off (64x48)
+        // 2. Huge preview at offset 50000, length 3 MB (3 * 1024 * 1024)
+        write_ifd(
+            &mut container,
+            subifd_off as usize,
+            &[
+                (0x0111, 4, 1, m_off),
+                (0x0117, 4, 1, medium_64x48.len() as u32),
+                (0x0201, 4, 1, 50000),
+                (0x0202, 4, 1, 3 * 1024 * 1024),
+            ],
+            0,
+        );
+
+        // In thumb_only == true (fast-scroll scrubbing), it should pick the smaller 16x12 thumbnail
+        let (thumb_fast, _, _) = decode_thumbnail_and_dimensions_for_mode(&container, None, true)
+            .expect("thumb_only load must succeed");
+        assert_eq!(thumb_fast.width(), 16);
+        assert_eq!(thumb_fast.height(), 12);
+
+        // In thumb_only == false (normal load), it should pick the higher-res 64x48 medium preview
+        let (thumb_norm, _, _) = decode_thumbnail_and_dimensions_for_mode(&container, None, false)
+            .expect("normal load must succeed");
+        assert_eq!(thumb_norm.width(), 64);
+        assert_eq!(thumb_norm.height(), 48);
     }
 }

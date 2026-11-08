@@ -240,6 +240,63 @@ pub struct RawHeaderProbe {
     pub orientation: image::metadata::Orientation,
 }
 
+impl RawHeaderProbe {
+    /// Returns candidate preview locations suitable for decoding as a fast thumbnail placeholder,
+    /// ordered according to the requested `thumb_only` decoding strategy:
+    /// - When `thumb_only == true` (fast-scroll scrubbing): prioritizes smaller placeholders
+    ///   `[thumbnail, medium, preview (if <= 2MB)]` followed by remaining candidates `<= 2MB`
+    ///   from smallest to largest for minimal decoding latency.
+    /// - When `thumb_only == false` (normal foreground load): prioritizes higher-quality placeholders
+    ///   `[medium, thumbnail, preview (if <= 2MB)]` followed by remaining candidates `<= 2MB`
+    ///   from largest to smallest.
+    pub fn placeholder_candidates(&self, thumb_only: bool) -> Vec<PreviewLocation> {
+        let mut order = Vec::with_capacity(4);
+        let mut push_unique = |loc: PreviewLocation| {
+            if !order.contains(&loc) {
+                order.push(loc);
+            }
+        };
+
+        if thumb_only {
+            if let Some(t) = self.thumbnail {
+                push_unique(t);
+            }
+            if let Some(m) = self.medium {
+                push_unique(m);
+            }
+            if let Some(p) = self.preview
+                && p.length <= 2 * 1024 * 1024
+            {
+                push_unique(p);
+            }
+            for c in self.candidates_desc.iter().rev() {
+                if c.length <= 2 * 1024 * 1024 {
+                    push_unique(*c);
+                }
+            }
+        } else {
+            if let Some(m) = self.medium {
+                push_unique(m);
+            }
+            if let Some(t) = self.thumbnail {
+                push_unique(t);
+            }
+            if let Some(p) = self.preview
+                && p.length <= 2 * 1024 * 1024
+            {
+                push_unique(p);
+            }
+            for c in &self.candidates_desc {
+                if c.length <= 2 * 1024 * 1024 {
+                    push_unique(*c);
+                }
+            }
+        }
+
+        order
+    }
+}
+
 impl Default for RawHeaderProbe {
     fn default() -> Self {
         Self {
@@ -1064,7 +1121,9 @@ pub fn probe_tiff_raw_header(header: &[u8], source: Option<&ImageSource>) -> Raw
             && h > 0
         {
             let is_cr2_raw = is_cr2 && depth >= 2;
-            if !is_cr2_raw && !is_cr2_raw_ifd {
+            let is_jpeg_app1_thumb_ifd =
+                tiff_start_off > 0 && !is_subifd && depth >= 1 && j_off.is_some();
+            if !is_cr2_raw && !is_cr2_raw_ifd && !is_jpeg_app1_thumb_ifd {
                 let is_raw_cfa = matches!(photometric, Some(32803 | 34892));
                 let is_subifd_raw =
                     is_subifd && matches!(subfile_type, Some(s) if (s & 1) == 0 && s != 0x00010000);
@@ -1241,12 +1300,10 @@ pub fn probe_tiff_raw_header(header: &[u8], source: Option<&ImageSource>) -> Raw
     }
 }
 
-/// Reads image pixel dimensions from EXIF metadata or scans JPEG Start-of-Frame (SOF) markers,
-/// explicitly skipping `APP1` (`0xFFE1`) to prevent matching embedded thumbnails.
-pub fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    if let Some((w, h)) = probe_tiff_raw_header(data, None).sensor_dims {
-        return Some((w, h));
-    }
+/// Scans a JPEG byte stream directly for Start-Of-Frame (SOF) markers
+/// (`SOF0..SOF3`, `SOF5..SOF7`, `SOF9..SOF11`, `SOF13..SOF15`),
+/// explicitly skipping `APP1` (`0xFFE1`) to prevent matching embedded thumbnail SOF markers.
+pub fn scan_jpeg_sof_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
         return None;
     }
@@ -1300,6 +1357,16 @@ pub fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     }
 
     None
+}
+
+/// Reads image pixel dimensions from SOF markers or EXIF metadata header,
+/// prioritizing the main frame's SOF marker and falling back to EXIF header metadata.
+pub fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.starts_with(&[0xFF, 0xD8]) {
+        scan_jpeg_sof_dimensions(data).or_else(|| probe_tiff_raw_header(data, None).sensor_dims)
+    } else {
+        probe_tiff_raw_header(data, None).sensor_dims
+    }
 }
 
 /// Extracts the original full raw image dimensions from the Fujifilm RAF metadata records container bytes.

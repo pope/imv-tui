@@ -456,9 +456,10 @@ impl App {
                                 continue;
                             }
                             if let Some((thumb_img, real_w, real_h)) =
-                                crate::imaging::decode_thumbnail_and_dimensions_with_source(
+                                crate::imaging::decode_thumbnail_and_dimensions_for_mode(
                                     &partial_bytes,
                                     Some(&r.source),
+                                    r.mode.is_thumbnail_only(),
                                 )
                                 && !cancel.is_cancelled()
                             {
