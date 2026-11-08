@@ -53,6 +53,56 @@ impl App {
         }
     }
 
+    /// Returns the terminal cell dimensions in pixels `(cell_w, cell_h)`, falling back to `(8, 16)`
+    /// if the protocol picker reports zero dimensions.
+    #[inline]
+    pub fn cell_pixel_size(&self) -> (u16, u16) {
+        let font_size = self.picker.font_size();
+        let cell_w = if font_size.width == 0 {
+            8
+        } else {
+            font_size.width
+        };
+        let cell_h = if font_size.height == 0 {
+            16
+        } else {
+            font_size.height
+        };
+        (cell_w, cell_h)
+    }
+
+    /// Returns the current viewport widget dimensions in pixels `(widget_w_px, widget_h_px)`.
+    #[inline]
+    pub fn viewport_pixel_size(&self) -> (f64, f64) {
+        let (widget_w_cells, widget_h_cells) = self.last_widget_size;
+        let (cell_w, cell_h) = self.cell_pixel_size();
+        (
+            widget_w_cells as f64 * cell_w as f64,
+            widget_h_cells as f64 * cell_h as f64,
+        )
+    }
+
+    /// Computes the sorted, deduplicated predefined zoom scale levels on the stack.
+    pub fn zoom_step_levels(&self, fit_scale: f64) -> ([f64; 6], usize) {
+        let (widget_w_px, widget_h_px) = self.viewport_pixel_size();
+        let s_w = widget_w_px / self.img_width as f64;
+        let s_h = widget_h_px / self.img_height as f64;
+        let crop_scale = s_w.max(s_h);
+
+        let mut raw = [fit_scale.min(1.0), fit_scale, crop_scale, 1.0, 2.0, 4.0];
+        raw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut out = [0.0; 6];
+        let mut len = 0;
+        for lvl in raw {
+            if len == 0 || (lvl - out[len - 1]).abs() >= 0.01 {
+                out[len] = lvl;
+                len += 1;
+            }
+        }
+        (out, len)
+    }
+
     /// Dispatches an image resize request to the background worker pool for the given viewport cell dimensions.
     pub fn update_protocol(&mut self, widget_w: u16, widget_h: u16) {
         let cells = CellDimensions::new(widget_w, widget_h);
@@ -60,16 +110,7 @@ impl App {
             return;
         }
 
-        let font_size = self.picker.font_size();
-        let mut cell_w = font_size.width;
-        let mut cell_h = font_size.height;
-        if cell_w == 0 {
-            cell_w = 8;
-        }
-        if cell_h == 0 {
-            cell_h = 16;
-        }
-
+        let (cell_w, cell_h) = self.cell_pixel_size();
         let widget_w_px = cells.cols as f64 * cell_w as f64;
         let widget_h_px = cells.rows as f64 * cell_h as f64;
 
@@ -187,18 +228,7 @@ impl App {
         if cells.is_empty() {
             return 0.0;
         }
-        let font_size = self.picker.font_size();
-        let mut cell_w = font_size.width;
-        let mut cell_h = font_size.height;
-        if cell_w == 0 {
-            cell_w = 8;
-        }
-        if cell_h == 0 {
-            cell_h = 16;
-        }
-
-        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
-        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+        let (widget_w_px, widget_h_px) = self.viewport_pixel_size();
 
         let s_w = widget_w_px / self.img_width as f64;
         let s_h = widget_h_px / self.img_height as f64;
@@ -262,46 +292,13 @@ impl App {
             return;
         }
 
-        // Calculate crop scale (crop to fill)
-        let (widget_w_cells, widget_h_cells) = self.last_widget_size;
-        let font_size = self.picker.font_size();
-        let mut cell_w = font_size.width;
-        let mut cell_h = font_size.height;
-        if cell_w == 0 {
-            cell_w = 8;
-        }
-        if cell_h == 0 {
-            cell_h = 16;
-        }
-        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
-        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
-        let s_w = widget_w_px / self.img_width as f64;
-        let s_h = widget_h_px / self.img_height as f64;
-        let crop_scale = s_w.max(s_h);
-
-        // Predefined levels in terms of absolute scale (scale = fit_scale * zoom_factor)
-        let shrink_to_fit_scale = fit_scale.min(1.0);
-        let fit_view_scale = fit_scale;
-        let crop_to_fill_scale = crop_scale;
-        let one_to_one_scale = 1.0;
-        let two_to_one_scale = 2.0;
-        let four_to_one_scale = 4.0;
-
-        let mut levels = vec![
-            shrink_to_fit_scale,
-            fit_view_scale,
-            crop_to_fill_scale,
-            one_to_one_scale,
-            two_to_one_scale,
-            four_to_one_scale,
-        ];
-        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        levels.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        let (levels, len) = self.zoom_step_levels(fit_scale);
+        let levels = &levels[..len];
 
         let current_scale = fit_scale * self.zoom_factor.value();
 
         let mut target_scale = None;
-        for &lvl in &levels {
+        for &lvl in levels {
             if lvl > current_scale + 0.01 {
                 target_scale = Some(lvl);
                 break;
@@ -329,41 +326,8 @@ impl App {
             return;
         }
 
-        // Calculate crop scale (crop to fill)
-        let (widget_w_cells, widget_h_cells) = self.last_widget_size;
-        let font_size = self.picker.font_size();
-        let mut cell_w = font_size.width;
-        let mut cell_h = font_size.height;
-        if cell_w == 0 {
-            cell_w = 8;
-        }
-        if cell_h == 0 {
-            cell_h = 16;
-        }
-        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
-        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
-        let s_w = widget_w_px / self.img_width as f64;
-        let s_h = widget_h_px / self.img_height as f64;
-        let crop_scale = s_w.max(s_h);
-
-        // Predefined levels in terms of absolute scale (scale = fit_scale * zoom_factor)
-        let shrink_to_fit_scale = fit_scale.min(1.0);
-        let fit_view_scale = fit_scale;
-        let crop_to_fill_scale = crop_scale;
-        let one_to_one_scale = 1.0;
-        let two_to_one_scale = 2.0;
-        let four_to_one_scale = 4.0;
-
-        let mut levels = vec![
-            shrink_to_fit_scale,
-            fit_view_scale,
-            crop_to_fill_scale,
-            one_to_one_scale,
-            two_to_one_scale,
-            four_to_one_scale,
-        ];
-        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        levels.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        let (levels, len) = self.zoom_step_levels(fit_scale);
+        let levels = &levels[..len];
 
         let current_scale = fit_scale * self.zoom_factor.value();
 
@@ -438,18 +402,7 @@ impl App {
                 }
                 ScaleMode::Full => 1.0,
                 ScaleMode::Crop => {
-                    let (widget_w_cells, widget_h_cells) = self.last_widget_size;
-                    let font_size = self.picker.font_size();
-                    let mut cell_w = font_size.width;
-                    let mut cell_h = font_size.height;
-                    if cell_w == 0 {
-                        cell_w = 8;
-                    }
-                    if cell_h == 0 {
-                        cell_h = 16;
-                    }
-                    let widget_w_px = widget_w_cells as f64 * cell_w as f64;
-                    let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+                    let (widget_w_px, widget_h_px) = self.viewport_pixel_size();
                     let s_w = widget_w_px / self.img_width as f64;
                     let s_h = widget_h_px / self.img_height as f64;
                     s_w.max(s_h) / s
@@ -588,14 +541,7 @@ impl App {
 
     /// Calculates the horizontal panning step delta based on viewport cell width and zoom level.
     pub fn pan_step_x(&self) -> i64 {
-        let (widget_w_cells, _) = self.last_widget_size;
-        let font_size = self.picker.font_size();
-        let cell_w = if font_size.width == 0 {
-            8
-        } else {
-            font_size.width
-        };
-        let widget_w_px = widget_w_cells as f64 * cell_w as f64;
+        let (widget_w_px, _) = self.viewport_pixel_size();
 
         let s = self.get_fit_scale();
         let scale = if s > 0.0 {
@@ -620,14 +566,7 @@ impl App {
 
     /// Calculates the vertical panning step delta based on viewport cell height and zoom level.
     pub fn pan_step_y(&self) -> i64 {
-        let (_, widget_h_cells) = self.last_widget_size;
-        let font_size = self.picker.font_size();
-        let cell_h = if font_size.height == 0 {
-            16
-        } else {
-            font_size.height
-        };
-        let widget_h_px = widget_h_cells as f64 * cell_h as f64;
+        let (_, widget_h_px) = self.viewport_pixel_size();
 
         let s = self.get_fit_scale();
         let scale = if s > 0.0 {

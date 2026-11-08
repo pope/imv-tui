@@ -34,7 +34,7 @@ use crate::commands::{Command, get_commands};
 use crate::imaging::{
     Brightness, CancellationToken, Contrast, DecodedImage, FilterType, ImageSource, LoaderRequest,
     LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ThumbnailSource,
-    ViewportProtocol, ZoomFactor, process_resize,
+    ViewportProtocol, ZoomFactor, orientation_swaps_dimensions, process_resize,
 };
 
 /// Threshold below which navigation is considered fast scrolling (60ms).
@@ -758,14 +758,11 @@ impl App {
                             } else if is_raw && let Some(ref hb) = raw_header_opt {
                                 let probe = crate::imaging::probe_raw_header(hb, Some(&r.source));
                                 if let Some((w, h)) = probe.sensor_dims {
-                                    let swaps = matches!(
-                                        probe.orientation,
-                                        image::metadata::Orientation::Rotate90
-                                            | image::metadata::Orientation::Rotate270
-                                            | image::metadata::Orientation::Rotate90FlipH
-                                            | image::metadata::Orientation::Rotate270FlipH
-                                    );
-                                    if swaps { (h, w) } else { (w, h) }
+                                    if orientation_swaps_dimensions(probe.orientation) {
+                                        (h, w)
+                                    } else {
+                                        (w, h)
+                                    }
                                 } else {
                                     image::image_dimensions(path)
                                         .unwrap_or((cached.image.width(), cached.image.height()))

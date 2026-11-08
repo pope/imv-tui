@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::imaging::DecodedImage;
 use crate::imaging::ImageSource;
 use crate::imaging::raw::*;
+use crate::imaging::types::orientation_swaps_dimensions;
 use image::{DynamicImage, GenericImageView, ImageDecoder};
 
 /// Cooperative cancellation token checked at multi-step I/O and decode checkpoints.
@@ -351,14 +352,7 @@ pub fn decode_image_bytes_with_header_cancellable(
             let probe = probe_raw_header(partial_bytes, Some(source));
             raw_container_orientation = Some(probe.orientation);
             if let Some((w, h)) = probe.sensor_dims {
-                let swaps = matches!(
-                    probe.orientation,
-                    image::metadata::Orientation::Rotate90
-                        | image::metadata::Orientation::Rotate270
-                        | image::metadata::Orientation::Rotate90FlipH
-                        | image::metadata::Orientation::Rotate270FlipH
-                );
-                if swaps {
+                if orientation_swaps_dimensions(probe.orientation) {
                     raw_dimensions = Some((h, w));
                 } else {
                     raw_dimensions = Some((w, h));
@@ -373,14 +367,7 @@ pub fn decode_image_bytes_with_header_cancellable(
         && let Some((w, h)) = probe.sensor_dims
     {
         let orientation = raw_container_orientation.unwrap_or(probe.orientation);
-        let swaps = matches!(
-            orientation,
-            image::metadata::Orientation::Rotate90
-                | image::metadata::Orientation::Rotate270
-                | image::metadata::Orientation::Rotate90FlipH
-                | image::metadata::Orientation::Rotate270FlipH
-        );
-        if swaps {
+        if orientation_swaps_dimensions(orientation) {
             raw_dimensions = Some((h, w));
         } else {
             raw_dimensions = Some((w, h));
@@ -933,14 +920,7 @@ fn decode_thumbnail_and_dimensions_impl(
         };
         thumb_img.apply_orientation(orientation);
 
-        let swaps = matches!(
-            orientation,
-            image::metadata::Orientation::Rotate90
-                | image::metadata::Orientation::Rotate270
-                | image::metadata::Orientation::Rotate90FlipH
-                | image::metadata::Orientation::Rotate270FlipH
-        );
-        if swaps {
+        if orientation_swaps_dimensions(orientation) {
             std::mem::swap(&mut raw_w, &mut raw_h);
         }
 
@@ -969,14 +949,7 @@ fn decode_thumbnail_and_dimensions_impl(
     thumb_img.apply_orientation(orientation);
 
     // Swap dimensions if orientation rotates the image 90 or 270 degrees
-    let swaps = matches!(
-        orientation,
-        image::metadata::Orientation::Rotate90
-            | image::metadata::Orientation::Rotate270
-            | image::metadata::Orientation::Rotate90FlipH
-            | image::metadata::Orientation::Rotate270FlipH
-    );
-    if swaps {
+    if orientation_swaps_dimensions(orientation) {
         std::mem::swap(&mut raw_w, &mut raw_h);
     }
 

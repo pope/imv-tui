@@ -462,9 +462,36 @@ impl PixelDimensions {
     }
 }
 
+/// Returns `true` if applying `orientation` swaps the image width and height dimensions
+/// (i.e., 90° or 270° rotations, with or without horizontal flip).
+#[inline]
+pub const fn orientation_swaps_dimensions(orientation: image::metadata::Orientation) -> bool {
+    matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_orientation_swaps_dimensions() {
+        use image::metadata::Orientation;
+
+        assert!(!orientation_swaps_dimensions(Orientation::NoTransforms));
+        assert!(orientation_swaps_dimensions(Orientation::Rotate90));
+        assert!(!orientation_swaps_dimensions(Orientation::Rotate180));
+        assert!(orientation_swaps_dimensions(Orientation::Rotate270));
+        assert!(!orientation_swaps_dimensions(Orientation::FlipHorizontal));
+        assert!(!orientation_swaps_dimensions(Orientation::FlipVertical));
+        assert!(orientation_swaps_dimensions(Orientation::Rotate90FlipH));
+        assert!(orientation_swaps_dimensions(Orientation::Rotate270FlipH));
+    }
 
     #[test]
     fn test_dimensions_newtypes() {
