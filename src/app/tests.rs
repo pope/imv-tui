@@ -381,24 +381,21 @@ fn test_prefetch_cache_retention_and_hits() {
 
     // Simulate background loading inserting into prefetch cache
     let shared_img = Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
-    {
-        let mut cache = app.prefetch_cache.lock().unwrap();
-        cache.insert(
-            1,
-            CachedImage {
-                image: Some(shared_img.clone()),
-                thumbnail: None,
-                thumbnail_source: None,
-                width: 10,
-                height: 10,
-                format: Some(image::ImageFormat::Png),
-                decode_duration: std::time::Duration::from_millis(5),
-                thumbnail_decode_duration: std::time::Duration::ZERO,
-                disk_size: 100,
-                raw_dimensions: None,
-            },
-        );
-    }
+    app.prefetch_cache.insert(
+        1,
+        CachedImage {
+            image: Some(shared_img.clone()),
+            thumbnail: None,
+            thumbnail_source: None,
+            width: 10,
+            height: 10,
+            format: Some(image::ImageFormat::Png),
+            decode_duration: std::time::Duration::from_millis(5),
+            thumbnail_decode_duration: std::time::Duration::ZERO,
+            disk_size: 100,
+            raw_dimensions: None,
+        },
+    );
 
     // Navigate to index 1
     app.execute_command(Command::NextImage);
@@ -408,10 +405,7 @@ fn test_prefetch_cache_retention_and_hits() {
     assert_eq!(app.stats.disk_size, 100);
 
     // Verify that it was NOT evicted from the cache on hit
-    {
-        let cache = app.prefetch_cache.lock().unwrap();
-        assert!(cache.contains_key(&1));
-    }
+    assert!(app.prefetch_cache.contains_key(1));
 
     // Verify sliding window indices helper
     assert_eq!(app.get_sliding_window_indices(), vec![0, 1]);
@@ -1255,24 +1249,21 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
 
     // 4. Verify cached thumbnail hit sets is_prefetch_cache_hit = true and activates thumbnail
     let cached_thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(24, 24)));
-    {
-        let mut cache = app.prefetch_cache.lock().unwrap();
-        cache.insert(
-            0,
-            CachedImage {
-                image: None,
-                thumbnail: Some(cached_thumb),
-                thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
-                width: 240,
-                height: 240,
-                format: Some(image::ImageFormat::Jpeg),
-                decode_duration: Duration::from_millis(15),
-                thumbnail_decode_duration: Duration::from_millis(3),
-                disk_size: 1024,
-                raw_dimensions: None,
-            },
-        );
-    }
+    app.prefetch_cache.insert(
+        0,
+        CachedImage {
+            image: None,
+            thumbnail: Some(cached_thumb),
+            thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
+            width: 240,
+            height: 240,
+            format: Some(image::ImageFormat::Jpeg),
+            decode_duration: Duration::from_millis(15),
+            thumbnail_decode_duration: Duration::from_millis(3),
+            disk_size: 1024,
+            raw_dimensions: None,
+        },
+    );
     app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
     app.prev_image(); // Navigates back to image 0 (which has cached thumbnail)
     assert!(app.thumbnail_image.is_some());
@@ -1283,7 +1274,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
 
 #[test]
 fn test_prefetch_cache_stats_and_thumbnail_sources() {
-    let app = setup_test_app();
+    let mut app = setup_test_app();
     let (count, bytes) = app.prefetch_cache_stats();
     assert_eq!(count, 0);
     assert_eq!(bytes, 0);
@@ -1291,24 +1282,21 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
     // Insert cached image with image (10x10) and thumbnail (5x5)
     let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
     let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(5, 5)));
-    {
-        let mut cache = app.prefetch_cache.lock().unwrap();
-        cache.insert(
-            0,
-            CachedImage {
-                image: Some(img),
-                thumbnail: Some(thumb),
-                thumbnail_source: Some(crate::imaging::ThumbnailSource::XdgCache),
-                width: 10,
-                height: 10,
-                format: Some(image::ImageFormat::Png),
-                decode_duration: std::time::Duration::from_millis(10),
-                thumbnail_decode_duration: std::time::Duration::from_millis(2),
-                disk_size: 500,
-                raw_dimensions: None,
-            },
-        );
-    }
+    app.prefetch_cache.insert(
+        0,
+        CachedImage {
+            image: Some(img),
+            thumbnail: Some(thumb),
+            thumbnail_source: Some(crate::imaging::ThumbnailSource::XdgCache),
+            width: 10,
+            height: 10,
+            format: Some(image::ImageFormat::Png),
+            decode_duration: std::time::Duration::from_millis(10),
+            thumbnail_decode_duration: std::time::Duration::from_millis(2),
+            disk_size: 500,
+            raw_dimensions: None,
+        },
+    );
 
     let (count, bytes) = app.prefetch_cache_stats();
     assert_eq!(count, 1);

@@ -25,9 +25,9 @@ use fast_image_resize as fir;
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::commands::{Command, get_commands};
@@ -286,7 +286,8 @@ pub struct App {
     pub clear_on_protocol_receive: bool,
     /// Flag to force scale mode view recalculation on load.
     pub zoom_needs_initialization: bool,
-    prefetch_cache: PrefetchCache,
+    /// Prefetch cache storing decoded images in the visible sliding window.
+    pub prefetch_cache: PrefetchCache,
     /// The slideshow state.
     pub slideshow_state: SlideshowState,
     /// Last slideshow transition timestamp.
@@ -691,7 +692,7 @@ impl App {
             loading_start_time: None,
             clear_on_protocol_receive: false,
             zoom_needs_initialization: false,
-            prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            prefetch_cache: PrefetchCache::new(),
             slideshow_state: SlideshowState::OFF,
             slideshow_last_transition: std::time::Instant::now(),
             stats: StatsForNerds::default(),
@@ -781,17 +782,7 @@ impl App {
 
     /// Returns the number of cached entries and their total uncompressed memory footprint in bytes.
     pub fn prefetch_cache_stats(&self) -> (usize, u64) {
-        let cache = self.prefetch_cache.lock().unwrap();
-        let mut total_bytes = 0u64;
-        for entry in cache.values() {
-            if let Some(ref img) = entry.image {
-                total_bytes = total_bytes.saturating_add(img.as_bytes().len() as u64);
-            }
-            if let Some(ref thumb) = entry.thumbnail {
-                total_bytes = total_bytes.saturating_add(thumb.as_bytes().len() as u64);
-            }
-        }
-        (cache.len(), total_bytes)
+        self.prefetch_cache.stats()
     }
 
     /// Returns cached filtered file indices matching the current search query.

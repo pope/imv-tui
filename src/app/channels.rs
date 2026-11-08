@@ -1,6 +1,6 @@
 //! Background channel communication, image loading, and cache prefetching for `App`.
 
-use crate::app::cache::{CachedImage, VisibleWindow};
+use crate::app::cache::VisibleWindow;
 use crate::app::palette::PaletteMode;
 use crate::app::{App, FAST_SCROLL_THRESHOLD, LoadPhase, ThumbnailTelemetry};
 use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
@@ -22,7 +22,7 @@ impl App {
     }
 
     /// Dispatches background prefetch requests for neighboring visible images.
-    pub fn trigger_prefetch(&self) {
+    pub fn trigger_prefetch(&mut self) {
         if self.queue.len() <= 1 {
             return;
         }
@@ -31,29 +31,21 @@ impl App {
         if window.is_empty() {
             return;
         }
-        let mut to_prefetch = Vec::new();
 
-        {
-            let mut cache = self.prefetch_cache.lock().unwrap();
-            cache.retain(|idx, _| window.contains(*idx));
-            for &idx in window.iter() {
-                if idx == self.queue.current_index {
-                    continue;
-                }
-                if !cache.contains_key(&idx) {
-                    to_prefetch.push(idx);
-                }
+        self.prefetch_cache.retain_window(&window);
+        for &idx in window.iter() {
+            if idx == self.queue.current_index {
+                continue;
             }
-        }
-
-        for idx in to_prefetch {
-            let source = self.queue.images()[idx].clone();
-            let _ = self.loader_tx.send(LoaderRequest {
-                idx,
-                source,
-                mode: LoaderMode::Prefetch,
-                sequence: self.current_sequence,
-            });
+            if !self.prefetch_cache.contains_key(idx) {
+                let source = self.queue.images()[idx].clone();
+                let _ = self.loader_tx.send(LoaderRequest {
+                    idx,
+                    source,
+                    mode: LoaderMode::Prefetch,
+                    sequence: self.current_sequence,
+                });
+            }
         }
     }
 
@@ -76,10 +68,7 @@ impl App {
         let adj = self.queue.adjustment(self.queue.current_index);
 
         // Check if the image is in the prefetch cache
-        let cached = {
-            let cache = self.prefetch_cache.lock().unwrap();
-            cache.get(&self.queue.current_index).cloned()
-        };
+        let cached = self.prefetch_cache.get(self.queue.current_index).cloned();
 
         let mut loaded_cached_thumb = false;
 
@@ -88,17 +77,16 @@ impl App {
                 self.current_sequence += 1;
                 self.active_sequence
                     .store(self.current_sequence as usize, Ordering::Release);
-                self.original_image = Some(img.clone()).map(|img| {
-                    if let Some(rotated) = adj.rotate_image(&img) {
-                        self.img_width = rotated.width();
-                        self.img_height = rotated.height();
-                        Arc::new(rotated)
-                    } else {
-                        self.img_width = cached_img.width;
-                        self.img_height = cached_img.height;
-                        img
-                    }
-                });
+                let display_img = if let Some(rotated) = adj.rotate_image(img) {
+                    self.img_width = rotated.width();
+                    self.img_height = rotated.height();
+                    Arc::new(rotated)
+                } else {
+                    self.img_width = cached_img.width;
+                    self.img_height = cached_img.height;
+                    img.clone()
+                };
+                self.original_image = Some(display_img);
 
                 self.thumbnail_image = cached_img
                     .thumbnail
@@ -254,56 +242,29 @@ impl App {
                     let shared_img = Arc::new(img);
                     let window = self.get_sliding_window();
                     if window.contains(resp.idx) {
-                        let mut cache = self.prefetch_cache.lock().unwrap();
                         if resp.is_thumbnail {
-                            if let Some(cached) = cache.get_mut(&resp.idx) {
-                                cached.thumbnail = Some(shared_img.clone());
-                                cached.thumbnail_source = resp.thumbnail_source;
-                                cached.thumbnail_decode_duration = resp.decode_duration;
-                                cached.raw_dimensions = decoded.raw_dimensions;
-                            } else {
-                                cache.insert(
-                                    resp.idx,
-                                    CachedImage {
-                                        image: None,
-                                        thumbnail: Some(shared_img.clone()),
-                                        thumbnail_source: resp.thumbnail_source,
-                                        width: w,
-                                        height: h,
-                                        format,
-                                        decode_duration: std::time::Duration::ZERO,
-                                        thumbnail_decode_duration: resp.decode_duration,
-                                        disk_size,
-                                        raw_dimensions: decoded.raw_dimensions,
-                                    },
-                                );
-                            }
+                            self.prefetch_cache.upsert_thumbnail(
+                                resp.idx,
+                                shared_img.clone(),
+                                resp.thumbnail_source,
+                                resp.decode_duration,
+                                w,
+                                h,
+                                format,
+                                disk_size,
+                                decoded.raw_dimensions,
+                            );
                         } else {
-                            if let Some(cached) = cache.get_mut(&resp.idx) {
-                                cached.image = Some(shared_img.clone());
-                                cached.width = w;
-                                cached.height = h;
-                                cached.format = format;
-                                cached.decode_duration = resp.decode_duration;
-                                cached.disk_size = disk_size;
-                                cached.raw_dimensions = decoded.raw_dimensions;
-                            } else {
-                                cache.insert(
-                                    resp.idx,
-                                    CachedImage {
-                                        image: Some(shared_img.clone()),
-                                        thumbnail: None,
-                                        thumbnail_source: None,
-                                        width: w,
-                                        height: h,
-                                        format,
-                                        decode_duration: resp.decode_duration,
-                                        thumbnail_decode_duration: std::time::Duration::ZERO,
-                                        disk_size,
-                                        raw_dimensions: decoded.raw_dimensions,
-                                    },
-                                );
-                            }
+                            self.prefetch_cache.upsert_full(
+                                resp.idx,
+                                shared_img.clone(),
+                                resp.decode_duration,
+                                w,
+                                h,
+                                format,
+                                disk_size,
+                                decoded.raw_dimensions,
+                            );
                         }
                     }
 

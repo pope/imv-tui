@@ -3,7 +3,7 @@ use crate::app::queue::MediaList;
 use crate::imaging::ThumbnailSource;
 use image::DynamicImage;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A cached image and its associated metadata in the prefetch cache.
 #[derive(Clone)]
@@ -30,7 +30,167 @@ pub struct CachedImage {
     pub raw_dimensions: Option<(u32, u32)>,
 }
 
-pub type PrefetchCache = Arc<Mutex<HashMap<usize, CachedImage>>>;
+/// Maximum capacity retained in the prefetch cache before shrinking down to initial capacity.
+pub const MAX_PREFETCH_CACHE_CAPACITY: usize = 16;
+/// Initial capacity allocated for the prefetch cache.
+const INITIAL_PREFETCH_CACHE_CAPACITY: usize = 8;
+
+/// Lock-free, main-thread prefetch cache storing decoded images and thumbnails for the visible sliding window.
+#[derive(Default)]
+pub struct PrefetchCache {
+    entries: HashMap<usize, CachedImage>,
+}
+
+impl PrefetchCache {
+    /// Creates a new empty `PrefetchCache` with initial capacity for the sliding window.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(INITIAL_PREFETCH_CACHE_CAPACITY),
+        }
+    }
+
+    /// Returns a reference to the cached entry for `idx`, if present.
+    pub fn get(&self, idx: usize) -> Option<&CachedImage> {
+        self.entries.get(&idx)
+    }
+
+    /// Returns true if the cache contains an entry for `idx`.
+    pub fn contains_key(&self, idx: usize) -> bool {
+        self.entries.contains_key(&idx)
+    }
+
+    /// Inserts a cached entry for `idx`.
+    #[cfg(test)]
+    pub fn insert(&mut self, idx: usize, entry: CachedImage) {
+        self.entries.insert(idx, entry);
+    }
+
+    /// Returns the number of cached entries.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the cache contains no entries.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Clears all cached entries, shrinking capacity if it exceeded `MAX_PREFETCH_CACHE_CAPACITY`.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        if self.entries.capacity() > MAX_PREFETCH_CACHE_CAPACITY {
+            self.entries.shrink_to(INITIAL_PREFETCH_CACHE_CAPACITY);
+        }
+    }
+
+    /// Retains only the entries present in the visible window, shrinking capacity if it exceeded `MAX_PREFETCH_CACHE_CAPACITY`.
+    pub fn retain_window(&mut self, window: &VisibleWindow) {
+        self.entries.retain(|idx, _| window.contains(*idx));
+        if self.entries.capacity() > MAX_PREFETCH_CACHE_CAPACITY {
+            self.entries.shrink_to(INITIAL_PREFETCH_CACHE_CAPACITY);
+        }
+    }
+
+    /// Inserts or updates a thumbnail placeholder for `idx`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_thumbnail(
+        &mut self,
+        idx: usize,
+        thumb: Arc<DynamicImage>,
+        thumbnail_source: Option<ThumbnailSource>,
+        decode_duration: std::time::Duration,
+        width: u32,
+        height: u32,
+        format: Option<image::ImageFormat>,
+        disk_size: u64,
+        raw_dimensions: Option<(u32, u32)>,
+    ) {
+        if let Some(cached) = self.entries.get_mut(&idx) {
+            cached.thumbnail = Some(thumb);
+            cached.thumbnail_source = thumbnail_source;
+            cached.thumbnail_decode_duration = decode_duration;
+            cached.raw_dimensions = raw_dimensions;
+        } else {
+            self.entries.insert(
+                idx,
+                CachedImage {
+                    image: None,
+                    thumbnail: Some(thumb),
+                    thumbnail_source,
+                    width,
+                    height,
+                    format,
+                    decode_duration: std::time::Duration::ZERO,
+                    thumbnail_decode_duration: decode_duration,
+                    disk_size,
+                    raw_dimensions,
+                },
+            );
+        }
+    }
+
+    /// Inserts or updates a full-resolution decoded image for `idx`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_full(
+        &mut self,
+        idx: usize,
+        image: Arc<DynamicImage>,
+        decode_duration: std::time::Duration,
+        width: u32,
+        height: u32,
+        format: Option<image::ImageFormat>,
+        disk_size: u64,
+        raw_dimensions: Option<(u32, u32)>,
+    ) {
+        if let Some(cached) = self.entries.get_mut(&idx) {
+            cached.image = Some(image);
+            cached.width = width;
+            cached.height = height;
+            cached.format = format;
+            cached.decode_duration = decode_duration;
+            cached.disk_size = disk_size;
+            cached.raw_dimensions = raw_dimensions;
+        } else {
+            self.entries.insert(
+                idx,
+                CachedImage {
+                    image: Some(image),
+                    thumbnail: None,
+                    thumbnail_source: None,
+                    width,
+                    height,
+                    format,
+                    decode_duration,
+                    thumbnail_decode_duration: std::time::Duration::ZERO,
+                    disk_size,
+                    raw_dimensions,
+                },
+            );
+        }
+    }
+
+    /// Computes the number of cached entries and their total estimated memory footprint in bytes.
+    pub fn stats(&self) -> (usize, u64) {
+        let mut total_bytes = 0u64;
+        for entry in self.entries.values() {
+            if let Some(ref img) = entry.image {
+                total_bytes = total_bytes.saturating_add(img.as_bytes().len() as u64);
+            }
+            if let Some(ref thumb) = entry.thumbnail {
+                total_bytes = total_bytes.saturating_add(thumb.as_bytes().len() as u64);
+            }
+        }
+        (self.entries.len(), total_bytes)
+    }
+
+    /// Returns the current allocation capacity of the underlying hash map.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+}
 
 /// Zero-allocation, stack-allocated sliding window of up to 5 visible image indices (`current`, `±1`, `±2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -208,5 +368,72 @@ mod cache_sliding_window_tests {
         let win = VisibleWindow::compute(&queue, ViewMode::Default);
         assert!(win.is_empty());
         assert_eq!(win.as_slice(), &[] as &[usize]);
+    }
+
+    #[test]
+    fn test_prefetch_cache_operations_and_shrink() {
+        let mut cache = PrefetchCache::new();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+
+        let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+        cache.upsert_thumbnail(
+            1,
+            thumb,
+            Some(ThumbnailSource::Exif),
+            std::time::Duration::from_millis(2),
+            100,
+            100,
+            Some(image::ImageFormat::Jpeg),
+            1000,
+            Some((1000, 1000)),
+        );
+        assert_eq!(cache.len(), 1);
+        let entry = cache.get(1).expect("entry must exist");
+        assert!(entry.image.is_none());
+        assert!(entry.thumbnail.is_some());
+        assert_eq!(entry.thumbnail_source, Some(ThumbnailSource::Exif));
+
+        let full = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
+        cache.upsert_full(
+            1,
+            full,
+            std::time::Duration::from_millis(10),
+            100,
+            100,
+            Some(image::ImageFormat::Jpeg),
+            1000,
+            Some((1000, 1000)),
+        );
+        assert_eq!(cache.len(), 1);
+        let entry = cache.get(1).expect("entry must exist");
+        assert!(entry.image.is_some());
+        assert!(entry.thumbnail.is_some());
+
+        // Insert more than MAX_PREFETCH_CACHE_CAPACITY items (e.g. 25 items) to expand capacity
+        for i in 2..27 {
+            let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(5, 5)));
+            cache.upsert_full(i, img, std::time::Duration::ZERO, 5, 5, None, 0, None);
+        }
+        assert!(cache.capacity() > MAX_PREFETCH_CACHE_CAPACITY);
+
+        // Test retain_window shrinks capacity
+        let sources: Vec<ImageSource> = (0..5)
+            .map(|i| ImageSource::Local(PathBuf::from(format!("{}.png", i))))
+            .collect();
+        let queue = MediaList::new(sources, 0).unwrap();
+        let window = VisibleWindow::compute(&queue, ViewMode::All);
+        cache.retain_window(&window);
+        assert!(cache.capacity() <= MAX_PREFETCH_CACHE_CAPACITY);
+
+        // Re-expand capacity and test clear() shrinks capacity
+        for i in 100..125 {
+            let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(5, 5)));
+            cache.upsert_full(i, img, std::time::Duration::ZERO, 5, 5, None, 0, None);
+        }
+        assert!(cache.capacity() > MAX_PREFETCH_CACHE_CAPACITY);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.capacity() <= MAX_PREFETCH_CACHE_CAPACITY);
     }
 }

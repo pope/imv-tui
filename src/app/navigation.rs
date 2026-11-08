@@ -173,7 +173,7 @@ impl App {
         }
 
         // Clear prefetch cache immediately since index associations have changed
-        self.prefetch_cache.lock().unwrap().clear();
+        self.prefetch_cache.clear();
 
         // Atomically rescan and preserve existing classifications and adjustments
         self.queue
