@@ -318,7 +318,9 @@ fn test_refresh_files_preservation() {
     fs::write(&img2_path, "fake").unwrap();
 
     // Refresh the files
+    app.screen_clear = ScreenClear::None;
     app.refresh_files().unwrap();
+    assert_eq!(app.screen_clear, ScreenClear::OnProtocolReceive);
 
     // Verify we now have 2 images
     assert_eq!(app.queue.len(), 2);
@@ -346,6 +348,11 @@ fn test_refresh_files_preservation() {
         .position(|img| img.identifier() == img2_abs)
         .unwrap();
     assert_eq!(app.classifications()[img2_idx], Classification::Unflagged);
+
+    // Verify screen clear when no images are visible
+    app.view_mode = ViewMode::Rejects;
+    app.refresh_files().unwrap();
+    assert_eq!(app.screen_clear, ScreenClear::Pending);
 
     // Clean up
     let _ = fs::remove_dir_all("target/tmp/refresh_test");
@@ -1176,6 +1183,47 @@ fn test_should_clear_on_update_and_dismiss_needs_clear() {
     app.screen_clear = ScreenClear::None;
     app.execute_command(Command::ToggleSlideshowPause);
     assert!(app.screen_clear.is_pending());
+
+    // 3. Closing PaletteMode::Command and PaletteMode::File via OverlayAction::Close
+    // resets overlay, sets screen_clear = Pending, and does NOT dirty resize_state.
+    app.resize_state = ResizeState::Idle;
+    app.screen_clear = ScreenClear::None;
+    app.palette_mode = PaletteMode::Command;
+    app.apply_action(
+        crate::commands::InputAction::Overlay(crate::commands::OverlayAction::Close),
+        24,
+    );
+    assert_eq!(app.palette_mode, PaletteMode::Closed);
+    assert_eq!(app.screen_clear, ScreenClear::Pending);
+    assert!(!app.needs_update());
+
+    app.resize_state = ResizeState::Idle;
+    app.screen_clear = ScreenClear::None;
+    app.palette_mode = PaletteMode::File;
+    app.apply_action(
+        crate::commands::InputAction::Overlay(crate::commands::OverlayAction::Close),
+        24,
+    );
+    assert_eq!(app.palette_mode, PaletteMode::Closed);
+    assert_eq!(app.screen_clear, ScreenClear::Pending);
+    assert!(!app.needs_update());
+
+    // 4. cycle_scale_mode defers screen clear until protocol arrival
+    app.load_phase = LoadPhase::Complete;
+    app.initial_load = InitialLoadState::Idle;
+    app.last_widget_size = (80, 24);
+    app.img_width = 100;
+    app.img_height = 100;
+    app.screen_clear = ScreenClear::None;
+    app.cycle_scale_mode();
+    assert_eq!(app.screen_clear, ScreenClear::OnProtocolReceive);
+
+    // 5. Command::ToggleThumbnail defers screen clear when thumbnail_image is Some
+    let dummy_thumb = std::sync::Arc::new(image::DynamicImage::new_rgb8(10, 10));
+    app.thumbnail_image = Some(dummy_thumb);
+    app.screen_clear = ScreenClear::None;
+    app.execute_command(Command::ToggleThumbnail);
+    assert_eq!(app.screen_clear, ScreenClear::OnProtocolReceive);
 }
 
 #[test]

@@ -21,12 +21,7 @@ impl App {
             }
             InputAction::Overlay(overlay) => match overlay {
                 OverlayAction::Close => {
-                    if self.palette_mode == PaletteMode::Info {
-                        self.close_palette();
-                    } else {
-                        self.close_palette();
-                        self.resize_state.mark_dirty();
-                    }
+                    self.close_palette();
                 }
                 OverlayAction::Confirm => match self.palette_mode {
                     PaletteMode::File => {
@@ -36,7 +31,6 @@ impl App {
                             self.start_load_image();
                         }
                         self.close_palette();
-                        self.resize_state.mark_dirty();
                     }
                     PaletteMode::Command => {
                         let cmds = self.get_filtered_commands();
@@ -48,7 +42,6 @@ impl App {
                         }
                         if self.palette_mode == PaletteMode::Command {
                             self.close_palette();
-                            self.resize_state.mark_dirty();
                         }
                     }
                     PaletteMode::Prompt(prompt_type) => {

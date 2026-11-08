@@ -410,6 +410,7 @@ impl App {
             });
             self.pan_offset = PanOffset::ZERO;
             self.resize_state.mark_dirty();
+            self.screen_clear.defer_until_protocol();
         }
     }
 

@@ -1373,7 +1373,7 @@ impl App {
                 if self.thumbnail_image.is_some() {
                     self.show_thumbnail_only = !self.show_thumbnail_only;
                     self.resize_state.mark_dirty();
-                    self.screen_clear.request_now();
+                    self.screen_clear.defer_until_protocol();
                 }
             }
             Command::ShowInfo => {

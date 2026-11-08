@@ -190,14 +190,13 @@ impl App {
             }
         }
 
-        // Adjust selected index for visibility in case files are filtered out
-        self.adjust_current_index_for_visibility();
-
-        // Reload current image to apply adjustments immediately
-        self.start_load_image();
-
-        self.resize_state.mark_dirty();
-        self.screen_clear.request_now();
+        // Adjust selected index for visibility and reload the active image once
+        if let Some(idx) = self.find_closest_visible_index(self.queue.current_index) {
+            self.queue.current_index = idx;
+            self.start_load_image();
+        } else {
+            self.adjust_current_index_for_visibility();
+        }
 
         Ok(())
     }
