@@ -1,6 +1,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 
-use crate::commands::{Command, EditorAction};
+use super::line_editor::EditorAction;
+use super::registry::Command;
 
 /// The specific input prompt type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

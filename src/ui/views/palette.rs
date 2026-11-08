@@ -1,4 +1,4 @@
-use crate::ui::{PaletteListKind, PaletteViewModel};
+use crate::ui::model::{PaletteListKind, PaletteViewModel};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},

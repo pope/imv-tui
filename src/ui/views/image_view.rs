@@ -1,4 +1,4 @@
-use crate::ui::{ImageDisplayState, ViewportModel};
+use crate::ui::model::{ImageDisplayState, ViewportModel};
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},

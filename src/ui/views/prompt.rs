@@ -1,5 +1,5 @@
 use crate::commands::PromptType;
-use crate::ui::PromptViewModel;
+use crate::ui::model::PromptViewModel;
 use ratatui::{
     Frame,
     layout::Rect,

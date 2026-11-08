@@ -9,6 +9,9 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use super::types::{FilterType, into_rgba8_fast, to_rgba8_fast, unpack_rgb24_to_rgba32};
+use super::worker::{maybe_reclaim_resizer_scratch, to_fir_resize_alg};
+
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
@@ -229,7 +232,7 @@ pub fn downscale_for_thumbnail(
     match src_img {
         DynamicImage::ImageRgb8(rgb_src) => {
             if target_w == src_w && target_h == src_h {
-                let rgba_raw = crate::imaging::unpack_rgb24_to_rgba32(rgb_src);
+                let rgba_raw = unpack_rgb24_to_rgba32(rgb_src);
                 return image::RgbaImage::from_raw(target_w, target_h, rgba_raw).ok_or_else(|| {
                     "Failed to construct RgbaImage from unpacked buffer".to_string()
                 });
@@ -238,26 +241,23 @@ pub fn downscale_for_thumbnail(
             let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x3);
 
             let mut options = fir::ResizeOptions::new();
-            options.algorithm =
-                crate::imaging::to_fir_resize_alg(crate::imaging::FilterType::Mitchell);
+            options.algorithm = to_fir_resize_alg(FilterType::Mitchell);
             options.mul_div_alpha = false;
 
             resizer
                 .resize(rgb_src, &mut dst_image, Some(&options))
                 .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
-            crate::imaging::maybe_reclaim_resizer_scratch(
-                resizer, src_w, src_h, target_w, target_h,
-            );
+            maybe_reclaim_resizer_scratch(resizer, src_w, src_h, target_w, target_h);
 
             let rgb_dst = image::RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
                 .ok_or_else(|| "Failed to construct RgbImage from resized buffer".to_string())?;
 
-            let rgba_raw = crate::imaging::unpack_rgb24_to_rgba32(&rgb_dst);
+            let rgba_raw = unpack_rgb24_to_rgba32(&rgb_dst);
             image::RgbaImage::from_raw(target_w, target_h, rgba_raw)
                 .ok_or_else(|| "Failed to construct RgbaImage from unpacked buffer".to_string())
         }
         _ => {
-            let src_rgba = crate::imaging::to_rgba8_fast(src_img);
+            let src_rgba = to_rgba8_fast(src_img);
 
             if target_w == src_w && target_h == src_h {
                 return Ok(src_rgba.into_owned());
@@ -266,16 +266,13 @@ pub fn downscale_for_thumbnail(
             let mut dst_image = fir::images::Image::new(target_w, target_h, fir::PixelType::U8x4);
 
             let mut options = fir::ResizeOptions::new();
-            options.algorithm =
-                crate::imaging::to_fir_resize_alg(crate::imaging::FilterType::Mitchell);
+            options.algorithm = to_fir_resize_alg(FilterType::Mitchell);
             options.mul_div_alpha = true;
 
             resizer
                 .resize(src_rgba.as_ref(), &mut dst_image, Some(&options))
                 .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
-            crate::imaging::maybe_reclaim_resizer_scratch(
-                resizer, src_w, src_h, target_w, target_h,
-            );
+            maybe_reclaim_resizer_scratch(resizer, src_w, src_h, target_w, target_h);
 
             let dst_raw = dst_image.into_vec();
             image::RgbaImage::from_raw(target_w, target_h, dst_raw)
@@ -656,7 +653,7 @@ pub fn load_cached_thumbnail_with_metadata(
         let img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
             Ok(loaded) => match loaded {
                 DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => loaded,
-                other => DynamicImage::ImageRgba8(crate::imaging::into_rgba8_fast(other)),
+                other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
             },
             Err(_) => continue,
         };

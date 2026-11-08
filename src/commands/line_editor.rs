@@ -491,9 +491,6 @@ mod tests {
         let mut le = LineEditor::new();
         // Shift + Enter should bubble up
         let key = make_key(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(
-            le.handle_key_event(&key),
-            crate::commands::EditorResult::NotConsumed
-        );
+        assert_eq!(le.handle_key_event(&key), EditorResult::NotConsumed);
     }
 }

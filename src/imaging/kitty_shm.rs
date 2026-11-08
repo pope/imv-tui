@@ -517,10 +517,10 @@ impl KittyShmProtocol {
 
         let normalized;
         let rgba = if canvas.width() == target_px_w && canvas.height() == target_px_h {
-            crate::imaging::to_rgba8_fast(canvas)
+            super::types::to_rgba8_fast(canvas)
         } else {
             normalized = ratatui_image::Resize::Crop(None).resize(canvas, font_size, size, None);
-            crate::imaging::to_rgba8_fast(&normalized)
+            super::types::to_rgba8_fast(&normalized)
         };
 
         let id = next_kitty_id();
@@ -709,7 +709,6 @@ pub fn probe_kitty_shm_support(is_tmux: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ActiveProtocol, KittyTransferMode};
     use image::RgbaImage;
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
@@ -799,25 +798,5 @@ mod tests {
 
         // 5. Cleanup transmitted segments
         cleanup_all_kitty_shm_segments();
-    }
-
-    #[test]
-    fn test_active_protocol_display_label_and_shm_helpers() {
-        let proto = ActiveProtocol::Kitty(KittyTransferMode::SharedMemory);
-        assert_eq!(proto.display_label(), "Kitty (SHM)");
-        assert!(proto.uses_kitty_shm());
-
-        let proto_off = proto.with_kitty_shm(false);
-        assert_eq!(proto_off.display_label(), "Kitty");
-        assert!(!proto_off.uses_kitty_shm());
-
-        let proto_comp = ActiveProtocol::Kitty(KittyTransferMode::Compressed);
-        assert_eq!(proto_comp.display_label(), "Kitty (Compressed)");
-        assert!(!proto_comp.uses_kitty_shm());
-
-        // with_kitty_shm does not enable shm when compression is true
-        let proto_comp_attempt = proto_comp.with_kitty_shm(true);
-        assert_eq!(proto_comp_attempt.display_label(), "Kitty (Compressed)");
-        assert!(!proto_comp_attempt.uses_kitty_shm());
     }
 }

@@ -2,22 +2,12 @@
 
 use std::io::{Read, Seek};
 
-use crate::imaging::ImageSource;
+use super::types::ImageSource;
 
 /// Maximum probe limit in bytes for RAW EXIF metadata and preview extraction (2MB).
 /// RAW files often store IFD tags and JPEG preview offsets past 256KB while we
 /// still avoid reading 50MB+ sensor payloads into memory.
 pub const RAW_EXIF_PROBE_LIMIT: usize = 2 * 1024 * 1024;
-
-/// Known file extensions for RAW camera image containers.
-pub const RAW_EXTENSIONS: &[&str] = &["dng", "cr2", "nef", "arw", "orf", "rw2", "pef", "raf"];
-
-/// Returns true if the lowercase file extension corresponds to a RAW camera format.
-pub fn is_raw_ext(ext: &str) -> bool {
-    RAW_EXTENSIONS
-        .iter()
-        .any(|&raw_ext| ext.eq_ignore_ascii_case(raw_ext))
-}
 
 /// Returns true if `bytes` starts with a TIFF container header:
 /// - Little-endian standard: `[b'I', b'I', 0x2A, 0x00]`

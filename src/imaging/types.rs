@@ -1,4 +1,6 @@
+use image::DynamicImage;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Resizing filter types for scaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +477,242 @@ pub const fn orientation_swaps_dimensions(orientation: image::metadata::Orientat
     )
 }
 
+/// Known file extensions for RAW camera image containers.
+pub const RAW_EXTENSIONS: &[&str] = &["dng", "cr2", "nef", "arw", "orf", "rw2", "pef", "raf"];
+
+/// Returns true if the lowercase file extension corresponds to a RAW camera format.
+#[inline]
+pub fn is_raw_ext(ext: &str) -> bool {
+    RAW_EXTENSIONS
+        .iter()
+        .any(|&raw_ext| ext.eq_ignore_ascii_case(raw_ext))
+}
+
+/// The source input format for an image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageSource {
+    /// A local filesystem image path.
+    Local(PathBuf),
+    /// A page inside a comic book zip archive (CBZ).
+    Cbz {
+        /// Path to the zip archive.
+        zip_path: PathBuf,
+        /// Name of the image entry inside the zip file.
+        file_in_zip: String,
+    },
+}
+
+impl ImageSource {
+    /// Returns a unique identifier string for the image source, using the provided current working directory.
+    pub fn identifier_with_cwd(&self, cwd: Option<&Path>) -> String {
+        match self {
+            Self::Local(path) => {
+                let abs = if path.is_absolute() {
+                    path.clone()
+                } else if let Some(curr) = cwd {
+                    curr.join(path)
+                } else if let Ok(curr) = std::env::current_dir() {
+                    curr.join(path)
+                } else {
+                    path.clone()
+                };
+                abs.to_string_lossy().into_owned()
+            }
+            Self::Cbz {
+                zip_path,
+                file_in_zip,
+            } => {
+                let abs_zip = if zip_path.is_absolute() {
+                    zip_path.clone()
+                } else if let Some(curr) = cwd {
+                    curr.join(zip_path)
+                } else if let Ok(curr) = std::env::current_dir() {
+                    curr.join(zip_path)
+                } else {
+                    zip_path.clone()
+                };
+                format!("{}::{}", abs_zip.to_string_lossy(), file_in_zip)
+            }
+        }
+    }
+
+    /// Returns a unique absolute identifier string for the image source (local path or cbz path + page).
+    pub fn identifier(&self) -> String {
+        self.identifier_with_cwd(std::env::current_dir().ok().as_deref())
+    }
+
+    /// Generates a display name for listing the image source in the status bar/palettes.
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Local(path) => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string(),
+            Self::Cbz {
+                zip_path,
+                file_in_zip,
+            } => {
+                let zip_name = zip_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Unknown");
+                format!("{}: {}", zip_name, file_in_zip)
+            }
+        }
+    }
+
+    /// Returns the file extension of the image source as a string slice, if present.
+    pub fn extension(&self) -> Option<&str> {
+        let ext = match self {
+            Self::Local(path) => path.extension()?,
+            Self::Cbz { file_in_zip, .. } => Path::new(file_in_zip).extension()?,
+        };
+        ext.to_str()
+    }
+
+    /// Returns true if the image source is a RAW format.
+    pub fn is_raw(&self) -> bool {
+        self.extension().is_some_and(is_raw_ext)
+    }
+}
+
+/// Specifies the decoding strategy and priority for a `LoaderRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderMode {
+    /// Active foreground load: extract fast thumbnail placeholder first, then decode full resolution.
+    ThumbnailAndFull,
+    /// Fast-scroll foreground load: extract only the thumbnail placeholder (falling back to full decode only if no thumbnail exists).
+    ThumbnailOnly,
+    /// Promotion foreground load: thumbnail is already resident; skip thumbnail extraction and decode only full resolution.
+    FullOnly,
+    /// Background neighbor prefetch load.
+    Prefetch,
+}
+
+impl LoaderMode {
+    /// Returns true if this request is a background neighbor prefetch.
+    #[inline]
+    pub fn is_prefetch(self) -> bool {
+        matches!(self, Self::Prefetch)
+    }
+
+    /// Returns true if the loader should attempt EXIF/XDG thumbnail extraction.
+    #[inline]
+    pub fn should_extract_thumbnail(self, disable_thumbnail: bool) -> bool {
+        !disable_thumbnail && !matches!(self, Self::FullOnly)
+    }
+
+    /// Returns true if the loader should stop after extracting a valid thumbnail.
+    #[inline]
+    pub fn is_thumbnail_only(self) -> bool {
+        matches!(self, Self::ThumbnailOnly)
+    }
+}
+
+/// A request sent to the persistent loader thread.
+pub struct LoaderRequest {
+    /// File index inside the App source list.
+    pub idx: usize,
+    /// The ImageSource identifier.
+    pub source: ImageSource,
+    /// Decoding strategy and priority mode.
+    pub mode: LoaderMode,
+    /// Navigation sequence identifier to discard outdated loads.
+    pub sequence: u64,
+}
+
+/// Encapsulates success values for a decoded image.
+pub struct DecodedImage {
+    /// The decoded DynamicImage.
+    pub image: DynamicImage,
+    /// Width of the image in pixels.
+    pub width: u32,
+    /// Height of the image in pixels.
+    pub height: u32,
+    /// Optional format parsed during load.
+    pub format: Option<image::ImageFormat>,
+    /// The size of the raw source file in bytes.
+    pub disk_size: u64,
+    /// Sensor dimensions of the raw container (`(width, height)`), if raw format.
+    pub raw_dimensions: Option<(u32, u32)>,
+}
+
+/// A response returned by the persistent loader thread.
+pub struct LoaderResponse {
+    /// File index inside the App source list.
+    pub idx: usize,
+    /// The decode result containing the DecodedImage data.
+    pub result: Result<DecodedImage, String>,
+    /// Whether this was a background prefetch request.
+    pub is_prefetch: bool,
+    /// Navigation sequence identifier of the load request.
+    pub sequence: u64,
+    /// Time taken to load and decode.
+    pub decode_duration: std::time::Duration,
+    /// Source of the fast thumbnail placeholder, if any.
+    /// `Some(source)` indicates a fast-load low-resolution thumbnail placeholder from `source`,
+    /// while `None` indicates a full-resolution decoded image.
+    pub thumbnail_source: Option<ThumbnailSource>,
+}
+
+/// Unpacks packed 24-bit RGB (`[R, G, B]`) bytes into 32-bit RGBA (`[R, G, B, 255]`) bytes
+/// using 4-pixel (12-byte -> 16-byte) unrolled block unpacking for SIMD auto-vectorization.
+pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
+    let num_pixels = rgb.len() / 3;
+    let mut rgba = vec![0u8; num_pixels * 4];
+    let (in_chunks, in_rem) = rgb[..num_pixels * 3].as_chunks::<12>();
+    let (out_chunks, out_rem) = rgba.as_chunks_mut::<16>();
+
+    for (src, dst) in in_chunks.iter().zip(out_chunks.iter_mut()) {
+        *dst = [
+            src[0], src[1], src[2], 0xFF, src[3], src[4], src[5], 0xFF, src[6], src[7], src[8],
+            0xFF, src[9], src[10], src[11], 0xFF,
+        ];
+    }
+
+    for (src, dst) in in_rem
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out_rem.as_chunks_mut::<4>().0.iter_mut())
+    {
+        *dst = [src[0], src[1], src[2], 0xFF];
+    }
+
+    rgba
+}
+
+/// Converts a `DynamicImage` into an `RgbaImage` by consuming it, utilizing SIMD-vectorized
+/// unpacking when the source is `DynamicImage::ImageRgb8` to avoid per-pixel allocations.
+pub fn into_rgba8_fast(img: DynamicImage) -> image::RgbaImage {
+    match img {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = unpack_rgb24_to_rgba32(rgb.as_raw());
+            image::RgbaImage::from_raw(w, h, raw).expect("valid RGBA dimensions")
+        }
+        other => other.into_rgba8(),
+    }
+}
+
+/// Converts a `DynamicImage` reference into a `Cow<RgbaImage>`, borrowing zero-copy when the image
+/// is already `DynamicImage::ImageRgba8` and using SIMD-vectorized unpacking for `DynamicImage::ImageRgb8`.
+pub fn to_rgba8_fast(img: &DynamicImage) -> std::borrow::Cow<'_, image::RgbaImage> {
+    match img {
+        DynamicImage::ImageRgba8(rgba) => std::borrow::Cow::Borrowed(rgba),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = unpack_rgb24_to_rgba32(rgb.as_raw());
+            std::borrow::Cow::Owned(
+                image::RgbaImage::from_raw(w, h, raw).expect("valid RGBA dimensions"),
+            )
+        }
+        other => std::borrow::Cow::Owned(other.to_rgba8()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +749,73 @@ mod tests {
 
         let empty_pixels = PixelDimensions::new(1920, 0);
         assert!(empty_pixels.is_empty());
+    }
+
+    #[test]
+    fn test_unpack_rgb24_to_rgba32_simd_and_tail_equivalence() {
+        let pixel_counts = [0, 1, 2, 3, 4, 5, 7, 16, 19, 33];
+
+        for &count in &pixel_counts {
+            let mut rgb_bytes = Vec::with_capacity(count * 3);
+            for i in 0..count {
+                rgb_bytes.push(((i * 7 + 13) % 256) as u8);
+                rgb_bytes.push(((i * 11 + 47) % 256) as u8);
+                rgb_bytes.push(((i * 13 + 89) % 256) as u8);
+            }
+
+            let rgba = unpack_rgb24_to_rgba32(&rgb_bytes);
+            assert_eq!(rgba.len(), count * 4);
+
+            for i in 0..count {
+                assert_eq!(rgba[i * 4], rgb_bytes[i * 3]);
+                assert_eq!(rgba[i * 4 + 1], rgb_bytes[i * 3 + 1]);
+                assert_eq!(rgba[i * 4 + 2], rgb_bytes[i * 3 + 2]);
+                assert_eq!(rgba[i * 4 + 3], 255);
+            }
+
+            if count > 0 {
+                let rgb_img =
+                    image::RgbImage::from_raw(count as u32, 1, rgb_bytes.clone()).unwrap();
+                let dynamic = DynamicImage::ImageRgb8(rgb_img);
+                let std_rgba = dynamic.clone().into_rgba8();
+                assert_eq!(rgba, std_rgba.into_raw());
+
+                let fast_rgba = into_rgba8_fast(dynamic.clone());
+                assert_eq!(fast_rgba.as_raw(), &rgba);
+
+                let cow_rgba = to_rgba8_fast(&dynamic);
+                assert_eq!(cow_rgba.as_raw(), &rgba);
+            }
+        }
+
+        let dimensions = [(7, 5), (16, 3), (1, 1), (4, 4), (13, 9)];
+        for (w, h) in dimensions {
+            let count = (w * h) as usize;
+            let mut rgb_bytes = Vec::with_capacity(count * 3);
+            for i in 0..count {
+                rgb_bytes.push(((i * 3 + 5) % 256) as u8);
+                rgb_bytes.push(((i * 5 + 17) % 256) as u8);
+                rgb_bytes.push(((i * 7 + 31) % 256) as u8);
+            }
+
+            let fast_unpacked = unpack_rgb24_to_rgba32(&rgb_bytes);
+            let rgb_img = image::RgbImage::from_raw(w, h, rgb_bytes).unwrap();
+            let dynamic = DynamicImage::ImageRgb8(rgb_img);
+            let std_rgba = dynamic.clone().into_rgba8();
+
+            assert_eq!(fast_unpacked, std_rgba.into_raw());
+
+            let fast_owned = into_rgba8_fast(dynamic.clone());
+            assert_eq!(fast_owned.as_raw(), &fast_unpacked);
+
+            let cow_borrowed_or_owned = to_rgba8_fast(&dynamic);
+            assert_eq!(cow_borrowed_or_owned.as_raw(), &fast_unpacked);
+
+            let dynamic_rgba = DynamicImage::ImageRgba8(fast_owned);
+            match to_rgba8_fast(&dynamic_rgba) {
+                std::borrow::Cow::Borrowed(_) => {}
+                std::borrow::Cow::Owned(_) => panic!("Expected Cow::Borrowed for ImageRgba8"),
+            }
+        }
     }
 }

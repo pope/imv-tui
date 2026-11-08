@@ -2,9 +2,44 @@
 
 use fast_image_resize as fir;
 use image::DynamicImage;
+use ratatui_image::picker::Picker;
+use std::sync::Arc;
 
-use crate::imaging::types::*;
-use crate::imaging::{ResizeRequest, ViewportProtocol};
+use super::kitty_shm::{KittyShmProtocol, ViewportProtocol};
+use super::types::*;
+
+/// A request payload sent to the resizing worker threads.
+pub struct ResizeRequest {
+    /// Shared reference to the decoded dynamic image.
+    pub img: Arc<DynamicImage>,
+    /// Expected full-resolution dimensions of the image.
+    /// If the actual image buffer dimensions differ, it indicates a thumbnail placeholder.
+    pub original_size: (u32, u32),
+    /// Calculated scaling factor.
+    pub scale: f64,
+    /// Crop box geometry.
+    pub crop: CropBox,
+    /// Clamped image intersection region.
+    pub intersection: ImageIntersection,
+    /// Resized target width.
+    pub target_w: u32,
+    /// Resized target height.
+    pub target_h: u32,
+    /// Desired scaling filter.
+    pub filter_type: FilterType,
+    /// Protocol generator picker.
+    pub picker: Picker,
+    /// Brightness correction value.
+    pub brightness: Brightness,
+    /// Contrast correction percentage.
+    pub contrast: Contrast,
+    /// Output terminal grid cell dimensions.
+    pub rendered_size_cells: (u16, u16),
+    /// Sequence identifier to filter out stale requests.
+    pub sequence: u64,
+    /// Whether POSIX shared memory (`t=s`) should be used for Kitty protocol rendering.
+    pub use_kitty_shm: bool,
+}
 
 /// Analytical single-sine Lanczos3 filter kernel.
 ///
@@ -135,7 +170,7 @@ pub fn fast_resize(
             let rgb_dst = image::RgbImage::from_raw(dst_w, dst_h, dst_image.into_vec())
                 .ok_or("Failed to construct RgbImage from resized buffer")?;
 
-            let rgba_raw = crate::imaging::unpack_rgb24_to_rgba32(&rgb_dst);
+            let rgba_raw = unpack_rgb24_to_rgba32(&rgb_dst);
             let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, rgba_raw)
                 .ok_or("Failed to construct RgbaImage from unpacked buffer")?;
 
@@ -146,7 +181,7 @@ pub fn fast_resize(
             Ok(DynamicImage::ImageRgba8(rgba_dst))
         }
         _ => {
-            let rgba_src = crate::imaging::to_rgba8_fast(src_img);
+            let rgba_src = to_rgba8_fast(src_img);
 
             let mut dst_image = FirImage::new(dst_w, dst_h, fir::PixelType::U8x4);
 
@@ -302,7 +337,7 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
             if copy_w > 0 && copy_h > 0 {
                 let mut src_rgba = match resized_part {
                     DynamicImage::ImageRgba8(rgba) => rgba,
-                    other => crate::imaging::into_rgba8_fast(other),
+                    other => into_rgba8_fast(other),
                 };
                 let src_stride = (src_rgba.width() as usize) * 4;
                 let row_bytes = (copy_w as usize) * 4;
@@ -345,7 +380,7 @@ pub fn process_resize(
     let protocol = if req.use_kitty_shm
         && req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty
     {
-        match crate::imaging::KittyShmProtocol::new(
+        match KittyShmProtocol::new(
             &canvas,
             req.picker.font_size(),
             target_size,
@@ -609,6 +644,7 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::kitty_shm::cleanup_all_kitty_shm_segments;
     use super::*;
     use image::{Rgba, RgbaImage};
     use ratatui_image::picker::Picker;
@@ -766,7 +802,7 @@ mod tests {
         let (proto_shm, _, _) = process_resize(req_shm, &mut resizer);
         assert!(matches!(proto_shm, ViewportProtocol::KittyShm(_)));
 
-        crate::imaging::cleanup_all_kitty_shm_segments();
+        cleanup_all_kitty_shm_segments();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::config::Classification;
-use crate::ui::InfoBoxModel;
+use crate::ui::model::InfoBoxModel;
 use ratatui::{
     Frame,
     layout::Rect,
