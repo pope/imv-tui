@@ -181,6 +181,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut draw_needed = true;
     let mut wait_for_frame = true;
     let mut last_loop_tick = std::time::Instant::now();
+    let mut events = Vec::with_capacity(16);
 
     // Main event loop
     while app.running {
@@ -249,7 +250,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_millis(33)
         };
         if event::poll(poll_timeout)? {
-            let mut events = Vec::new();
+            events.clear();
             events.push(event::read()?);
             while event::poll(Duration::from_millis(0))? {
                 events.push(event::read()?);
@@ -260,7 +261,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // graphics query response escape sequences written to stdin) are processed but ignored
             // for redrawing to prevent infinite drawing feedback loops and high CPU usage.
             let mut meaningful = false;
-            for ev in events {
+            for ev in events.drain(..) {
                 meaningful |= matches!(
                     ev,
                     event::Event::Key(_)
@@ -275,6 +276,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     other => app.handle_event(other, term_size.height),
                 }
+            }
+            if events.capacity() > 64 {
+                events.shrink_to(16);
             }
             if meaningful {
                 draw_needed = true;

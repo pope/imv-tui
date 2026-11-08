@@ -73,6 +73,27 @@ pub fn to_fir_resize_alg(filter_type: FilterType) -> fir::ResizeAlg {
     }
 }
 
+/// Maximum source or destination pixel count before `fir::Resizer` scratch memory is reset.
+/// Resizing images larger than this threshold (>16 MP) causes `Resizer` to allocate large
+/// internal scratch buffers; resetting back to a fresh instance releases this peak memory.
+pub const MAX_RESIZER_SCRATCH_PIXELS: u64 = 16_000_000;
+
+/// Resets a `fir::Resizer` instance back to `fir::Resizer::new()` if the processed dimensions
+/// exceeded `MAX_RESIZER_SCRATCH_PIXELS`.
+pub fn maybe_reclaim_resizer_scratch(
+    resizer: &mut fir::Resizer,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    let src_pixels = (src_w as u64) * (src_h as u64);
+    let dst_pixels = (dst_w as u64) * (dst_h as u64);
+    if src_pixels > MAX_RESIZER_SCRATCH_PIXELS || dst_pixels > MAX_RESIZER_SCRATCH_PIXELS {
+        *resizer = fir::Resizer::new();
+    }
+}
+
 /// Helper resizing function leveraging fast_image_resize for sub-millisecond execution speeds.
 pub fn fast_resize(
     resizer: &mut fir::Resizer,
@@ -109,6 +130,7 @@ pub fn fast_resize(
             }
 
             resizer.resize(rgb_src, &mut dst_image, Some(&options))?;
+            maybe_reclaim_resizer_scratch(resizer, src_img.width(), src_img.height(), dst_w, dst_h);
 
             let rgb_dst = image::RgbImage::from_raw(dst_w, dst_h, dst_image.into_vec())
                 .ok_or("Failed to construct RgbImage from resized buffer")?;
@@ -136,6 +158,7 @@ pub fn fast_resize(
             }
 
             resizer.resize(rgba_src.as_ref(), &mut dst_image, Some(&options))?;
+            maybe_reclaim_resizer_scratch(resizer, src_img.width(), src_img.height(), dst_w, dst_h);
 
             let buffer = dst_image.into_vec();
             let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, buffer)
@@ -1273,6 +1296,31 @@ mod tests {
         // For Nearest, RGB8 requires 0 bytes of internal buffers
         resizer.reset_internal_buffers();
         fast_resize(&mut resizer, &large_rgb, 50, 50, FilterType::Nearest, None).unwrap();
+        assert_eq!(resizer.size_of_internal_buffers(), 0);
+    }
+
+    #[test]
+    fn test_maybe_reclaim_resizer_scratch() {
+        let mut resizer = fir::Resizer::new();
+        let test_img = DynamicImage::ImageRgb8(image::RgbImage::new(400, 400));
+
+        // Populate internal convolution buffers
+        fast_resize(&mut resizer, &test_img, 50, 50, FilterType::Mitchell, None).unwrap();
+        assert!(resizer.size_of_internal_buffers() > 0);
+
+        // Dimensions exactly at or below 16 MP threshold (16,000,000 pixels) do NOT reset
+        maybe_reclaim_resizer_scratch(&mut resizer, 4000, 4000, 100, 100);
+        assert!(resizer.size_of_internal_buffers() > 0);
+
+        // Source dimensions exceeding 16 MP reset the resizer scratch buffers
+        maybe_reclaim_resizer_scratch(&mut resizer, 4001, 4000, 100, 100);
+        assert_eq!(resizer.size_of_internal_buffers(), 0);
+
+        // Re-populate and test destination dimensions exceeding 16 MP
+        fast_resize(&mut resizer, &test_img, 50, 50, FilterType::Mitchell, None).unwrap();
+        assert!(resizer.size_of_internal_buffers() > 0);
+
+        maybe_reclaim_resizer_scratch(&mut resizer, 100, 100, 4000, 4001);
         assert_eq!(resizer.size_of_internal_buffers(), 0);
     }
 }

@@ -374,17 +374,21 @@ impl App {
             let mut pending_requests = Vec::new();
             let mut thumb_resizer = fir::Resizer::new();
             let thumb_cache_root = crate::imaging::thumbcache::default_thumbnail_cache_root();
+            let mut requests: Vec<LoaderRequest> = Vec::with_capacity(16);
+            let mut current_requests: Vec<LoaderRequest> = Vec::with_capacity(16);
+            let mut new_reqs: Vec<LoaderRequest> = Vec::with_capacity(16);
 
             loop {
                 // If we don't have any pending requests, block until we receive one
-                let mut requests = if pending_requests.is_empty() {
+                requests.clear();
+                if pending_requests.is_empty() {
                     match loader_rx.recv() {
-                        Ok(req) => vec![req],
+                        Ok(req) => requests.push(req),
                         Err(_) => break, // Channel disconnected, exit thread
                     }
                 } else {
-                    std::mem::take(&mut pending_requests)
-                };
+                    requests.append(&mut pending_requests);
+                }
 
                 // Read any other immediately available requests
                 while let Ok(r) = loader_rx.try_recv() {
@@ -395,23 +399,21 @@ impl App {
                 let highest_seq = requests.iter().map(|r| r.sequence).max().unwrap_or(0);
 
                 // Keep only requests matching the highest sequence
-                let mut current_requests: Vec<LoaderRequest> = requests
-                    .into_iter()
-                    .filter(|r| r.sequence == highest_seq)
-                    .collect();
+                current_requests.clear();
+                current_requests.extend(requests.drain(..).filter(|r| r.sequence == highest_seq));
 
                 // Sort current_requests so that the active load (is_prefetch == false) is processed first
                 current_requests.sort_by_key(|r| r.mode.is_prefetch());
 
                 let mut aborted = false;
-                for r in current_requests {
+                for r in current_requests.drain(..) {
                     let cancel = CancellationToken::with_sequence(r.sequence as usize, &active_seq);
                     if cancel.is_cancelled() {
                         continue;
                     }
 
                     // Poll channel for newer sequence requests
-                    let mut new_reqs = Vec::new();
+                    new_reqs.clear();
                     while let Ok(nr) = loader_rx.try_recv() {
                         new_reqs.push(nr);
                     }
@@ -419,7 +421,7 @@ impl App {
                         let new_max_seq = new_reqs.iter().map(|nr| nr.sequence).max().unwrap_or(0);
                         if new_max_seq > highest_seq {
                             // Abort current sequence processing
-                            pending_requests = new_reqs;
+                            pending_requests.append(&mut new_reqs);
                             aborted = true;
                             break;
                         }
@@ -615,6 +617,22 @@ impl App {
                             thumbnail_source: None,
                         });
                     }
+                }
+
+                requests.clear();
+                if requests.capacity() > 64 {
+                    requests.shrink_to(16);
+                }
+                current_requests.clear();
+                if current_requests.capacity() > 64 {
+                    current_requests.shrink_to(16);
+                }
+                new_reqs.clear();
+                if new_reqs.capacity() > 64 {
+                    new_reqs.shrink_to(16);
+                }
+                if pending_requests.capacity() > 64 {
+                    pending_requests.shrink_to(16);
                 }
 
                 if aborted {

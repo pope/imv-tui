@@ -245,6 +245,9 @@ pub fn downscale_for_thumbnail(
             resizer
                 .resize(rgb_src, &mut dst_image, Some(&options))
                 .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
+            crate::imaging::maybe_reclaim_resizer_scratch(
+                resizer, src_w, src_h, target_w, target_h,
+            );
 
             let rgb_dst = image::RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
                 .ok_or_else(|| "Failed to construct RgbImage from resized buffer".to_string())?;
@@ -270,6 +273,9 @@ pub fn downscale_for_thumbnail(
             resizer
                 .resize(src_rgba.as_ref(), &mut dst_image, Some(&options))
                 .map_err(|e| format!("Thumbnail resize failed: {}", e))?;
+            crate::imaging::maybe_reclaim_resizer_scratch(
+                resizer, src_w, src_h, target_w, target_h,
+            );
 
             let dst_raw = dst_image.into_vec();
             image::RgbaImage::from_raw(target_w, target_h, dst_raw)

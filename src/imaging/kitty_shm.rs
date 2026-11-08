@@ -104,7 +104,6 @@ pub fn cleanup_all_kitty_shm_segments() {
 /// A POSIX shared memory segment holding raw RGBA pixel data for Kitty transmission.
 pub struct KittyShmSegment {
     c_name: CString,
-    shm_name: String,
     transmitted: AtomicBool,
 }
 
@@ -113,8 +112,8 @@ impl KittyShmSegment {
     pub fn new(raw_bytes: &[u8]) -> Result<Self, String> {
         let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
         let shm_name = format!("/imv-tui-{}-{}", std::process::id(), seq);
-        let c_name = CString::new(shm_name.clone())
-            .map_err(|e| format!("Invalid CString for shm_name: {}", e))?;
+        let c_name =
+            CString::new(shm_name).map_err(|e| format!("Invalid CString for shm_name: {}", e))?;
 
         let fd = unsafe {
             libc::shm_open(
@@ -126,7 +125,7 @@ impl KittyShmSegment {
         if fd < 0 {
             return Err(format!(
                 "shm_open failed for {}: {}",
-                shm_name,
+                c_name.to_str().unwrap_or(""),
                 std::io::Error::last_os_error()
             ));
         }
@@ -136,26 +135,33 @@ impl KittyShmSegment {
             unsafe {
                 libc::shm_unlink(c_name.as_ptr());
             }
-            return Err(format!("Failed to set shm size for {}: {}", shm_name, e));
+            return Err(format!(
+                "Failed to set shm size for {}: {}",
+                c_name.to_str().unwrap_or(""),
+                e
+            ));
         }
         if let Err(e) = file.write_all(raw_bytes) {
             unsafe {
                 libc::shm_unlink(c_name.as_ptr());
             }
-            return Err(format!("Failed to write bytes to shm {}: {}", shm_name, e));
+            return Err(format!(
+                "Failed to write bytes to shm {}: {}",
+                c_name.to_str().unwrap_or(""),
+                e
+            ));
         }
         drop(file);
 
         Ok(Self {
             c_name,
-            shm_name,
             transmitted: AtomicBool::new(false),
         })
     }
 
     /// Returns the shared memory object name.
     pub fn shm_name(&self) -> &str {
-        &self.shm_name
+        self.c_name.to_str().unwrap_or("")
     }
 
     /// Returns `true` if the frame has been transmitted to the terminal.
@@ -572,6 +578,7 @@ impl KittyShmProtocol {
             None
         };
 
+        const PLACEHOLDER_STR: &str = "\u{10EEEE}";
         let mut symbol = String::with_capacity(64);
         for y in 0..height {
             let row = y;
@@ -579,6 +586,13 @@ impl KittyShmProtocol {
                 let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) else {
                     continue;
                 };
+
+                if x > 0 && transmit.is_none() {
+                    cell.set_symbol(PLACEHOLDER_STR)
+                        .set_fg(self.fg)
+                        .set_diff_option(UNIT_WIDTH);
+                    continue;
+                }
 
                 symbol.clear();
                 if let Some(seq) = transmit.take() {
