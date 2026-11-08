@@ -2,7 +2,7 @@
 
 use crate::app::cache::VisibleWindow;
 use crate::app::palette::PaletteMode;
-use crate::app::{App, FAST_SCROLL_THRESHOLD, LoadPhase, ThumbnailTelemetry};
+use crate::app::{App, InitialLoadState, LoadPhase, ThumbnailTelemetry};
 use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -59,10 +59,10 @@ impl App {
             return;
         }
 
-        self.resize_in_flight = false;
+        self.resize_state.complete_in_flight();
         self.load_phase = LoadPhase::Complete;
         self.error_message = None;
-        self.clear_on_protocol_receive = true;
+        self.screen_clear.defer_until_protocol();
         self.slideshow_last_transition = std::time::Instant::now();
 
         let adj = self.queue.adjustment(self.queue.current_index);
@@ -108,10 +108,8 @@ impl App {
 
                 self.zoom_factor = ZoomFactor::DEFAULT;
                 self.pan_offset = PanOffset::ZERO;
-                self.is_loading = false;
-                self.frame_ready_pending = false;
-                self.needs_update = true;
-                self.zoom_needs_initialization = true;
+                self.initial_load = InitialLoadState::Idle;
+                self.resize_state.mark_dirty_with_init_zoom();
 
                 // Set stats for cache hit
                 self.stats.load_duration = Some(cached_img.decode_duration);
@@ -120,12 +118,7 @@ impl App {
                 self.stats.format = cached_img.format;
                 self.stats.raw_dimensions = cached_img.raw_dimensions;
 
-                let now = Instant::now();
-                let is_fast_scroll = self
-                    .last_nav_time
-                    .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
-                self.last_nav_time = Some(now);
-                self.prefetch_suspended = is_fast_scroll;
+                let is_fast_scroll = self.scroll_cadence.record_navigation(Instant::now());
 
                 if !is_fast_scroll {
                     self.trigger_prefetch();
@@ -148,7 +141,7 @@ impl App {
                 self.img_height = orig_h;
 
                 self.show_thumbnail_only = true;
-                self.needs_update = true;
+                self.resize_state.mark_dirty_with_init_zoom();
                 loaded_cached_thumb = true;
                 self.stats.is_prefetch_cache_hit = true;
                 let (tw, th) = self
@@ -179,23 +172,20 @@ impl App {
         }
         self.stats.load_duration = None;
         self.image_protocol = None;
-        self.is_loading = true;
-        self.frame_ready_pending = true;
-        self.loading_start_time = Some(Instant::now());
+        self.initial_load = InitialLoadState::start();
         self.current_sequence += 1;
         self.active_sequence
             .store(self.current_sequence as usize, Ordering::Release);
 
         self.zoom_factor = ZoomFactor::DEFAULT;
         self.pan_offset = PanOffset::ZERO;
-        self.zoom_needs_initialization = true;
+        if loaded_cached_thumb {
+            self.resize_state.mark_dirty_with_init_zoom();
+        } else {
+            self.resize_state.reset_idle();
+        }
 
-        let now = Instant::now();
-        let is_fast_scroll = self
-            .last_nav_time
-            .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
-        self.last_nav_time = Some(now);
-        self.prefetch_suspended = is_fast_scroll;
+        let is_fast_scroll = self.scroll_cadence.record_navigation(Instant::now());
 
         let thumb_only = is_fast_scroll && !self.disable_thumbnail;
         if loaded_cached_thumb && thumb_only {
@@ -296,7 +286,7 @@ impl App {
                             self.thumbnail_image = Some(rotated_img);
                             self.show_thumbnail_only = true;
                             self.error_message = None;
-                            self.needs_update = true;
+                            self.resize_state.mark_dirty_with_init_zoom();
 
                             if let Some(src) = resp.thumbnail_source {
                                 self.stats.thumbnail = Some(ThumbnailTelemetry {
@@ -314,12 +304,17 @@ impl App {
                         } else {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();
+                            let had_thumbnail_only = self.show_thumbnail_only;
                             self.original_image = Some(rotated_img);
                             self.show_thumbnail_only = false;
                             self.load_phase = LoadPhase::Complete;
                             self.error_message = None;
-                            self.is_loading = false;
-                            self.needs_update = true;
+                            self.initial_load = InitialLoadState::Idle;
+                            if had_thumbnail_only {
+                                self.resize_state.mark_dirty();
+                            } else {
+                                self.resize_state.mark_dirty_with_init_zoom();
+                            }
 
                             self.stats.load_duration = Some(resp.decode_duration);
                             self.stats.is_prefetch_cache_hit = false;
@@ -327,10 +322,7 @@ impl App {
                             self.stats.format = format;
                             self.stats.raw_dimensions = decoded.raw_dimensions;
 
-                            if self
-                                .last_nav_time
-                                .is_none_or(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
-                            {
+                            if self.scroll_cadence.is_settled() {
                                 self.trigger_prefetch();
                             }
                         }
@@ -355,15 +347,10 @@ impl App {
             received = true;
             self.image_protocol = Some(resp.protocol);
             self.rendered_size_cells = resp.rendered_cells;
-            self.resize_in_flight = false;
-            self.is_loading = false;
-            if self.clear_on_protocol_receive {
-                self.clear_on_protocol_receive = false;
-                self.needs_clear = true;
-            }
-            if self.palette_mode != PaletteMode::Closed {
-                self.needs_clear = true;
-            }
+            self.resize_state.complete_in_flight();
+            self.initial_load = InitialLoadState::Idle;
+            self.screen_clear
+                .on_protocol_received(self.palette_mode != PaletteMode::Closed);
             self.stats.process_duration = resp.process_duration;
             self.stats.protocol_duration = resp.protocol_duration;
             self.stats.protocol_width = resp.target_width;
@@ -378,12 +365,7 @@ impl App {
     /// suspended background prefetching once fast scrolling ceases and the elapsed time
     /// exceeds `FAST_SCROLL_THRESHOLD`.
     pub fn tick(&mut self) {
-        if self.prefetch_suspended
-            && self
-                .last_nav_time
-                .is_some_and(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
-        {
-            self.prefetch_suspended = false;
+        if self.scroll_cadence.poll_settled() {
             if self.load_phase.needs_promotion() && !self.queue.is_empty() {
                 self.load_phase = LoadPhase::FullInFlight;
                 let mode = if self.thumbnail_image.is_some() {
@@ -409,19 +391,18 @@ impl App {
         if self.error_message.is_some() || self.queue.is_empty() {
             return false;
         }
-        self.is_loading
-            || self.needs_update
-            || self.resize_in_flight
-            || self.prefetch_suspended
+        self.is_loading()
+            || self.needs_update()
+            || self.resize_state.is_in_flight()
+            || self.is_prefetch_suspended()
             || self.load_phase.is_pending()
     }
 
     /// Returns true if a renderable protocol is ready (or no load is active) and no layout/resize work is pending.
     #[inline]
     pub fn is_frame_ready(&self) -> bool {
-        (!self.is_loading || self.image_protocol.is_some())
-            && !self.resize_in_flight
-            && !self.needs_update
+        (!self.initial_load.is_active() || self.image_protocol.is_some())
+            && !self.resize_state.is_busy()
     }
 
     /// Pumps background worker channels and layout updates for up to `budget` while waiting
@@ -432,10 +413,8 @@ impl App {
         term_height: u16,
         budget: std::time::Duration,
     ) -> bool {
-        let should_wait = (self.frame_ready_pending && !self.is_frame_ready())
-            || self.resize_in_flight
-            || self.needs_update;
-        self.frame_ready_pending = false;
+        let should_wait = (self.initial_load.take_frame_ready_pending() && !self.is_frame_ready())
+            || self.resize_state.is_busy();
         if !should_wait {
             return false;
         }
@@ -467,7 +446,7 @@ impl App {
         }
 
         if self.slideshow_state.is_playing()
-            && !self.is_loading
+            && !self.is_loading()
             && self.palette_mode == PaletteMode::Closed
             && self.slideshow_last_transition.elapsed()
                 >= std::time::Duration::from_secs(self.slideshow_state.seconds() as u64)
@@ -484,9 +463,11 @@ impl App {
     /// updating state and triggering protocol resize requests if widget size is non-zero.
     pub fn check_background_responses(&mut self) -> bool {
         let updated = self.update_channels();
-        if self.needs_update && self.last_widget_size.0 > 0 && self.last_widget_size.1 > 0 {
+        if self.resize_state.is_dirty()
+            && self.last_widget_size.0 > 0
+            && self.last_widget_size.1 > 0
+        {
             let (w, h) = self.last_widget_size;
-            self.needs_update = false;
             self.update_protocol(w, h);
         }
         updated

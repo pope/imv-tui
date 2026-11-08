@@ -69,6 +69,267 @@ impl LoadPhase {
     }
 }
 
+/// Tracks the lifecycle of viewport protocol resizing and initial zoom calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResizeState {
+    /// Viewport protocol is up-to-date for `last_widget_size` (or no image is loaded).
+    #[default]
+    Idle,
+    /// Viewport state changed; next `update_layout` must dispatch a `ResizeRequest`.
+    Dirty {
+        /// Whether `update_protocol` must initialize `zoom_factor` and `pan_offset` from `scale_mode`.
+        init_zoom: bool,
+    },
+    /// A `ResizeRequest` is currently in flight on the resizer worker thread.
+    InFlight,
+}
+
+impl ResizeState {
+    /// Creates a new `ResizeState` in the `Dirty` state with initial zoom pending disabled.
+    pub const fn new_dirty() -> Self {
+        Self::Dirty { init_zoom: false }
+    }
+
+    /// Marks the resize state as dirty, requesting a new `ResizeRequest` on next layout update.
+    /// Preserves `init_zoom: true` if an initial zoom calculation was already pending.
+    pub fn mark_dirty(&mut self) {
+        let preserve_init = matches!(self, Self::Dirty { init_zoom: true });
+        *self = Self::Dirty {
+            init_zoom: preserve_init,
+        };
+    }
+
+    /// Marks the resize state as dirty and flags initial zoom calculation as pending.
+    pub fn mark_dirty_with_init_zoom(&mut self) {
+        *self = Self::Dirty { init_zoom: true };
+    }
+
+    /// Resets the resize state to idle.
+    pub fn reset_idle(&mut self) {
+        *self = Self::Idle;
+    }
+
+    /// Sets the status to `InFlight` if `sent` is true, or `Idle` otherwise.
+    pub fn set_in_flight(&mut self, sent: bool) {
+        *self = if sent { Self::InFlight } else { Self::Idle };
+    }
+
+    /// Completes an in-flight resize operation, transitioning back to `Idle` (if still in flight).
+    pub fn complete_in_flight(&mut self) {
+        if matches!(self, Self::InFlight) {
+            *self = Self::Idle;
+        }
+    }
+
+    /// Returns `true` if a new resize request is dirty/pending.
+    pub fn is_dirty(&self) -> bool {
+        matches!(self, Self::Dirty { .. })
+    }
+
+    /// Returns `true` if a resize request is currently in flight on the resizer worker.
+    pub fn is_in_flight(&self) -> bool {
+        matches!(self, Self::InFlight)
+    }
+
+    /// Returns `true` if the resizer pipeline is busy (either dirty or in flight).
+    pub fn is_busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    /// Takes the `init_zoom` flag, returning its value and resetting it to `false`.
+    pub fn take_init_zoom(&mut self) -> bool {
+        match self {
+            Self::Dirty { init_zoom } => std::mem::replace(init_zoom, false),
+            _ => false,
+        }
+    }
+}
+
+/// Tracks terminal screen clearing requests across immediate UI transitions and deferred protocol updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScreenClear {
+    /// No terminal clear is scheduled.
+    #[default]
+    None,
+    /// Defer clearing the terminal until the next `ResizeResponse` protocol arrives from the worker thread.
+    OnProtocolReceive,
+    /// Clear the terminal immediately before the next frame draw.
+    Pending,
+}
+
+impl ScreenClear {
+    /// Schedules an immediate terminal clear before the next frame draw.
+    pub fn request_now(&mut self) {
+        *self = Self::Pending;
+    }
+
+    /// Defers screen clearing until a new image protocol is received, unless a clear is already pending.
+    pub fn defer_until_protocol(&mut self) {
+        if *self == Self::None {
+            *self = Self::OnProtocolReceive;
+        }
+    }
+
+    /// Handles arrival of a new protocol, promoting `OnProtocolReceive` (or active palette) to `Pending`.
+    pub fn on_protocol_received(&mut self, palette_open: bool) {
+        if *self == Self::OnProtocolReceive || palette_open {
+            *self = Self::Pending;
+        }
+    }
+
+    /// Consumes the pending clear flag if scheduled, returning `true`.
+    pub fn take_pending(&mut self) -> bool {
+        if *self == Self::Pending {
+            *self = Self::None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if an immediate terminal clear is pending.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+/// Tracks whether the application is awaiting the initial displayable frame for the current image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InitialLoadState {
+    /// An image (or thumbnail placeholder) is already displayed, or no load is active.
+    #[default]
+    Idle,
+    /// Waiting for the initial decode/protocol of a load started at `started_at`.
+    Loading {
+        /// Timestamp when the load began, used to debounce the 150ms loading spinner.
+        started_at: Instant,
+        /// Whether the one-shot Frame-1 barrier wait is still pending for this load.
+        frame_ready_pending: bool,
+    },
+}
+
+impl InitialLoadState {
+    /// Begins a new load starting at the current instant.
+    pub fn start() -> Self {
+        Self::Loading {
+            started_at: Instant::now(),
+            frame_ready_pending: true,
+        }
+    }
+
+    /// Begins a new load with an explicit starting timestamp.
+    #[cfg(test)]
+    pub fn start_at(started_at: Instant) -> Self {
+        Self::Loading {
+            started_at,
+            frame_ready_pending: true,
+        }
+    }
+
+    /// Returns `true` if image loading is currently active.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Loading { .. })
+    }
+
+    /// Returns `true` if the one-shot Frame-1 barrier wait is still pending.
+    #[cfg(test)]
+    pub fn is_frame_ready_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Loading {
+                frame_ready_pending: true,
+                ..
+            }
+        )
+    }
+
+    /// Consumes the one-shot Frame-1 barrier flag, returning `true` if it was pending.
+    pub fn take_frame_ready_pending(&mut self) -> bool {
+        if let Self::Loading {
+            ref mut frame_ready_pending,
+            ..
+        } = *self
+        {
+            std::mem::replace(frame_ready_pending, false)
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if loading duration has exceeded `debounce` threshold.
+    pub fn should_show_spinner(&self, debounce: Duration) -> bool {
+        matches!(
+            self,
+            Self::Loading { started_at, .. } if started_at.elapsed() > debounce
+        )
+    }
+}
+
+/// Tracks user navigation cadence to detect fast scrolling and suspend/resume background work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollCadence {
+    /// No navigation has occurred yet.
+    #[default]
+    Idle,
+    /// Normal navigation cadence (or fast-scroll settle period has elapsed); prefetching is active.
+    Settled {
+        /// Timestamp of the most recent navigation event.
+        last_nav: Instant,
+    },
+    /// Rapid navigation detected within `FAST_SCROLL_THRESHOLD`; full decode and neighbor prefetch are suspended.
+    FastScrolling {
+        /// Timestamp of the most recent navigation event.
+        last_nav: Instant,
+    },
+}
+
+impl ScrollCadence {
+    /// Returns the timestamp of the last navigation action, if any.
+    pub fn last_nav_time(&self) -> Option<Instant> {
+        match *self {
+            Self::Idle => None,
+            Self::Settled { last_nav } | Self::FastScrolling { last_nav } => Some(last_nav),
+        }
+    }
+
+    /// Records a new navigation event, transitioning to `FastScrolling` if within `FAST_SCROLL_THRESHOLD`.
+    /// Returns `true` if fast scrolling was detected.
+    pub fn record_navigation(&mut self, now: Instant) -> bool {
+        let is_fast = self
+            .last_nav_time()
+            .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
+        *self = if is_fast {
+            Self::FastScrolling { last_nav: now }
+        } else {
+            Self::Settled { last_nav: now }
+        };
+        is_fast
+    }
+
+    /// Returns `true` if neighbor prefetching is currently suspended due to rapid navigation.
+    pub fn is_prefetch_suspended(&self) -> bool {
+        matches!(self, Self::FastScrolling { .. })
+    }
+
+    /// Returns `true` if navigation has settled (or no navigation has occurred).
+    pub fn is_settled(&self) -> bool {
+        self.last_nav_time()
+            .is_none_or(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
+    }
+
+    /// Transitions from `FastScrolling` to `Settled` if the elapsed time exceeds `FAST_SCROLL_THRESHOLD`.
+    /// Returns `true` if a transition from `FastScrolling` to `Settled` occurred.
+    pub fn poll_settled(&mut self) -> bool {
+        if let Self::FastScrolling { last_nav } = *self
+            && last_nav.elapsed() >= FAST_SCROLL_THRESHOLD
+        {
+            *self = Self::Settled { last_nav };
+            return true;
+        }
+        false
+    }
+}
+
 /// Telemetry metadata for a decoded thumbnail placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThumbnailTelemetry {
@@ -240,18 +501,12 @@ pub struct App {
 
     /// Size of the image widget area on the last frame draw.
     pub last_widget_size: (u16, u16),
-    /// If true, triggers a resize worker dispatch.
-    pub needs_update: bool,
-    /// Tracks whether a resize request for `current_sequence` is currently in flight on the worker thread.
-    pub resize_in_flight: bool,
-    /// Flag tracking whether an initial frame-ready barrier wait is pending for the active image load.
-    pub frame_ready_pending: bool,
+    /// Tracks the background resize worker pipeline and initial zoom calculation.
+    pub resize_state: ResizeState,
     /// Lifecycle state of background loading for the currently selected image.
     pub load_phase: LoadPhase,
-    /// Triggers a visual clearing of the terminal screen, gated on `should_clear_on_update()` (e.g. Sixel).
-    /// Used to clean obsolete graphic cells on discrete updates (like image loads or dismissed dialogues)
-    /// without causing constant Kitty/Halfblocks flicker.
-    pub needs_clear: bool,
+    /// Terminal screen clear coordination across immediate and deferred updates.
+    pub screen_clear: ScreenClear,
     /// Cell dimensions of the actual rendered Sixel/Kitty image.
     pub rendered_size_cells: (u16, u16),
     /// Percentage display value of the current scaling.
@@ -280,14 +535,8 @@ pub struct App {
     pub loader_tx: mpsc::Sender<LoaderRequest>,
     response_rx: mpsc::Receiver<LoaderResponse>,
     current_sequence: u64,
-    /// Loading state spinner indicator boolean.
-    pub is_loading: bool,
-    /// Timestamp when image loading started to debounce the spinner.
-    pub loading_start_time: Option<Instant>,
-    /// Defer screen clearing until protocol is received to prevent stutters.
-    pub clear_on_protocol_receive: bool,
-    /// Flag to force scale mode view recalculation on load.
-    pub zoom_needs_initialization: bool,
+    /// Lifecycle of the active foreground image decode/protocol load.
+    pub initial_load: InitialLoadState,
     /// Prefetch cache storing decoded images in the visible sliding window.
     pub prefetch_cache: PrefetchCache,
     /// The slideshow state.
@@ -310,10 +559,8 @@ pub struct App {
     pub scan_config: ScanConfig,
     /// Active sequence counter for cooperative cancellation in worker threads.
     pub active_sequence: Arc<AtomicUsize>,
-    /// Timestamp of the last navigation action, used to detect fast scrolling.
-    pub last_nav_time: Option<Instant>,
-    /// Flag indicating whether background prefetching is currently suspended due to fast scrolling.
-    pub prefetch_suspended: bool,
+    /// User navigation cadence used to detect fast scrolling and throttle prefetching.
+    pub scroll_cadence: ScrollCadence,
     /// Active runtime terminal graphics protocol and its protocol-specific options.
     pub active_protocol: crate::config::ActiveProtocol,
 }
@@ -689,11 +936,9 @@ impl App {
             running: true,
             error_message: None,
             last_widget_size: (0, 0),
-            needs_update: true,
-            resize_in_flight: false,
-            frame_ready_pending: false,
+            resize_state: ResizeState::new_dirty(),
             load_phase: LoadPhase::Complete,
-            needs_clear: true,
+            screen_clear: ScreenClear::Pending,
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
             palette_mode: PaletteMode::Closed,
@@ -709,10 +954,7 @@ impl App {
             loader_tx,
             response_rx,
             current_sequence: 0,
-            is_loading: false,
-            loading_start_time: None,
-            clear_on_protocol_receive: false,
-            zoom_needs_initialization: false,
+            initial_load: InitialLoadState::Idle,
             prefetch_cache: PrefetchCache::new(),
             slideshow_state: SlideshowState::OFF,
             slideshow_last_transition: std::time::Instant::now(),
@@ -724,8 +966,7 @@ impl App {
             unmapped_classifications: HashMap::new(),
             scan_config,
             active_sequence,
-            last_nav_time: None,
-            prefetch_suspended: false,
+            scroll_cadence: ScrollCadence::Idle,
             active_protocol: config.active_protocol,
         }
     }
@@ -770,12 +1011,11 @@ impl App {
 
     /// Returns the active viewport display state.
     pub fn display_state(&self) -> ImageDisplayState<'_> {
-        let show_loading = self.is_loading
-            && self.image_protocol.is_none()
+        let show_loading = self.image_protocol.is_none()
             && self.thumbnail_image.is_none()
             && self
-                .loading_start_time
-                .is_some_and(|t| t.elapsed() > Duration::from_millis(150));
+                .initial_load
+                .should_show_spinner(Duration::from_millis(150));
 
         if show_loading {
             ImageDisplayState::LoadingSpinner
@@ -788,18 +1028,39 @@ impl App {
         }
     }
 
+    /// Returns `true` if active image loading is in progress.
+    #[inline]
+    pub fn is_loading(&self) -> bool {
+        self.initial_load.is_active()
+    }
+
+    /// Returns `true` if the viewport is dirty and requires a resize request dispatch.
+    #[inline]
+    pub fn needs_update(&self) -> bool {
+        self.resize_state.is_dirty()
+    }
+
+    /// Returns `true` if an immediate screen clear is scheduled.
+    #[inline]
+    pub fn needs_clear(&self) -> bool {
+        self.screen_clear.is_pending()
+    }
+
+    /// Returns `true` if neighbor prefetching is currently suspended due to rapid navigation.
+    #[inline]
+    pub fn is_prefetch_suspended(&self) -> bool {
+        self.scroll_cadence.is_prefetch_suspended()
+    }
+
     /// Sets an error state, terminating loading and clearing image protocol and buffer data.
     pub fn set_error_state(&mut self, msg: impl Into<String>) {
         self.error_message = Some(msg.into());
-        self.is_loading = false;
-        self.frame_ready_pending = false;
-        self.loading_start_time = None;
+        self.initial_load = InitialLoadState::Idle;
         self.original_image = None;
         self.thumbnail_image = None;
         self.image_protocol = None;
-        self.resize_in_flight = false;
+        self.resize_state.reset_idle();
         self.load_phase = LoadPhase::Complete;
-        self.needs_update = false;
     }
 
     /// Returns the number of cached entries and their total uncompressed memory footprint in bytes.
@@ -862,7 +1123,7 @@ impl App {
     /// Closes any active palette overlay and shrinks palette arena buffers if they exceeded `MAX_IDLE_PALETTE_CAPACITY`.
     pub fn close_palette(&mut self) {
         self.palette_mode = PaletteMode::Closed;
-        self.needs_clear = true;
+        self.screen_clear.request_now();
         self.palette_scratch.clear();
         if self.palette_scratch.capacity() > palette::MAX_IDLE_PALETTE_CAPACITY {
             self.palette_scratch
@@ -895,7 +1156,7 @@ impl App {
 
     /// Cycles through available image scaling filters.
     pub fn cycle_filter(&mut self) {
-        if self.is_loading {
+        if self.is_loading() {
             return;
         }
         self.filter_type = match self.filter_type {
@@ -907,7 +1168,7 @@ impl App {
             FilterType::Gaussian => FilterType::Lanczos,
             FilterType::Lanczos => FilterType::Nearest,
         };
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Executes a discrete user command, updating internal application state.
@@ -925,31 +1186,31 @@ impl App {
             Command::Quit => self.running = false,
             Command::SetFilterNearest => {
                 self.filter_type = FilterType::Nearest;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::SetFilterLinear => {
                 self.filter_type = FilterType::Linear;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::SetFilterCubic => {
                 self.filter_type = FilterType::Cubic;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::SetFilterMitchell => {
                 self.filter_type = FilterType::Mitchell;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::SetFilterGaussian => {
                 self.filter_type = FilterType::Gaussian;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::SetFilterLanczos => {
                 self.filter_type = FilterType::Lanczos;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::SetFilterHamming => {
                 self.filter_type = FilterType::Hamming;
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
             Command::NextFilter => self.cycle_filter(),
             Command::GoToImage => self.open_prompt(PromptType::GoToImage),
@@ -1018,8 +1279,8 @@ impl App {
             Command::ToggleThumbnail => {
                 if self.thumbnail_image.is_some() {
                     self.show_thumbnail_only = !self.show_thumbnail_only;
-                    self.needs_update = true;
-                    self.needs_clear = true;
+                    self.resize_state.mark_dirty();
+                    self.screen_clear.request_now();
                 }
             }
             Command::ShowInfo => {
@@ -1034,7 +1295,7 @@ impl App {
                 } else {
                     self.palette_mode = PaletteMode::Info;
                     self.palette_height = 23;
-                    self.needs_clear = true;
+                    self.screen_clear.request_now();
                     self.last_info_toggle = Some(std::time::Instant::now());
                 }
             }
@@ -1054,18 +1315,18 @@ impl App {
             Command::SetViewAll => self.set_view_mode(ViewMode::All),
             Command::SetInfoBarTop => {
                 self.infobar = InfoBarPosition::Top;
-                self.needs_update = true;
-                self.needs_clear = true;
+                self.resize_state.mark_dirty();
+                self.screen_clear.request_now();
             }
             Command::SetInfoBarBottom => {
                 self.infobar = InfoBarPosition::Bottom;
-                self.needs_update = true;
-                self.needs_clear = true;
+                self.resize_state.mark_dirty();
+                self.screen_clear.request_now();
             }
             Command::SetInfoBarNone => {
                 self.infobar = InfoBarPosition::None;
-                self.needs_update = true;
-                self.needs_clear = true;
+                self.resize_state.mark_dirty();
+                self.screen_clear.request_now();
             }
             Command::CycleInfoBar => {
                 self.infobar = match self.infobar {
@@ -1073,8 +1334,8 @@ impl App {
                     InfoBarPosition::Top => InfoBarPosition::None,
                     InfoBarPosition::None => InfoBarPosition::Bottom,
                 };
-                self.needs_update = true;
-                self.needs_clear = true;
+                self.resize_state.mark_dirty();
+                self.screen_clear.request_now();
             }
             Command::ToggleSlideshowPause => {
                 self.slideshow_state = match self.slideshow_state {
@@ -1082,7 +1343,7 @@ impl App {
                     SlideshowState::Paused { delay } => SlideshowState::Playing { delay },
                     SlideshowState::Stopped => SlideshowState::Stopped,
                 };
-                self.needs_clear = true;
+                self.screen_clear.request_now();
             }
         }
     }
@@ -1096,7 +1357,7 @@ impl App {
             PaletteMode::Command => 0,
             _ => 0,
         };
-        self.needs_clear = true;
+        self.screen_clear.request_now();
         self.update_palette_filter();
 
         let max_text_width = match mode {
@@ -1127,7 +1388,7 @@ impl App {
         self.palette_selected_index = 0;
         self.palette_width = 45;
         self.palette_height = 0;
-        self.needs_clear = true;
+        self.screen_clear.request_now();
     }
 
     /// Executes an entered value from the interactive input prompt.
@@ -1190,7 +1451,7 @@ impl App {
                         }
                     }
                     if old != adj_slot.brightness {
-                        self.needs_update = true;
+                        self.resize_state.mark_dirty();
                     }
                 }
             }
@@ -1211,7 +1472,7 @@ impl App {
                         Adjustment::RelativeSub(val) => next.adjust(-val),
                     }
                     if adj_slot.contrast.update(next.value()) {
-                        self.needs_update = true;
+                        self.resize_state.mark_dirty();
                     }
                 }
             }

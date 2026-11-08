@@ -56,7 +56,7 @@ impl App {
                 match key.code {
                     KeyCode::Esc => {
                         self.close_palette();
-                        self.needs_update = true;
+                        self.resize_state.mark_dirty();
                     }
                     KeyCode::Enter => match self.palette_mode {
                         PaletteMode::File => {
@@ -66,7 +66,7 @@ impl App {
                                 self.start_load_image();
                             }
                             self.close_palette();
-                            self.needs_update = true;
+                            self.resize_state.mark_dirty();
                         }
                         PaletteMode::Command => {
                             let cmds = self.get_filtered_commands();
@@ -78,7 +78,7 @@ impl App {
                             }
                             if self.palette_mode == PaletteMode::Command {
                                 self.close_palette();
-                                self.needs_update = true;
+                                self.resize_state.mark_dirty();
                             }
                         }
                         PaletteMode::Prompt(prompt_type) => {
@@ -230,7 +230,7 @@ mod tests {
         app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
             image::RgbImage::new(800, 600),
         )));
-        app.is_loading = false;
+        app.initial_load = crate::app::InitialLoadState::Idle;
         app.img_width = 800;
         app.img_height = 600;
         app.last_widget_size = (80, 24);
@@ -339,7 +339,7 @@ mod tests {
         app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
             image::RgbImage::new(800, 600),
         )));
-        app.is_loading = false;
+        app.initial_load = crate::app::InitialLoadState::Idle;
         app.img_width = 800;
         app.img_height = 600;
         app.last_widget_size = (80, 24);

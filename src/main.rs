@@ -210,8 +210,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             draw_needed = true;
         }
 
-        if app.needs_clear {
-            app.needs_clear = false;
+        if app.needs_clear() {
+            app.screen_clear.take_pending();
             if app.should_clear_on_update() {
                 terminal.clear()?;
             }

@@ -603,7 +603,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     // Verify full resolution state
     assert!(app.original_image.is_some());
     assert!(!app.show_thumbnail_only);
-    assert!(!app.is_loading);
+    assert!(!app.is_loading());
     assert_eq!(app.img_width, 1920);
     assert_eq!(app.img_height, 1080);
     assert_eq!(
@@ -721,7 +721,7 @@ fn test_decode_error_handling() {
     // Drain initial requests
     while channels.loader_rx.try_recv().is_ok() {}
 
-    assert!(app.is_loading);
+    assert!(app.is_loading());
     assert!(app.error_message.is_none());
 
     // Send a decode error for the current active image
@@ -742,7 +742,7 @@ fn test_decode_error_handling() {
         app.error_message.as_deref(),
         Some("Corrupt image data: decode failed")
     );
-    assert!(!app.is_loading);
+    assert!(!app.is_loading());
     assert!(app.original_image.is_none());
 }
 
@@ -757,7 +757,7 @@ fn test_panning_safety_and_bounds() {
     // Mock a loaded image width and height
     app.img_width = 800;
     app.img_height = 600;
-    app.is_loading = false;
+    app.initial_load = InitialLoadState::Idle;
     app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
         image::RgbImage::new(800, 600),
     )));
@@ -969,7 +969,7 @@ fn test_zoom_stops_and_scale_modes() {
     )));
     app.img_width = 800;
     app.img_height = 600;
-    app.is_loading = false;
+    app.initial_load = InitialLoadState::Idle;
     app.last_widget_size = (100, 50); // With 8x16 font: 800x800 px viewport
 
     let fit_scale = app.get_fit_scale();
@@ -1058,17 +1058,17 @@ fn test_zoom_stops_and_scale_modes() {
     // 7. set_actual_size, reset_view, and reset_image
     app.zoom_factor = ZoomFactor::new(5.0);
     app.pan_offset = PanOffset::new(100, -50);
-    app.clear_on_protocol_receive = false;
+    app.screen_clear = ScreenClear::None;
     app.set_actual_size();
     assert!((app.zoom_factor.value() - (1.0 / fs)).abs() < 1e-4);
-    assert!(app.clear_on_protocol_receive);
+    assert_eq!(app.screen_clear, ScreenClear::OnProtocolReceive);
 
     app.zoom_factor = ZoomFactor::new(3.0);
     app.pan_offset = PanOffset::new(80, 40);
-    app.clear_on_protocol_receive = false;
+    app.screen_clear = ScreenClear::None;
     app.reset_view();
     assert_eq!(app.pan_offset, PanOffset::ZERO);
-    assert!(app.clear_on_protocol_receive);
+    assert_eq!(app.screen_clear, ScreenClear::OnProtocolReceive);
 
     // reset_image resets adjustments on current index
     let curr = app.queue.current_index;
@@ -1098,32 +1098,32 @@ fn test_should_clear_on_update_and_dismiss_needs_clear() {
     app.picker.set_protocol_type(ProtocolType::Sixel);
     assert!(app.should_clear_on_update());
 
-    // 2. Overlay dismissal sets needs_clear = true
+    // 2. Overlay dismissal sets screen_clear = Pending
     // Open and close prompt
-    app.needs_clear = false;
+    app.screen_clear = ScreenClear::None;
     app.open_prompt(PromptType::GoToImage);
-    assert!(app.needs_clear);
+    assert!(app.screen_clear.is_pending());
 
-    app.needs_clear = false;
+    app.screen_clear = ScreenClear::None;
     app.execute_prompt(PromptType::GoToImage);
-    assert!(app.needs_clear);
+    assert!(app.screen_clear.is_pending());
 
     // Open and close Info overlay
-    app.needs_clear = false;
+    app.screen_clear = ScreenClear::None;
     app.execute_command(Command::ShowInfo);
-    assert!(app.needs_clear);
+    assert!(app.screen_clear.is_pending());
     assert_eq!(app.palette_mode, PaletteMode::Info);
 
-    app.needs_clear = false;
+    app.screen_clear = ScreenClear::None;
     app.last_info_toggle = Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
     app.execute_command(Command::ShowInfo);
-    assert!(app.needs_clear);
+    assert!(app.screen_clear.is_pending());
     assert_eq!(app.palette_mode, PaletteMode::Closed);
 
-    // Slideshow pause toggle sets needs_clear
-    app.needs_clear = false;
+    // Slideshow pause toggle sets screen_clear
+    app.screen_clear = ScreenClear::None;
     app.execute_command(Command::ToggleSlideshowPause);
-    assert!(app.needs_clear);
+    assert!(app.screen_clear.is_pending());
 }
 
 #[test]
@@ -1133,16 +1133,18 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
     while channels.loader_rx.try_recv().is_ok() {}
 
     // 1. Initial state
-    assert!(!app.prefetch_suspended);
+    assert!(!app.is_prefetch_suspended());
     assert_eq!(
         app.active_sequence.load(Ordering::Acquire),
         app.current_sequence as usize
     );
 
     // 2. Trigger first navigation (isolated after threshold)
-    app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
+    app.scroll_cadence = ScrollCadence::Settled {
+        last_nav: Instant::now() - Duration::from_millis(100),
+    };
     app.next_image();
-    assert!(!app.prefetch_suspended);
+    assert!(!app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::FullInFlight);
     assert!(!app.load_phase.needs_promotion());
     // Drain requests
@@ -1155,7 +1157,7 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
 
     // 3. Trigger rapid successive navigation (within FAST_SCROLL_THRESHOLD)
     app.next_image();
-    assert!(app.prefetch_suspended);
+    assert!(app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::ThumbnailInFlightDeferred);
     assert!(app.load_phase.needs_promotion());
     assert_eq!(
@@ -1175,14 +1177,16 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
 
     // 4. Tick before threshold does not resume prefetch
     app.tick();
-    assert!(app.prefetch_suspended);
+    assert!(app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::ThumbnailInFlightDeferred);
     assert!(channels.loader_rx.try_recv().is_err());
 
     // 5. Once elapsed time exceeds threshold, tick resumes prefetch and dispatches full-resolution promotion
-    app.last_nav_time = Some(Instant::now() - Duration::from_millis(70));
+    app.scroll_cadence = ScrollCadence::FastScrolling {
+        last_nav: Instant::now() - Duration::from_millis(70),
+    };
     app.tick();
-    assert!(!app.prefetch_suspended);
+    assert!(!app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::FullInFlight);
     assert!(!app.load_phase.needs_promotion());
 
@@ -1229,7 +1233,9 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     assert!(app.stats.is_prefetch_cache_hit);
 
     // 2. Navigate to image 1 (which is NOT in prefetch cache)
-    app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
+    app.scroll_cadence = ScrollCadence::Settled {
+        last_nav: Instant::now() - Duration::from_millis(100),
+    };
     app.next_image();
 
     // Stale thumbnail and original image must be completely cleared!
@@ -1240,7 +1246,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     assert!(app.stats.thumbnail.is_none());
 
     // 3. Verify has_pending_work() is true while loading or resizing
-    assert!(app.is_loading);
+    assert!(app.is_loading());
     assert!(app.has_pending_work());
 
     // Once error state is set, has_pending_work() is false
@@ -1264,7 +1270,9 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
             raw_dimensions: None,
         },
     );
-    app.last_nav_time = Some(Instant::now() - Duration::from_millis(100));
+    app.scroll_cadence = ScrollCadence::Settled {
+        last_nav: Instant::now() - Duration::from_millis(100),
+    };
     app.prev_image(); // Navigates back to image 0 (which has cached thumbnail)
     assert!(app.thumbnail_image.is_some());
     assert!(app.show_thumbnail_only);
@@ -1398,7 +1406,7 @@ fn test_wait_for_frame_ready_and_frame_ready_pending() {
     while channels.loader_rx.try_recv().is_ok() {}
 
     // Initially loading image 0: frame_ready_pending is true, and protocol is not ready yet
-    assert!(app.frame_ready_pending);
+    assert!(app.initial_load.is_frame_ready_pending());
     assert!(!app.is_frame_ready());
 
     // Provide a thumbnail response on loader channel
@@ -1453,7 +1461,7 @@ fn test_wait_for_frame_ready_and_frame_ready_pending() {
 
     assert!(updated);
     assert!(app.is_frame_ready());
-    assert!(!app.frame_ready_pending);
+    assert!(!app.initial_load.is_frame_ready_pending());
     assert!(elapsed < Duration::from_millis(30));
 
     // A subsequent call when frame_ready_pending is already false and no resize is in flight
@@ -1499,10 +1507,118 @@ fn test_tick_slideshow_timer_and_transitions() {
     };
 
     // 3. When playing, no palette, not loading, and delay is reached: advance to next image
-    app.is_loading = false;
+    app.initial_load = InitialLoadState::Idle;
     app.slideshow_last_transition = Instant::now() - Duration::from_secs(4);
     let initial_idx = app.queue.current_index;
     let transitioned = app.tick_slideshow(Duration::from_millis(50));
     assert!(transitioned);
     assert_eq!(app.queue.current_index, (initial_idx + 1) % app.queue.len());
+}
+
+#[test]
+fn test_app_state_machine_invariants() {
+    // 1. ResizeState
+    let mut rs = ResizeState::default();
+    assert_eq!(rs, ResizeState::Idle);
+    assert!(!rs.is_busy());
+    assert!(!rs.is_dirty());
+    assert!(!rs.is_in_flight());
+    assert!(!rs.take_init_zoom());
+
+    rs.mark_dirty();
+    assert_eq!(rs, ResizeState::Dirty { init_zoom: false });
+    assert!(rs.is_busy());
+    assert!(rs.is_dirty());
+    assert!(!rs.is_in_flight());
+    assert!(!rs.take_init_zoom());
+
+    rs.set_in_flight(true);
+    assert_eq!(rs, ResizeState::InFlight);
+    assert!(rs.is_busy());
+    assert!(!rs.is_dirty());
+    assert!(rs.is_in_flight());
+
+    rs.complete_in_flight();
+    assert_eq!(rs, ResizeState::Idle);
+    assert!(!rs.is_busy());
+    assert!(!rs.is_in_flight());
+
+    rs.mark_dirty_with_init_zoom();
+    assert_eq!(rs, ResizeState::Dirty { init_zoom: true });
+    assert!(rs.is_dirty());
+
+    // mark_dirty() preserves existing init_zoom: true
+    rs.mark_dirty();
+    assert_eq!(rs, ResizeState::Dirty { init_zoom: true });
+    assert!(rs.take_init_zoom());
+    assert_eq!(rs, ResizeState::Dirty { init_zoom: false });
+    assert!(!rs.take_init_zoom());
+
+    rs.reset_idle();
+    assert_eq!(rs, ResizeState::Idle);
+    assert!(!rs.is_busy());
+    assert!(!rs.take_init_zoom());
+
+    // 2. ScreenClear
+    let mut sc = ScreenClear::default();
+    assert!(!sc.is_pending());
+    assert!(!sc.take_pending());
+
+    sc.request_now();
+    assert!(sc.is_pending());
+    assert!(sc.take_pending());
+    assert!(!sc.is_pending());
+
+    sc.defer_until_protocol();
+    assert_eq!(sc, ScreenClear::OnProtocolReceive);
+    assert!(!sc.is_pending());
+
+    sc.on_protocol_received(false);
+    assert!(sc.is_pending());
+    assert!(sc.take_pending());
+    assert_eq!(sc, ScreenClear::None);
+
+    sc.on_protocol_received(true);
+    assert!(sc.is_pending());
+    assert!(sc.take_pending());
+
+    // 3. InitialLoadState
+    let mut load = InitialLoadState::default();
+    assert!(!load.is_active());
+    assert!(!load.is_frame_ready_pending());
+
+    load = InitialLoadState::start();
+    assert!(load.is_active());
+    assert!(load.is_frame_ready_pending());
+    assert!(load.take_frame_ready_pending());
+    assert!(!load.take_frame_ready_pending());
+    assert!(load.is_active());
+    assert!(!load.should_show_spinner(Duration::from_millis(150)));
+
+    let old_load = InitialLoadState::start_at(Instant::now() - Duration::from_millis(200));
+    assert!(old_load.should_show_spinner(Duration::from_millis(150)));
+
+    // 4. ScrollCadence
+    let mut cad = ScrollCadence::default();
+    assert_eq!(cad.last_nav_time(), None);
+    assert!(cad.is_settled());
+    assert!(!cad.is_prefetch_suspended());
+
+    let now = Instant::now();
+    assert!(!cad.record_navigation(now));
+    assert_eq!(cad.last_nav_time(), Some(now));
+    assert!(!cad.is_prefetch_suspended());
+
+    let fast_now = now + Duration::from_millis(20);
+    assert!(cad.record_navigation(fast_now));
+    assert!(cad.is_prefetch_suspended());
+    assert!(!cad.is_settled());
+    assert!(!cad.poll_settled());
+
+    cad = ScrollCadence::FastScrolling {
+        last_nav: Instant::now() - Duration::from_millis(70),
+    };
+    assert!(cad.is_settled());
+    assert!(cad.poll_settled());
+    assert!(!cad.is_prefetch_suspended());
 }

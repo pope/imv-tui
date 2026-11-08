@@ -20,9 +20,8 @@ impl App {
     pub fn update_layout(&mut self, term_width: u16, term_height: u16) {
         // 1. First, check if the image protocol needs updating based on the main viewport area size
         let (widget_w, widget_h) = self.get_viewport_size(term_width, term_height);
-        if self.needs_update || self.last_widget_size != (widget_w, widget_h) {
+        if self.needs_update() || self.last_widget_size != (widget_w, widget_h) {
             self.last_widget_size = (widget_w, widget_h);
-            self.needs_update = false;
             self.update_protocol(widget_w, widget_h);
         }
 
@@ -50,7 +49,7 @@ impl App {
 
         if self.palette_height != new_h {
             self.palette_height = new_h;
-            self.needs_clear = true;
+            self.screen_clear.request_now();
         }
     }
 
@@ -93,8 +92,7 @@ impl App {
             let s_h = widget_h_px / h_orig;
             let s = s_w.min(s_h);
 
-            if self.zoom_needs_initialization && s > 0.0 {
-                self.zoom_needs_initialization = false;
+            if self.resize_state.take_init_zoom() && s > 0.0 {
                 self.zoom_factor = ZoomFactor::new(match self.scale_mode {
                     ScaleMode::None => 1.0 / s,
                     ScaleMode::Shrink => {
@@ -169,11 +167,12 @@ impl App {
                 use_kitty_shm: self.active_protocol.uses_kitty_shm(),
             };
 
-            self.resize_in_flight = self.resize_tx.send(req).is_ok();
+            let sent = self.resize_tx.send(req).is_ok();
+            self.resize_state.set_in_flight(sent);
         } else {
             self.image_protocol = None;
             self.rendered_size_cells = (0, 0);
-            self.resize_in_flight = false;
+            self.resize_state.reset_idle();
         }
     }
 
@@ -229,33 +228,33 @@ impl App {
 
     /// Zooms into the image by a fractional multiplier.
     pub fn zoom_in(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
             self.zoom_factor = ZoomFactor::new((self.zoom_factor.value() * 1.25).min(102.4 / s));
             self.clamp_pan();
-            self.needs_update = true;
+            self.resize_state.mark_dirty();
         }
     }
 
     /// Zooms out of the image by a fractional multiplier.
     pub fn zoom_out(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
             self.zoom_factor = ZoomFactor::new((self.zoom_factor.value() / 1.25).max(0.01 / s));
             self.clamp_pan();
-            self.needs_update = true;
+            self.resize_state.mark_dirty();
         }
     }
 
     /// Jumps forward to the next predefined zoom step.
     pub fn jump_zoom_in(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let fit_scale = self.get_fit_scale();
@@ -317,12 +316,12 @@ impl App {
         }
 
         self.clamp_pan();
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Jumps backward to the previous predefined zoom step.
     pub fn jump_zoom_out(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let fit_scale = self.get_fit_scale();
@@ -384,30 +383,30 @@ impl App {
         }
 
         self.clamp_pan();
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Sets the zoom factor to actual size (1:1 image pixels to screen pixels).
     pub fn set_actual_size(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let s = self.get_fit_scale();
         if s > 0.0 {
             self.zoom_factor = ZoomFactor::new(1.0 / s);
             self.clamp_pan();
-            self.needs_update = true;
-            self.clear_on_protocol_receive = true;
+            self.resize_state.mark_dirty();
+            self.screen_clear.defer_until_protocol();
         }
     }
 
     /// Resets the zoom factor and pan offset back to the current scale mode settings.
     pub fn reset_view(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         self.apply_scale_mode();
-        self.clear_on_protocol_receive = true;
+        self.screen_clear.defer_until_protocol();
     }
 
     /// Resets brightness, contrast, and rotation adjustments back to zero defaults.
@@ -457,13 +456,13 @@ impl App {
                 }
             });
             self.pan_offset = PanOffset::ZERO;
-            self.needs_update = true;
+            self.resize_state.mark_dirty();
         }
     }
 
     /// Cycles through the ScaleModes (None -> Shrink -> Full -> Crop).
     pub fn cycle_scale_mode(&mut self) {
-        if self.is_loading {
+        if self.is_loading() {
             return;
         }
         self.scale_mode = match self.scale_mode {
@@ -477,7 +476,7 @@ impl App {
 
     /// Increments the brightness of the current image.
     pub fn increase_brightness(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let idx = self.queue.current_index;
@@ -485,14 +484,14 @@ impl App {
             let old = adj.brightness;
             adj.brightness.adjust(10);
             if old != adj.brightness {
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
         }
     }
 
     /// Decrements the brightness of the current image.
     pub fn decrease_brightness(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let idx = self.queue.current_index;
@@ -500,14 +499,14 @@ impl App {
             let old = adj.brightness;
             adj.brightness.adjust(-10);
             if old != adj.brightness {
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
         }
     }
 
     /// Increments the contrast of the current image.
     pub fn increase_contrast(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let idx = self.queue.current_index;
@@ -515,14 +514,14 @@ impl App {
             let mut next = adj.contrast;
             next.adjust(10.0);
             if adj.contrast.update(next.value()) {
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
         }
     }
 
     /// Decrements the contrast of the current image.
     pub fn decrease_contrast(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let idx = self.queue.current_index;
@@ -530,7 +529,7 @@ impl App {
             let mut next = adj.contrast;
             next.adjust(-10.0);
             if adj.contrast.update(next.value()) {
-                self.needs_update = true;
+                self.resize_state.mark_dirty();
             }
         }
     }
@@ -545,46 +544,46 @@ impl App {
 
     /// Pans the image viewport to the left.
     pub fn pan_left(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let step = self.pan_step_x();
         self.pan_offset.x = self.pan_offset.x.saturating_sub(step);
         self.clamp_pan();
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Pans the image viewport to the right.
     pub fn pan_right(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let step = self.pan_step_x();
         self.pan_offset.x = self.pan_offset.x.saturating_add(step);
         self.clamp_pan();
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Pans the image viewport upwards.
     pub fn pan_up(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let step = self.pan_step_y();
         self.pan_offset.y = self.pan_offset.y.saturating_sub(step);
         self.clamp_pan();
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Pans the image viewport downwards.
     pub fn pan_down(&mut self) {
-        if self.original_image.is_none() || self.is_loading {
+        if self.original_image.is_none() || self.is_loading() {
             return;
         }
         let step = self.pan_step_y();
         self.pan_offset.y = self.pan_offset.y.saturating_add(step);
         self.clamp_pan();
-        self.needs_update = true;
+        self.resize_state.mark_dirty();
     }
 
     /// Calculates the horizontal panning step delta based on viewport cell width and zoom level.
@@ -653,7 +652,7 @@ impl App {
 
     /// Rotates the image clockwise by 90 degrees.
     pub fn rotate_clockwise(&mut self) {
-        if self.is_loading {
+        if self.is_loading() {
             return;
         }
         if let Some(img) = self.original_image.take() {
@@ -673,14 +672,14 @@ impl App {
 
             self.zoom_factor = ZoomFactor::DEFAULT;
             self.pan_offset = PanOffset::ZERO;
-            self.needs_update = true;
-            self.clear_on_protocol_receive = true;
+            self.resize_state.mark_dirty();
+            self.screen_clear.defer_until_protocol();
         }
     }
 
     /// Rotates the image counter-clockwise by 90 degrees.
     pub fn rotate_counter_clockwise(&mut self) {
-        if self.is_loading {
+        if self.is_loading() {
             return;
         }
         if let Some(img) = self.original_image.take() {
@@ -700,8 +699,8 @@ impl App {
 
             self.zoom_factor = ZoomFactor::DEFAULT;
             self.pan_offset = PanOffset::ZERO;
-            self.needs_update = true;
-            self.clear_on_protocol_receive = true;
+            self.resize_state.mark_dirty();
+            self.screen_clear.defer_until_protocol();
         }
     }
 }

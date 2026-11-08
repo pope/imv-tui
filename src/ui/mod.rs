@@ -173,13 +173,12 @@ mod tests {
         let mut app = setup_test_app();
         app.img_width = 800;
         app.img_height = 600;
-        app.is_loading = true;
         app.image_protocol = None;
         app.thumbnail_image = None;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         // 1. Loading started immediately (< 150ms debounce) -> "Loading Image..." must NOT be rendered
-        app.loading_start_time = Some(std::time::Instant::now());
+        app.initial_load = crate::app::InitialLoadState::start();
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let rendered_early = buffer_to_string(&terminal);
         assert!(
@@ -188,8 +187,9 @@ mod tests {
         );
 
         // 2. Loading exceeded 150ms (simulated 200ms ago) -> "Loading Image..." IS rendered
-        app.loading_start_time =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(200));
+        app.initial_load = crate::app::InitialLoadState::start_at(
+            std::time::Instant::now() - std::time::Duration::from_millis(200),
+        );
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let rendered_late = buffer_to_string(&terminal);
         assert!(

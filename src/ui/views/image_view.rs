@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(err_paragraph, area);
         }
         ImageDisplayState::Empty => {
-            if !app.is_loading {
+            if !app.is_loading() {
                 let loading_paragraph = Paragraph::new("No image loaded.")
                     .alignment(Alignment::Center)
                     .style(Style::default().fg(Color::Yellow));

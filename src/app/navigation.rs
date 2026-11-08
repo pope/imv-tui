@@ -66,8 +66,8 @@ impl App {
             self.active_sequence
                 .store(self.current_sequence as usize, Ordering::Release);
             self.set_error_state("No images match the current view filter");
-            self.needs_update = true;
-            self.needs_clear = true;
+            self.resize_state.mark_dirty();
+            self.screen_clear.request_now();
         }
     }
 
@@ -196,8 +196,8 @@ impl App {
         // Reload current image to apply adjustments immediately
         self.start_load_image();
 
-        self.needs_update = true;
-        self.needs_clear = true;
+        self.resize_state.mark_dirty();
+        self.screen_clear.request_now();
 
         Ok(())
     }
