@@ -26,7 +26,6 @@ description: Interactive input delegation, EditorAction translation, zero-alloca
 - `LineEditor::apply_action(&mut self, action: EditorAction) -> bool` executes the editing action:
   - Returns `true` when buffer content changed, triggering `update_palette_filter()` and resetting `palette_selected_index = 0`.
   - Returns `false` on cursor-only moves or no-ops, preserving the active filtered list and current selection.
-  - Test helper `LineEditor::handle_key_event` wraps `apply_action` into `EditorResult` (`ConsumedChanged`, `ConsumedNoChange`, `NotConsumed`).
 
 ### 2. Zero-Allocation UTF-8 Slice Safety
 

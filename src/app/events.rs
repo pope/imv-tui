@@ -310,4 +310,105 @@ mod tests {
         // Current index should remain 1, not cancelled target 0
         assert_eq!(app.queue.current_index, 1);
     }
+
+    #[test]
+    fn test_overlay_selection_navigation_and_confirm() {
+        // --- 1. PaletteMode::File ---
+        let mut app = setup_test_app();
+        app.queue.push(
+            crate::imaging::ImageSource::Local(std::path::PathBuf::from("img3.png")),
+            "img3.png".into(),
+            Classification::Unflagged,
+            Default::default(),
+        );
+        app.queue.push(
+            crate::imaging::ImageSource::Local(std::path::PathBuf::from("img4.png")),
+            "img4.png".into(),
+            Classification::Unflagged,
+            Default::default(),
+        );
+        app.open_palette(PaletteMode::File);
+        assert_eq!(app.palette_mode, PaletteMode::File);
+        assert_eq!(app.get_filtered_files().len(), 4);
+
+        // SelectNext increments index
+        assert_eq!(app.palette_selected_index, 0);
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectNext), 24);
+        assert_eq!(app.palette_selected_index, 1);
+
+        // SelectPrev decrements index
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPrev), 24);
+        assert_eq!(app.palette_selected_index, 0);
+
+        // SelectPrev saturates at 0
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPrev), 24);
+        assert_eq!(app.palette_selected_index, 0);
+
+        // SelectPageDown jumps forward
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPageDown), 24);
+        assert!(app.palette_selected_index > 0);
+
+        // SelectPageUp jumps back to 0
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPageUp), 24);
+        assert_eq!(app.palette_selected_index, 0);
+
+        // Move to index 1 and Confirm
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectNext), 24);
+        assert_eq!(app.palette_selected_index, 1);
+        let selected_file_idx = app.get_filtered_files()[1];
+        app.apply_action(InputAction::Overlay(OverlayAction::Confirm), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+        assert_eq!(app.queue.current_index, selected_file_idx);
+
+        // OverlayAction::Close closes the palette
+        app.open_palette(PaletteMode::File);
+        assert_eq!(app.palette_mode, PaletteMode::File);
+        app.apply_action(InputAction::Overlay(OverlayAction::Close), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+
+        // --- 2. PaletteMode::Command ---
+        app.open_palette(PaletteMode::Command);
+        assert_eq!(app.palette_mode, PaletteMode::Command);
+        let num_cmds = app.get_filtered_commands().len();
+        assert!(num_cmds > 10);
+
+        // Navigation
+        assert_eq!(app.palette_selected_index, 0);
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectNext), 24);
+        assert_eq!(app.palette_selected_index, 1);
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPrev), 24);
+        assert_eq!(app.palette_selected_index, 0);
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPageDown), 24);
+        assert!(app.palette_selected_index > 0);
+        app.apply_action(InputAction::Overlay(OverlayAction::SelectPageUp), 24);
+        assert_eq!(app.palette_selected_index, 0);
+
+        // Test non-prompt command confirm (e.g. NextImage)
+        let cmds = app.get_filtered_commands();
+        let all_cmds = crate::commands::get_commands();
+        let next_img_filtered_idx = cmds
+            .iter()
+            .position(|&idx| all_cmds[idx].cmd == Command::NextImage)
+            .unwrap();
+        app.palette_selected_index = next_img_filtered_idx;
+        let prev_queue_idx = app.queue.current_index;
+        app.apply_action(InputAction::Overlay(OverlayAction::Confirm), 24);
+        assert_eq!(app.palette_mode, PaletteMode::Closed);
+        assert_eq!(
+            app.queue.current_index,
+            (prev_queue_idx + 1) % app.queue.len()
+        );
+
+        // Test prompt-opening command confirm (e.g. GoToImage)
+        app.open_palette(PaletteMode::Command);
+        let cmds2 = app.get_filtered_commands();
+        let goto_idx = cmds2
+            .iter()
+            .position(|&idx| all_cmds[idx].cmd == Command::GoToImage)
+            .unwrap();
+        app.palette_selected_index = goto_idx;
+        app.apply_action(InputAction::Overlay(OverlayAction::Confirm), 24);
+        // PaletteMode should transition to Prompt(PromptType::GoToImage) and NOT close
+        assert_eq!(app.palette_mode, PaletteMode::Prompt(PromptType::GoToImage));
+    }
 }

@@ -1,17 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// The outcome of the LineEditor handling a key event.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditorResult {
-    /// The key was not handled by the editor (e.g., navigation, submit, cancel).
-    NotConsumed,
-    /// The key was handled, but the input value did not change (e.g., cursor movement).
-    ConsumedNoChange,
-    /// The key was handled, and the input value changed.
-    ConsumedChanged,
-}
-
 /// Pure editing or cursor navigation action for a `LineEditor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorAction {
@@ -109,20 +97,6 @@ pub struct LineEditor {
 }
 
 impl LineEditor {
-    #[cfg(test)]
-    /// Handles editing or cursor navigation key events.
-    pub fn handle_key_event(&mut self, key: &KeyEvent) -> EditorResult {
-        if let Some(action) = EditorAction::from_key_event(key) {
-            if self.apply_action(action) {
-                EditorResult::ConsumedChanged
-            } else {
-                EditorResult::ConsumedNoChange
-            }
-        } else {
-            EditorResult::NotConsumed
-        }
-    }
-
     /// Applies a pure editing action to the line editor buffer.
     ///
     /// Returns `true` if the buffer content changed, or `false` if only cursor moved or no-op.
@@ -488,9 +462,144 @@ mod tests {
 
     #[test]
     fn test_unconsumed_key_events() {
-        let mut le = LineEditor::new();
-        // Shift + Enter should bubble up
         let key = make_key(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(le.handle_key_event(&key), EditorResult::NotConsumed);
+        assert!(EditorAction::from_key_event(&key).is_none());
+    }
+
+    #[test]
+    fn test_editor_action_from_key_event_and_apply_action() {
+        // 1. InsertChar
+        let key_char = make_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            EditorAction::from_key_event(&key_char),
+            Some(EditorAction::InsertChar('x'))
+        );
+        let mut le = LineEditor::new();
+        assert!(le.apply_action(EditorAction::InsertChar('x')));
+        assert_eq!(le.value(), "x");
+        assert_eq!(le.cursor_char_idx(), 1);
+
+        // 2. MoveLeft (Left and Ctrl+B)
+        let key_left = make_key(KeyCode::Left, KeyModifiers::NONE);
+        let key_ctrl_b = make_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_left),
+            Some(EditorAction::MoveLeft)
+        );
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_b),
+            Some(EditorAction::MoveLeft)
+        );
+        assert!(!le.apply_action(EditorAction::MoveLeft));
+        assert_eq!(le.cursor_char_idx(), 0);
+
+        // 3. MoveRight (Right and Ctrl+F)
+        let key_right = make_key(KeyCode::Right, KeyModifiers::NONE);
+        let key_ctrl_f = make_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_right),
+            Some(EditorAction::MoveRight)
+        );
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_f),
+            Some(EditorAction::MoveRight)
+        );
+        assert!(!le.apply_action(EditorAction::MoveRight));
+        assert_eq!(le.cursor_char_idx(), 1);
+
+        // 4. MoveToStart (Home and Ctrl+A)
+        let key_home = make_key(KeyCode::Home, KeyModifiers::NONE);
+        let key_ctrl_a = make_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_home),
+            Some(EditorAction::MoveToStart)
+        );
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_a),
+            Some(EditorAction::MoveToStart)
+        );
+        assert!(!le.apply_action(EditorAction::MoveToStart));
+        assert_eq!(le.cursor_char_idx(), 0);
+
+        // 5. MoveToEnd (End and Ctrl+E)
+        let key_end = make_key(KeyCode::End, KeyModifiers::NONE);
+        let key_ctrl_e = make_key(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_end),
+            Some(EditorAction::MoveToEnd)
+        );
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_e),
+            Some(EditorAction::MoveToEnd)
+        );
+        assert!(!le.apply_action(EditorAction::MoveToEnd));
+        assert_eq!(le.cursor_char_idx(), 1);
+
+        // 6. DeleteChar (Delete and Ctrl+D)
+        let key_del = make_key(KeyCode::Delete, KeyModifiers::NONE);
+        let key_ctrl_d = make_key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_del),
+            Some(EditorAction::DeleteChar)
+        );
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_d),
+            Some(EditorAction::DeleteChar)
+        );
+        le.move_to_start();
+        assert!(le.apply_action(EditorAction::DeleteChar));
+        assert_eq!(le.value(), "");
+        assert_eq!(le.cursor_char_idx(), 0);
+
+        // 7. Backspace
+        let key_bs = make_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(
+            EditorAction::from_key_event(&key_bs),
+            Some(EditorAction::Backspace)
+        );
+        le.insert_char('y');
+        assert!(le.apply_action(EditorAction::Backspace));
+        assert_eq!(le.value(), "");
+        assert_eq!(le.cursor_char_idx(), 0);
+
+        // 8. DeleteWordBefore (Ctrl+W and Alt+Backspace)
+        let key_ctrl_w = make_key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let key_alt_bs = make_key(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_w),
+            Some(EditorAction::DeleteWordBefore)
+        );
+        assert_eq!(
+            EditorAction::from_key_event(&key_alt_bs),
+            Some(EditorAction::DeleteWordBefore)
+        );
+        for c in "foo bar".chars() {
+            le.insert_char(c);
+        }
+        assert!(le.apply_action(EditorAction::DeleteWordBefore));
+        assert_eq!(le.value(), "foo ");
+        assert_eq!(le.cursor_char_idx(), 4);
+
+        // 9. DeleteToEnd (Ctrl+K)
+        let key_ctrl_k = make_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_k),
+            Some(EditorAction::DeleteToEnd)
+        );
+        le.insert_char('z');
+        le.move_left();
+        assert!(le.apply_action(EditorAction::DeleteToEnd));
+        assert_eq!(le.value(), "foo ");
+        assert_eq!(le.cursor_char_idx(), 4);
+
+        // 10. DeleteToStart (Ctrl+U)
+        let key_ctrl_u = make_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(
+            EditorAction::from_key_event(&key_ctrl_u),
+            Some(EditorAction::DeleteToStart)
+        );
+        assert!(le.apply_action(EditorAction::DeleteToStart));
+        assert_eq!(le.value(), "");
+        assert_eq!(le.cursor_char_idx(), 0);
     }
 }
