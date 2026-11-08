@@ -1,186 +1,119 @@
 use super::PaletteMode;
 use crate::app::App;
-use crate::commands::Command;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+#[cfg(test)]
+use crate::commands::translate_event;
+use crate::commands::{InputAction, OverlayAction};
+#[cfg(test)]
+use crossterm::event::Event;
 
 impl App {
-    /// Handles a Crossterm input event (keyboard or mouse).
-    pub fn handle_event(&mut self, ev: Event, terminal_height: u16) {
-        if let (
-            PaletteMode::Info,
-            Event::Key(crossterm::event::KeyEvent {
-                code,
-                kind: KeyEventKind::Press,
-                ..
-            }),
-        ) = (self.palette_mode, &ev)
-        {
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.close_palette();
-                    return;
-                }
-                KeyCode::Char('d') => {
-                    if self
-                        .last_info_toggle
-                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(200))
-                    {
-                        self.close_palette();
-                        self.last_info_toggle = Some(std::time::Instant::now());
-                    }
-                    return;
-                }
-                _ => {}
+    /// Pure reducer executing a translated `InputAction`.
+    pub fn apply_action(&mut self, action: InputAction, terminal_height: u16) {
+        match action {
+            InputAction::Command(cmd) => {
+                self.execute_command(cmd);
             }
-        }
-
-        if self.palette_mode != PaletteMode::Closed && self.palette_mode != PaletteMode::Info {
-            if let Event::Key(key) = ev {
-                if key.kind != KeyEventKind::Press {
-                    return;
+            InputAction::Editor(edit) => {
+                if self.palette_query.apply_action(edit) {
+                    self.palette_selected_index = 0;
+                    self.update_palette_filter();
                 }
-
-                // Handle editor keys first
-                match self.palette_query.handle_key_event(&key) {
-                    super::line_editor::EditorResult::ConsumedChanged => {
-                        self.palette_selected_index = 0;
-                        self.update_palette_filter();
-                        return;
-                    }
-                    super::line_editor::EditorResult::ConsumedNoChange => {
-                        return;
-                    }
-                    super::line_editor::EditorResult::NotConsumed => {}
-                }
-
-                match key.code {
-                    KeyCode::Esc => {
+            }
+            InputAction::Overlay(overlay) => match overlay {
+                OverlayAction::Close => {
+                    if self.palette_mode == PaletteMode::Info {
+                        self.close_palette();
+                    } else {
                         self.close_palette();
                         self.resize_state.mark_dirty();
                     }
-                    KeyCode::Enter => match self.palette_mode {
-                        PaletteMode::File => {
-                            let files = self.get_filtered_files();
-                            if !files.is_empty() && self.palette_selected_index < files.len() {
-                                self.queue.current_index = files[self.palette_selected_index];
-                                self.start_load_image();
-                            }
+                }
+                OverlayAction::Confirm => match self.palette_mode {
+                    PaletteMode::File => {
+                        let files = self.get_filtered_files();
+                        if !files.is_empty() && self.palette_selected_index < files.len() {
+                            self.queue.current_index = files[self.palette_selected_index];
+                            self.start_load_image();
+                        }
+                        self.close_palette();
+                        self.resize_state.mark_dirty();
+                    }
+                    PaletteMode::Command => {
+                        let cmds = self.get_filtered_commands();
+                        if !cmds.is_empty() && self.palette_selected_index < cmds.len() {
+                            let cmd = crate::commands::get_commands()
+                                [cmds[self.palette_selected_index]]
+                                .cmd;
+                            self.execute_command(cmd);
+                        }
+                        if self.palette_mode == PaletteMode::Command {
                             self.close_palette();
                             self.resize_state.mark_dirty();
                         }
-                        PaletteMode::Command => {
-                            let cmds = self.get_filtered_commands();
-                            if !cmds.is_empty() && self.palette_selected_index < cmds.len() {
-                                let cmd = crate::commands::get_commands()
-                                    [cmds[self.palette_selected_index]]
-                                    .cmd;
-                                self.execute_command(cmd);
-                            }
-                            if self.palette_mode == PaletteMode::Command {
-                                self.close_palette();
-                                self.resize_state.mark_dirty();
-                            }
-                        }
-                        PaletteMode::Prompt(prompt_type) => {
-                            self.execute_prompt(prompt_type);
-                        }
-                        _ => {}
-                    },
-                    // List Navigation: Up / Ctrl+P
-                    KeyCode::Up | KeyCode::Char('p')
-                        if (key.code == KeyCode::Up
-                            || key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL))
-                            && self.palette_selected_index > 0 =>
-                    {
+                    }
+                    PaletteMode::Prompt(prompt_type) => {
+                        self.execute_prompt(prompt_type);
+                    }
+                    _ => {}
+                },
+                OverlayAction::SelectPrev => {
+                    if self.palette_selected_index > 0 {
                         self.palette_selected_index -= 1;
                     }
-                    // List Navigation: Down / Ctrl+N / Ctrl+J
-                    KeyCode::Down | KeyCode::Char('n') | KeyCode::Char('j')
-                        if key.code == KeyCode::Down
-                            || key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                    {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 && self.palette_selected_index < max_len - 1 {
-                            self.palette_selected_index += 1;
-                        }
+                }
+                OverlayAction::SelectNext => {
+                    let max_len = match self.palette_mode {
+                        PaletteMode::File => self.get_filtered_files().len(),
+                        PaletteMode::Command => self.get_filtered_commands().len(),
+                        _ => 0,
+                    };
+                    if max_len > 0 && self.palette_selected_index < max_len - 1 {
+                        self.palette_selected_index += 1;
                     }
-                    KeyCode::PageUp | KeyCode::Char('v')
-                        if key.code == KeyCode::PageUp
-                            || (key.code == KeyCode::Char('v')
-                                && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)) =>
-                    {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
+                }
+                OverlayAction::SelectPageUp => {
+                    let max_len = match self.palette_mode {
+                        PaletteMode::File => self.get_filtered_files().len(),
+                        PaletteMode::Command => self.get_filtered_commands().len(),
+                        _ => 0,
+                    };
+                    let page_size = super::palette::palette_page_size(terminal_height, max_len);
+
+                    self.palette_selected_index =
+                        self.palette_selected_index.saturating_sub(page_size);
+                }
+                OverlayAction::SelectPageDown => {
+                    let max_len = match self.palette_mode {
+                        PaletteMode::File => self.get_filtered_files().len(),
+                        PaletteMode::Command => self.get_filtered_commands().len(),
+                        _ => 0,
+                    };
+                    if max_len > 0 {
                         let page_size = super::palette::palette_page_size(terminal_height, max_len);
 
                         self.palette_selected_index =
-                            self.palette_selected_index.saturating_sub(page_size);
+                            (self.palette_selected_index + page_size).min(max_len - 1);
                     }
-                    KeyCode::PageDown | KeyCode::Char('v')
-                        if key.code == KeyCode::PageDown
-                            || (key.code == KeyCode::Char('v')
-                                && key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL)) =>
-                    {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 {
-                            let page_size =
-                                super::palette::palette_page_size(terminal_height, max_len);
-
-                            self.palette_selected_index =
-                                (self.palette_selected_index + page_size).min(max_len - 1);
-                        }
-                    }
-                    _ => {}
                 }
-            } else if let Event::Mouse(mouse_event) = ev {
-                match mouse_event.kind {
-                    crossterm::event::MouseEventKind::ScrollUp
-                        if self.palette_selected_index > 0 =>
-                    {
-                        self.palette_selected_index -= 1;
-                    }
-                    crossterm::event::MouseEventKind::ScrollDown => {
-                        let max_len = match self.palette_mode {
-                            PaletteMode::File => self.get_filtered_files().len(),
-                            PaletteMode::Command => self.get_filtered_commands().len(),
-                            _ => 0,
-                        };
-                        if max_len > 0 && self.palette_selected_index < max_len - 1 {
-                            self.palette_selected_index += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            if let Some(cmd) = Command::from_event(&ev) {
-                self.execute_command(cmd);
-            }
+            },
         }
     }
 
+    #[cfg(test)]
+    /// Handles a Crossterm input event (keyboard or mouse).
+    pub fn handle_event(&mut self, ev: Event, terminal_height: u16) {
+        if let Some(action) = translate_event(self.palette_mode, &ev) {
+            self.apply_action(action, terminal_height);
+        }
+    }
+
+    #[cfg(test)]
     /// Handles a Crossterm keyboard event.
     pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent, terminal_height: u16) {
         self.handle_event(Event::Key(key), terminal_height);
     }
 
+    #[cfg(test)]
     /// Handles a Crossterm mouse event.
     pub fn handle_mouse_event(
         &mut self,
@@ -197,6 +130,7 @@ mod tests {
     use crate::app::PromptType;
     use crate::app::classifications::Classification;
     use crate::app::setup_test_app;
+    use crate::commands::Command;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
     };

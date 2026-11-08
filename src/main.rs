@@ -257,12 +257,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     term_size.width = w;
                     term_size.height = h;
                 }
-                match ev {
-                    event::Event::Key(key) => app.handle_key_event(key, term_size.height),
-                    event::Event::Mouse(mouse) => {
-                        app.handle_mouse_event(mouse, term_size.height);
-                    }
-                    other => app.handle_event(other, term_size.height),
+                if let Some(action) = crate::commands::translate_event(app.palette_mode, &ev) {
+                    app.apply_action(action, term_size.height);
                 }
             }
             if events.capacity() > 64 {

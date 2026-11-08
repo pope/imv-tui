@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The outcome of the LineEditor handling a key event.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorResult {
     /// The key was not handled by the editor (e.g., navigation, submit, cancel).
@@ -11,6 +12,95 @@ pub enum EditorResult {
     ConsumedChanged,
 }
 
+/// Pure editing or cursor navigation action for a `LineEditor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorAction {
+    /// Move cursor one character to the left (`Left` or `Ctrl+B`).
+    MoveLeft,
+    /// Move cursor one character to the right (`Right` or `Ctrl+F`).
+    MoveRight,
+    /// Move cursor to the start of the line (`Home` or `Ctrl+A`).
+    MoveToStart,
+    /// Move cursor to the end of the line (`End` or `Ctrl+E`).
+    MoveToEnd,
+    /// Delete from cursor to the end of the line (`Ctrl+K`).
+    DeleteToEnd,
+    /// Delete from cursor to the start of the line (`Ctrl+U`).
+    DeleteToStart,
+    /// Delete the word preceding the cursor (`Ctrl+W` or `Alt+Backspace`).
+    DeleteWordBefore,
+    /// Delete the character under the cursor (`Delete` or `Ctrl+D`).
+    DeleteChar,
+    /// Delete the character before the cursor (`Backspace`).
+    Backspace,
+    /// Insert a literal character at the cursor position.
+    InsertChar(char),
+}
+
+impl EditorAction {
+    /// Parses a key event into a pure editing action without modifying state.
+    pub fn from_key_event(key: &KeyEvent) -> Option<Self> {
+        match key.code {
+            // Left / Ctrl+B
+            KeyCode::Left | KeyCode::Char('b')
+                if key.code == KeyCode::Left || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(Self::MoveLeft)
+            }
+            // Right / Ctrl+F
+            KeyCode::Right | KeyCode::Char('f')
+                if key.code == KeyCode::Right || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(Self::MoveRight)
+            }
+            // Home / Ctrl+A
+            KeyCode::Home | KeyCode::Char('a')
+                if key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(Self::MoveToStart)
+            }
+            // End / Ctrl+E
+            KeyCode::End | KeyCode::Char('e')
+                if key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(Self::MoveToEnd)
+            }
+            // Ctrl+K (delete to end)
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Self::DeleteToEnd)
+            }
+            // Ctrl+U (delete to start)
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Self::DeleteToStart)
+            }
+            // Ctrl+W (delete word before)
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Self::DeleteWordBefore)
+            }
+            // Ctrl+D / Delete
+            KeyCode::Char('d') | KeyCode::Delete
+                if key.code == KeyCode::Delete || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(Self::DeleteChar)
+            }
+            // Alt+Backspace (delete word before)
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                Some(Self::DeleteWordBefore)
+            }
+            // Backspace (delete char before)
+            KeyCode::Backspace => Some(Self::Backspace),
+            // Literal characters
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Some(Self::InsertChar(c))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A simple, cursor-aware line editing buffer.
 #[derive(Debug, Clone, Default)]
 pub struct LineEditor {
@@ -19,96 +109,50 @@ pub struct LineEditor {
 }
 
 impl LineEditor {
+    #[cfg(test)]
     /// Handles editing or cursor navigation key events.
     pub fn handle_key_event(&mut self, key: &KeyEvent) -> EditorResult {
-        match key.code {
-            // Left / Ctrl+B
-            KeyCode::Left | KeyCode::Char('b')
-                if key.code == KeyCode::Left || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.move_left();
-                EditorResult::ConsumedNoChange
-            }
-            // Right / Ctrl+F
-            KeyCode::Right | KeyCode::Char('f')
-                if key.code == KeyCode::Right || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.move_right();
-                EditorResult::ConsumedNoChange
-            }
-            // Home / Ctrl+A
-            KeyCode::Home | KeyCode::Char('a')
-                if key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.move_to_start();
-                EditorResult::ConsumedNoChange
-            }
-            // End / Ctrl+E
-            KeyCode::End | KeyCode::Char('e')
-                if key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.move_to_end();
-                EditorResult::ConsumedNoChange
-            }
-            // Ctrl+K (delete to end)
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.delete_to_end() {
-                    EditorResult::ConsumedChanged
-                } else {
-                    EditorResult::ConsumedNoChange
-                }
-            }
-            // Ctrl+U (delete to start)
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.delete_to_start() {
-                    EditorResult::ConsumedChanged
-                } else {
-                    EditorResult::ConsumedNoChange
-                }
-            }
-            // Ctrl+W (delete word before)
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.delete_word_before() {
-                    EditorResult::ConsumedChanged
-                } else {
-                    EditorResult::ConsumedNoChange
-                }
-            }
-            // Ctrl+D / Delete
-            KeyCode::Char('d') | KeyCode::Delete
-                if key.code == KeyCode::Delete || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                if self.delete() {
-                    EditorResult::ConsumedChanged
-                } else {
-                    EditorResult::ConsumedNoChange
-                }
-            }
-            // Alt+Backspace (delete word before)
-            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
-                if self.delete_word_before() {
-                    EditorResult::ConsumedChanged
-                } else {
-                    EditorResult::ConsumedNoChange
-                }
-            }
-            // Backspace (delete char before)
-            KeyCode::Backspace => {
-                if self.backspace() {
-                    EditorResult::ConsumedChanged
-                } else {
-                    EditorResult::ConsumedNoChange
-                }
-            }
-            // Literal characters
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.insert_char(c);
+        if let Some(action) = EditorAction::from_key_event(key) {
+            if self.apply_action(action) {
                 EditorResult::ConsumedChanged
+            } else {
+                EditorResult::ConsumedNoChange
             }
-            _ => EditorResult::NotConsumed,
+        } else {
+            EditorResult::NotConsumed
+        }
+    }
+
+    /// Applies a pure editing action to the line editor buffer.
+    ///
+    /// Returns `true` if the buffer content changed, or `false` if only cursor moved or no-op.
+    pub fn apply_action(&mut self, action: EditorAction) -> bool {
+        match action {
+            EditorAction::MoveLeft => {
+                self.move_left();
+                false
+            }
+            EditorAction::MoveRight => {
+                self.move_right();
+                false
+            }
+            EditorAction::MoveToStart => {
+                self.move_to_start();
+                false
+            }
+            EditorAction::MoveToEnd => {
+                self.move_to_end();
+                false
+            }
+            EditorAction::DeleteToEnd => self.delete_to_end(),
+            EditorAction::DeleteToStart => self.delete_to_start(),
+            EditorAction::DeleteWordBefore => self.delete_word_before(),
+            EditorAction::DeleteChar => self.delete(),
+            EditorAction::Backspace => self.backspace(),
+            EditorAction::InsertChar(c) => {
+                self.insert_char(c);
+                true
+            }
         }
     }
 
@@ -447,6 +491,9 @@ mod tests {
         let mut le = LineEditor::new();
         // Shift + Enter should bubble up
         let key = make_key(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(le.handle_key_event(&key), EditorResult::NotConsumed);
+        assert_eq!(
+            le.handle_key_event(&key),
+            crate::commands::EditorResult::NotConsumed
+        );
     }
 }

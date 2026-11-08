@@ -7,7 +7,16 @@ use strum::IntoEnumIterator;
 /// Commands registry for matching descriptions and shortcut keys.
 pub mod registry;
 
+/// Semantic input actions and event translation logic.
+pub mod actions;
+/// Cursor-aware line editing buffer and actions.
+pub mod line_editor;
+
 pub use crate::config::keys::KeyDef;
+pub use actions::{InputAction, OverlayAction, PaletteMode, PromptType, translate_event};
+#[cfg(test)]
+pub use line_editor::EditorResult;
+pub use line_editor::{EditorAction, LineEditor};
 pub use registry::get_commands;
 
 /// User-facing metadata for a Command.

@@ -1,35 +1,8 @@
 use crate::commands::get_commands;
+pub use crate::commands::{PaletteMode, PromptType};
 
 /// Maximum retained capacity for idle palette scratch and filter buffers.
 pub const MAX_IDLE_PALETTE_CAPACITY: usize = 1024;
-
-/// The specific input prompt type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptType {
-    /// Go to specific image index.
-    GoToImage,
-    /// Adjust image brightness.
-    SetBrightness,
-    /// Adjust image contrast.
-    SetContrast,
-    /// Adjust slideshow interval.
-    SetSlideshow,
-}
-
-/// The state of the top overlay search palette or prompt dialog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaletteMode {
-    /// Palette/prompt overlay is closed.
-    Closed,
-    /// Searchable commands lookup.
-    Command,
-    /// Fuzzy search files in local queue.
-    File,
-    /// Prompt value input box is open with the given prompt type.
-    Prompt(PromptType),
-    /// Image metadata and statistics dialog is open.
-    Info,
-}
 
 /// Filters files matching an optional query string using nucleo fuzzy search and a visibility predicate.
 pub fn filter_files(

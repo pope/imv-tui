@@ -2,7 +2,7 @@ pub mod adjustments;
 pub mod cache;
 pub mod classifications;
 pub mod events;
-pub mod line_editor;
+pub use crate::commands::LineEditor;
 pub mod palette;
 pub mod queue;
 
@@ -514,7 +514,7 @@ pub struct App {
     /// The active overlay panel state.
     pub palette_mode: PaletteMode,
     /// Input buffer for fuzzy queries or prompt values.
-    pub palette_query: line_editor::LineEditor,
+    pub palette_query: LineEditor,
     /// Selected row inside the fuzzy matcher list.
     pub palette_selected_index: usize,
     /// Freezed layout width of the popup dialogue.
@@ -936,7 +936,7 @@ impl App {
             rendered_size_cells: (0, 0),
             current_zoom_pct: 100.0,
             palette_mode: PaletteMode::Closed,
-            palette_query: line_editor::LineEditor::new(),
+            palette_query: LineEditor::new(),
             palette_selected_index: 0,
             palette_width: 0,
             palette_height: 0,
