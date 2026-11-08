@@ -109,6 +109,7 @@ impl App {
                 self.zoom_factor = ZoomFactor::DEFAULT;
                 self.pan_offset = PanOffset::ZERO;
                 self.is_loading = false;
+                self.frame_ready_pending = false;
                 self.needs_update = true;
                 self.zoom_needs_initialization = true;
 
@@ -179,6 +180,7 @@ impl App {
         self.stats.load_duration = None;
         self.image_protocol = None;
         self.is_loading = true;
+        self.frame_ready_pending = true;
         self.loading_start_time = Some(Instant::now());
         self.current_sequence += 1;
         self.active_sequence
@@ -414,6 +416,14 @@ impl App {
             || self.load_phase.is_pending()
     }
 
+    /// Returns true if a renderable protocol is ready (or no load is active) and no layout/resize work is pending.
+    #[inline]
+    pub fn is_frame_ready(&self) -> bool {
+        (!self.is_loading || self.image_protocol.is_some())
+            && !self.resize_in_flight
+            && !self.needs_update
+    }
+
     /// Pumps background worker channels and layout updates for up to `budget` while waiting
     /// for an initial thumbnail/image protocol or in-flight resize to complete on Frame 1.
     pub fn wait_for_frame_ready(
@@ -422,7 +432,11 @@ impl App {
         term_height: u16,
         budget: std::time::Duration,
     ) -> bool {
-        if !self.is_loading && !self.resize_in_flight && !self.needs_update {
+        let should_wait = (self.frame_ready_pending && !self.is_frame_ready())
+            || self.resize_in_flight
+            || self.needs_update;
+        self.frame_ready_pending = false;
+        if !should_wait {
             return false;
         }
         let start = Instant::now();
@@ -432,7 +446,7 @@ impl App {
                 updated = true;
             }
             self.update_layout(term_width, term_height);
-            if !self.is_loading && !self.resize_in_flight && !self.needs_update {
+            if self.is_frame_ready() {
                 break;
             }
             if start.elapsed() >= budget {
@@ -441,6 +455,28 @@ impl App {
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         updated
+    }
+
+    /// Updates the slideshow transition timer by `delta` and advances to the next image when due.
+    /// Returns `true` if a slideshow transition occurred.
+    pub fn tick_slideshow(&mut self, delta: std::time::Duration) -> bool {
+        if self.slideshow_state.is_active()
+            && (self.palette_mode != PaletteMode::Closed || self.slideshow_state.is_paused())
+        {
+            self.slideshow_last_transition += delta;
+        }
+
+        if self.slideshow_state.is_playing()
+            && !self.is_loading
+            && self.palette_mode == PaletteMode::Closed
+            && self.slideshow_last_transition.elapsed()
+                >= std::time::Duration::from_secs(self.slideshow_state.seconds() as u64)
+        {
+            self.next_image();
+            self.slideshow_last_transition = Instant::now();
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]

@@ -20,7 +20,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
 
-use crate::app::{App, Classification, PaletteMode};
+use crate::app::{App, Classification, ImageDisplayState};
 use crate::config::cli::{parse_cli_args, read_piped_stdin, reopen_tty_stdin};
 use crate::imaging::{ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory};
 use crate::ui::ui;
@@ -179,7 +179,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut draw_needed = true;
-    let mut wait_for_frame = true;
+    let mut was_showing_spinner = false;
     let mut last_loop_tick = std::time::Instant::now();
     let mut events = Vec::with_capacity(16);
 
@@ -189,10 +189,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let delta = now.duration_since(last_loop_tick);
         last_loop_tick = now;
 
-        if app.slideshow_state.is_active()
-            && (app.palette_mode != PaletteMode::Closed || app.slideshow_state.is_paused())
-        {
-            app.slideshow_last_transition += delta;
+        if app.tick_slideshow(delta) {
+            draw_needed = true;
         }
 
         if app.update_channels() {
@@ -200,19 +198,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         app.tick();
 
-        // Automatic slideshow transition
-        if app.slideshow_state.is_playing()
-            && !app.is_loading
-            && app.palette_mode == PaletteMode::Closed
-            && app.slideshow_last_transition.elapsed()
-                >= std::time::Duration::from_secs(app.slideshow_state.seconds() as u64)
-        {
-            app.next_image();
-            app.slideshow_last_transition = std::time::Instant::now();
-            draw_needed = true;
-        }
-
-        let term_size = terminal.size().unwrap_or_default();
+        let mut term_size = terminal.size().unwrap_or_default();
         let (widget_w, widget_h) = app.get_viewport_size(term_size.width, term_size.height);
         if app.last_widget_size != (widget_w, widget_h) {
             draw_needed = true;
@@ -220,22 +206,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         app.update_layout(term_size.width, term_size.height);
 
-        if (wait_for_frame || app.resize_in_flight)
-            && app.wait_for_frame_ready(
-                term_size.width,
-                term_size.height,
-                Duration::from_millis(12),
-            )
-        {
+        if app.wait_for_frame_ready(term_size.width, term_size.height, Duration::from_millis(12)) {
             draw_needed = true;
         }
-        wait_for_frame = false;
 
         if app.needs_clear {
             app.needs_clear = false;
             if app.should_clear_on_update() {
                 terminal.clear()?;
             }
+            draw_needed = true;
+        }
+
+        let showing_spinner = matches!(app.display_state(), ImageDisplayState::LoadingSpinner);
+        if showing_spinner != was_showing_spinner {
+            was_showing_spinner = showing_spinner;
             draw_needed = true;
         }
 
@@ -256,7 +241,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 events.push(event::read()?);
             }
 
-            let term_size = terminal.size().unwrap_or_default();
             // Only redraw on actual user inputs or window changes. Non-user events (like Kitty/Sixel
             // graphics query response escape sequences written to stdin) are processed but ignored
             // for redrawing to prevent infinite drawing feedback loops and high CPU usage.
@@ -269,6 +253,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         | event::Event::Mouse(_)
                         | event::Event::Paste(_)
                 );
+                if let event::Event::Resize(w, h) = ev {
+                    term_size.width = w;
+                    term_size.height = h;
+                }
                 match ev {
                     event::Event::Key(key) => app.handle_key_event(key, term_size.height),
                     event::Event::Mouse(mouse) => {
@@ -282,7 +270,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if meaningful {
                 draw_needed = true;
-                wait_for_frame = true;
             }
         }
     }

@@ -244,6 +244,8 @@ pub struct App {
     pub needs_update: bool,
     /// Tracks whether a resize request for `current_sequence` is currently in flight on the worker thread.
     pub resize_in_flight: bool,
+    /// Flag tracking whether an initial frame-ready barrier wait is pending for the active image load.
+    pub frame_ready_pending: bool,
     /// Lifecycle state of background loading for the currently selected image.
     pub load_phase: LoadPhase,
     /// Triggers a visual clearing of the terminal screen, gated on `should_clear_on_update()` (e.g. Sixel).
@@ -689,6 +691,7 @@ impl App {
             last_widget_size: (0, 0),
             needs_update: true,
             resize_in_flight: false,
+            frame_ready_pending: false,
             load_phase: LoadPhase::Complete,
             needs_clear: true,
             rendered_size_cells: (0, 0),
@@ -789,6 +792,7 @@ impl App {
     pub fn set_error_state(&mut self, msg: impl Into<String>) {
         self.error_message = Some(msg.into());
         self.is_loading = false;
+        self.frame_ready_pending = false;
         self.loading_start_time = None;
         self.original_image = None;
         self.thumbnail_image = None;
