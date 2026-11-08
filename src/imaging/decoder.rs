@@ -27,7 +27,6 @@ impl<'a> CancellationToken<'a> {
     }
 
     /// Creates a new active cancellation token backed by a borrowed boolean flag.
-    #[cfg(test)]
     #[inline]
     pub const fn from_flag(flag: &'a AtomicBool) -> Self {
         Self {
@@ -197,6 +196,44 @@ pub fn collect_sources(paths: &[PathBuf], check_magic: bool) -> Result<Vec<Image
     Ok(sources)
 }
 
+/// Filters candidate file paths down to valid image files, using scoped worker threads
+/// when `check_magic` is enabled on large candidate sets (`>= 64` files).
+pub fn filter_image_candidates(candidates: Vec<PathBuf>, check_magic: bool) -> Vec<PathBuf> {
+    if !check_magic || candidates.len() < 64 {
+        return candidates
+            .into_iter()
+            .filter(|p| is_image_file(p, check_magic))
+            .collect();
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4);
+    let chunk_size = candidates.len().div_ceil(workers);
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for chunk in candidates.chunks(chunk_size) {
+            let handle = s.spawn(move || {
+                chunk
+                    .iter()
+                    .filter(|p| is_image_file(p, check_magic))
+                    .cloned()
+                    .collect::<Vec<PathBuf>>()
+            });
+            handles.push(handle);
+        }
+
+        let mut filtered = Vec::with_capacity(candidates.len());
+        for handle in handles {
+            if let Ok(chunk_result) = handle.join() {
+                filtered.extend(chunk_result);
+            }
+        }
+        filtered
+    })
+}
+
 /// Scans the directory surrounding the initial path, returns sorted paths of
 /// supported images along with the index pointing to the initial file.
 pub fn scan_directory(
@@ -222,7 +259,7 @@ pub fn scan_directory(
         }
     };
 
-    let mut images = Vec::new();
+    let mut candidates = Vec::new();
     let mut visited_files = std::collections::HashSet::new();
 
     if recursive {
@@ -247,14 +284,12 @@ pub fn scan_directory(
                     let path = entry.path();
                     if path.is_dir() {
                         stack.push((path, depth + 1));
-                    } else if is_image_file(&path, check_magic) {
-                        if let Ok(canonical) = path.canonicalize() {
-                            if visited_files.insert(canonical) {
-                                images.push(path);
-                            }
-                        } else {
-                            images.push(path);
+                    } else if let Ok(canonical) = path.canonicalize() {
+                        if visited_files.insert(canonical) {
+                            candidates.push(path);
                         }
+                    } else {
+                        candidates.push(path);
                     }
                 }
             }
@@ -262,18 +297,19 @@ pub fn scan_directory(
     } else if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_image_file(&path, check_magic) {
+            if !path.is_dir() {
                 if let Ok(canonical) = path.canonicalize() {
                     if visited_files.insert(canonical) {
-                        images.push(path);
+                        candidates.push(path);
                     }
                 } else {
-                    images.push(path);
+                    candidates.push(path);
                 }
             }
         }
     }
 
+    let mut images = filter_image_candidates(candidates, check_magic);
     images.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     let index = if let Some(ref target_name) = file_name {
@@ -2078,5 +2114,58 @@ mod tests {
             .expect("normal load must succeed");
         assert_eq!(thumb_norm.width(), 64);
         assert_eq!(thumb_norm.height(), 48);
+    }
+
+    #[test]
+    fn test_filter_image_candidates_parallel_magic() {
+        let test_dir = PathBuf::from("target/tmp/filter_candidates_test");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+
+        // Create 80 files: 40 valid images, 40 non-images
+        let mut candidates = Vec::with_capacity(80);
+        let sample_png = {
+            let img = image::RgbImage::new(2, 2);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+
+        for i in 0..80 {
+            let p = if i % 2 == 0 {
+                // Image file
+                let path = test_dir.join(format!("file_{:03}.png", i));
+                fs::write(&path, &sample_png).unwrap();
+                path
+            } else {
+                // Non-image file (plain text)
+                let path = test_dir.join(format!("file_{:03}.txt", i));
+                fs::write(&path, b"hello world not an image").unwrap();
+                path
+            };
+            candidates.push(p);
+        }
+
+        // Test with check_magic = false (extension based)
+        let filtered_ext = filter_image_candidates(candidates.clone(), false);
+        // Only .png files should pass (40 files)
+        assert_eq!(filtered_ext.len(), 40);
+
+        // Test with check_magic = true (magic-bytes based, >= 64 triggers parallel path)
+        let filtered_magic = filter_image_candidates(candidates.clone(), true);
+        assert_eq!(filtered_magic.len(), 40);
+
+        // Verify identical deterministic output and ordering
+        assert_eq!(filtered_ext, filtered_magic);
+
+        // Verify ordering matches original candidates slice order
+        for (idx, p) in filtered_magic.iter().enumerate() {
+            assert_eq!(
+                p.file_name().unwrap(),
+                format!("file_{:03}.png", idx * 2).as_str()
+            );
+        }
+
+        let _ = fs::remove_dir_all(&test_dir);
     }
 }

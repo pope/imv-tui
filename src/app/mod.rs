@@ -21,20 +21,18 @@ pub use classifications::{Classification, ViewMode};
 pub use palette::{PaletteMode, PromptType};
 pub use queue::ImageQueue;
 
-use fast_image_resize as fir;
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::commands::{Command, get_commands};
 use crate::imaging::{
-    Brightness, CancellationToken, Contrast, DecodedImage, FilterType, ImageSource, LoaderRequest,
-    LoaderResponse, PanOffset, RAW_EXIF_PROBE_LIMIT, ResizeRequest, ScaleMode, ThumbnailSource,
-    ViewportProtocol, ZoomFactor, orientation_swaps_dimensions, process_resize,
+    Brightness, Contrast, FilterType, ImageSource, LoaderRequest, LoaderResponse, PanOffset,
+    ResizeRequest, ScaleMode, ViewportProtocol, ZoomFactor,
 };
 
 /// Threshold below which navigation is considered fast scrolling (60ms).
@@ -330,16 +328,7 @@ impl ScrollCadence {
     }
 }
 
-/// A response payload sent by the resizing worker thread.
-pub struct ResizeResponse {
-    pub protocol: ViewportProtocol,
-    pub rendered_cells: (u16, u16),
-    pub process_duration: std::time::Duration,
-    pub protocol_duration: std::time::Duration,
-    pub target_width: u32,
-    pub target_height: u32,
-    pub sequence: u64,
-}
+pub use crate::imaging::ResizeResponse;
 
 /// Configuration parameters for app components.
 #[derive(Debug, Clone)]
@@ -517,305 +506,17 @@ impl App {
         let resize_active_seq = Arc::clone(&active_sequence);
         let active_seq = Arc::clone(&active_sequence);
 
-        // Spawn background resizing worker thread
-        std::thread::spawn(move || {
-            let mut resizer = fir::Resizer::new();
-            while let Ok(req) = resize_rx.recv() {
-                let mut latest_req = req;
-                while let Ok(next_req) = resize_rx.try_recv() {
-                    latest_req = next_req;
-                }
-                if (latest_req.sequence as usize) < resize_active_seq.load(Ordering::Acquire) {
-                    continue;
-                }
-                let rendered_cells = latest_req.rendered_size_cells;
-                let target_w = latest_req.target_w;
-                let target_h = latest_req.target_h;
-                let sequence = latest_req.sequence;
-                let (protocol, proc_dur, proto_dur) = process_resize(latest_req, &mut resizer);
-                if (sequence as usize) >= resize_active_seq.load(Ordering::Acquire) {
-                    let _ = protocol_tx.send(ResizeResponse {
-                        protocol,
-                        rendered_cells,
-                        process_duration: proc_dur,
-                        protocol_duration: proto_dur,
-                        target_width: target_w,
-                        target_height: target_h,
-                        sequence,
-                    });
-                }
-            }
-        });
+        crate::imaging::spawn_resize_worker(resize_rx, protocol_tx, resize_active_seq);
 
         let (loader_tx, loader_rx) = mpsc::channel::<LoaderRequest>();
         let (response_tx, response_rx) = mpsc::channel::<LoaderResponse>();
 
-        // Spawn persistent background loader thread
-        let disable_thumbnail = config.disable_thumbnail;
-        std::thread::spawn(move || {
-            let mut pending_requests = Vec::new();
-            let mut thumb_resizer = fir::Resizer::new();
-            let thumb_cache_root = crate::imaging::thumbcache::default_thumbnail_cache_root();
-            let mut requests: Vec<LoaderRequest> = Vec::with_capacity(16);
-            let mut current_requests: Vec<LoaderRequest> = Vec::with_capacity(16);
-            let mut new_reqs: Vec<LoaderRequest> = Vec::with_capacity(16);
-
-            loop {
-                // If we don't have any pending requests, block until we receive one
-                requests.clear();
-                if pending_requests.is_empty() {
-                    match loader_rx.recv() {
-                        Ok(req) => requests.push(req),
-                        Err(_) => break, // Channel disconnected, exit thread
-                    }
-                } else {
-                    requests.append(&mut pending_requests);
-                }
-
-                // Read any other immediately available requests
-                while let Ok(r) = loader_rx.try_recv() {
-                    requests.push(r);
-                }
-
-                // Find the highest sequence number
-                let highest_seq = requests.iter().map(|r| r.sequence).max().unwrap_or(0);
-
-                // Keep only requests matching the highest sequence
-                current_requests.clear();
-                current_requests.extend(requests.drain(..).filter(|r| r.sequence == highest_seq));
-
-                // Sort current_requests so that the active load (is_prefetch == false) is processed first
-                current_requests.sort_by_key(|r| r.mode.is_prefetch());
-
-                let mut aborted = false;
-                for r in current_requests.drain(..) {
-                    let cancel = CancellationToken::with_sequence(r.sequence as usize, &active_seq);
-                    if cancel.is_cancelled() {
-                        continue;
-                    }
-
-                    // Poll channel for newer sequence requests
-                    new_reqs.clear();
-                    while let Ok(nr) = loader_rx.try_recv() {
-                        new_reqs.push(nr);
-                    }
-                    if !new_reqs.is_empty() {
-                        let new_max_seq = new_reqs.iter().map(|nr| nr.sequence).max().unwrap_or(0);
-                        if new_max_seq > highest_seq {
-                            // Abort current sequence processing
-                            pending_requests.append(&mut new_reqs);
-                            aborted = true;
-                            break;
-                        }
-                    }
-
-                    if cancel.is_cancelled() {
-                        continue;
-                    }
-
-                    let start = std::time::Instant::now();
-
-                    // Try to load limited bytes first and extract thumbnail if this is an active cold load
-                    let mut bytes_opt = None;
-                    let mut raw_header_opt = None;
-                    let is_raw = r.source.is_raw();
-                    let limit = if is_raw {
-                        RAW_EXIF_PROBE_LIMIT
-                    } else {
-                        256 * 1024
-                    };
-
-                    let local_path = match &r.source {
-                        ImageSource::Local(p) => Some(p.clone()),
-                        _ => None,
-                    };
-
-                    let mut has_thumbnail = false;
-
-                    if r.mode.should_extract_thumbnail(disable_thumbnail) {
-                        if cancel.is_cancelled() {
-                            continue;
-                        }
-                        let read_res = crate::imaging::read_source_bytes_limited(&r.source, limit);
-                        if let Ok(partial_bytes) = read_res {
-                            if cancel.is_cancelled() {
-                                continue;
-                            }
-                            if let Some((thumb_img, real_w, real_h)) =
-                                crate::imaging::decode_thumbnail_and_dimensions_for_mode(
-                                    &partial_bytes,
-                                    Some(&r.source),
-                                    r.mode.is_thumbnail_only(),
-                                )
-                                && !cancel.is_cancelled()
-                            {
-                                // Send thumbnail placeholder immediately
-                                let thumb_dur = start.elapsed();
-                                let _ = response_tx.send(LoaderResponse {
-                                    idx: r.idx,
-                                    result: Ok(DecodedImage {
-                                        image: thumb_img,
-                                        width: real_w,
-                                        height: real_h,
-                                        format: Some(image::ImageFormat::Jpeg),
-                                        disk_size: 0, // Filled in by final high-res response
-                                        raw_dimensions: Some((real_w, real_h)),
-                                    }),
-                                    is_prefetch: r.mode.is_prefetch(),
-                                    sequence: r.sequence,
-                                    decode_duration: thumb_dur,
-                                    thumbnail_source: Some(ThumbnailSource::Exif),
-                                });
-                                has_thumbnail = true;
-                            }
-                            if !is_raw && partial_bytes.len() < limit {
-                                // If the file was smaller than the limit, we have already loaded it fully
-                                bytes_opt = Some(partial_bytes);
-                            } else if is_raw {
-                                raw_header_opt = Some(partial_bytes);
-                            }
-                        }
-
-                        // If EXIF thumbnail was not found, check Freedesktop thumbnail cache
-                        if !has_thumbnail
-                            && !cancel.is_cancelled()
-                            && let Some(ref path) = local_path
-                            && let Some(ref cache_root) = thumb_cache_root
-                            && let Some(cached) =
-                                crate::imaging::thumbcache::load_cached_thumbnail_with_metadata(
-                                    cache_root, path,
-                                )
-                        {
-                            let (mut real_w, mut real_h) = if let Some(dims) = cached.source_dims {
-                                dims
-                            } else if is_raw && let Some(ref hb) = raw_header_opt {
-                                let probe = crate::imaging::probe_raw_header(hb, Some(&r.source));
-                                if let Some((w, h)) = probe.sensor_dims {
-                                    if orientation_swaps_dimensions(probe.orientation) {
-                                        (h, w)
-                                    } else {
-                                        (w, h)
-                                    }
-                                } else {
-                                    image::image_dimensions(path)
-                                        .unwrap_or((cached.image.width(), cached.image.height()))
-                                }
-                            } else {
-                                image::image_dimensions(path)
-                                    .unwrap_or((cached.image.width(), cached.image.height()))
-                            };
-                            if cached.image.width() != cached.image.height()
-                                && (real_w > real_h)
-                                    != (cached.image.width() > cached.image.height())
-                            {
-                                std::mem::swap(&mut real_w, &mut real_h);
-                            }
-                            let thumb_dur = start.elapsed();
-                            let _ = response_tx.send(LoaderResponse {
-                                idx: r.idx,
-                                result: Ok(DecodedImage {
-                                    image: cached.image,
-                                    width: real_w,
-                                    height: real_h,
-                                    format: Some(image::ImageFormat::Png),
-                                    disk_size: 0,
-                                    raw_dimensions: Some((real_w, real_h)),
-                                }),
-                                is_prefetch: r.mode.is_prefetch(),
-                                sequence: r.sequence,
-                                decode_duration: thumb_dur,
-                                thumbnail_source: Some(ThumbnailSource::XdgCache),
-                            });
-                            has_thumbnail = true;
-                        }
-                    }
-
-                    if r.mode.is_thumbnail_only() && has_thumbnail {
-                        continue;
-                    }
-
-                    if cancel.is_cancelled() {
-                        continue;
-                    }
-
-                    // Decode the full resolution image
-                    let decode_start = std::time::Instant::now();
-                    let read_result = if let Some(bytes) = bytes_opt {
-                        Ok(bytes)
-                    } else {
-                        crate::imaging::read_source_bytes_with_header(
-                            &r.source,
-                            raw_header_opt.as_deref(),
-                        )
-                    };
-
-                    if cancel.is_cancelled() {
-                        continue;
-                    }
-
-                    let res = match read_result {
-                        Ok(ref bytes) => {
-                            crate::imaging::decode_image_bytes_with_header_cancellable(
-                                bytes,
-                                &r.source,
-                                raw_header_opt.as_deref(),
-                                &cancel,
-                            )
-                        }
-                        Err(e) => Err(e),
-                    };
-                    let decode_duration = decode_start.elapsed();
-
-                    if !cancel.is_cancelled() {
-                        if let Ok(ref decoded) = res
-                            && !has_thumbnail
-                            && r.mode.should_extract_thumbnail(disable_thumbnail)
-                            && let Some(ref path) = local_path
-                            && let Some(ref cache_root) = thumb_cache_root
-                        {
-                            crate::imaging::thumbcache::save_cached_thumbnail_with_dims(
-                                cache_root,
-                                &mut thumb_resizer,
-                                path,
-                                &decoded.image,
-                                decoded
-                                    .raw_dimensions
-                                    .unwrap_or((decoded.width, decoded.height)),
-                            );
-                        }
-
-                        let _ = response_tx.send(LoaderResponse {
-                            idx: r.idx,
-                            result: res,
-                            is_prefetch: r.mode.is_prefetch(),
-                            sequence: r.sequence,
-                            decode_duration,
-                            thumbnail_source: None,
-                        });
-                    }
-                }
-
-                requests.clear();
-                if requests.capacity() > 64 {
-                    requests.shrink_to(16);
-                }
-                current_requests.clear();
-                if current_requests.capacity() > 64 {
-                    current_requests.shrink_to(16);
-                }
-                new_reqs.clear();
-                if new_reqs.capacity() > 64 {
-                    new_reqs.shrink_to(16);
-                }
-                if pending_requests.capacity() > 64 {
-                    pending_requests.shrink_to(16);
-                }
-
-                if aborted {
-                    continue;
-                }
-            }
-        });
+        crate::imaging::spawn_loader_pool(
+            loader_rx,
+            response_tx,
+            active_seq,
+            config.disable_thumbnail,
+        );
 
         let mut app = Self::with_channels(
             queue,

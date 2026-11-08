@@ -1,3 +1,4 @@
+use fast_image_resize as fir;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,77 @@ impl FilterType {
             FilterType::Mitchell => image::imageops::FilterType::CatmullRom,
             FilterType::Lanczos => image::imageops::FilterType::Lanczos3,
         }
+    }
+}
+
+/// Analytical single-sine Lanczos3 filter kernel.
+///
+/// Uses the triple-angle trigonometric identity $\sin(\pi x) = \sin(3\theta) = \sin(\theta)(3 - 4\sin^2\theta)$
+/// where $\theta = \frac{\pi}{3} x$, evaluating only a single sine call per tap instead of two while
+/// remaining mathematically identical to $\text{sinc}(x) \cdot \text{sinc}(x / 3.0)$.
+pub fn fast_lanczos3_kernel(x: f64) -> f64 {
+    if x.abs() < 1e-8 {
+        return 1.0;
+    }
+    if !(-3.0..3.0).contains(&x) {
+        return 0.0;
+    }
+    let theta = (std::f64::consts::PI / 3.0) * x;
+    let s = theta.sin();
+    let s2 = s * s;
+    (s2 * (3.0 - 4.0 * s2)) / (3.0 * theta * theta)
+}
+
+/// Division-free Horner polynomial Mitchell-Netravali ($B = 1/3, C = 1/3$) filter kernel.
+///
+/// Evaluates the cubic piecewise polynomial using Horner's method with compile-time reciprocal constants.
+pub fn fast_mitchell_kernel(mut x: f64) -> f64 {
+    x = x.abs();
+    if x < 1.0 {
+        ((7.0 / 6.0) * x - 2.0) * x * x + (8.0 / 9.0)
+    } else if x < 2.0 {
+        (((-7.0 / 18.0) * x + 2.0) * x - (10.0 / 3.0)) * x + (16.0 / 9.0)
+    } else {
+        0.0
+    }
+}
+
+/// Maps `FilterType` to `fir::ResizeAlg`, utilizing pure SIMD Convolution kernels
+/// with analytical formulations for Mitchell and Lanczos.
+pub fn to_fir_resize_alg(filter_type: FilterType) -> fir::ResizeAlg {
+    match filter_type {
+        FilterType::Nearest => fir::ResizeAlg::Nearest,
+        FilterType::Box => fir::ResizeAlg::Convolution(fir::FilterType::Box),
+        FilterType::Linear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
+        FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
+            fir::Filter::new("Mitchell", fast_mitchell_kernel, 2.0)
+                .expect("Valid custom Mitchell filter"),
+        )),
+        FilterType::Lanczos => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
+            fir::Filter::new("Lanczos3", fast_lanczos3_kernel, 3.0)
+                .expect("Valid custom Lanczos3 filter"),
+        )),
+    }
+}
+
+/// Maximum source or destination pixel count before `fir::Resizer` scratch memory is reset.
+/// Resizing images larger than this threshold (>16 MP) causes `Resizer` to allocate large
+/// internal scratch buffers; resetting back to a fresh instance releases this peak memory.
+pub const MAX_RESIZER_SCRATCH_PIXELS: u64 = 16_000_000;
+
+/// Resets a `fir::Resizer` instance back to `fir::Resizer::new()` if the processed dimensions
+/// exceeded `MAX_RESIZER_SCRATCH_PIXELS`.
+pub fn maybe_reclaim_resizer_scratch(
+    resizer: &mut fir::Resizer,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    let src_pixels = (src_w as u64) * (src_h as u64);
+    let dst_pixels = (dst_w as u64) * (dst_h as u64);
+    if src_pixels > MAX_RESIZER_SCRATCH_PIXELS || dst_pixels > MAX_RESIZER_SCRATCH_PIXELS {
+        *resizer = fir::Resizer::new();
     }
 }
 
@@ -594,7 +666,7 @@ impl LoaderMode {
     /// Returns true if the loader should attempt EXIF/XDG thumbnail extraction.
     #[inline]
     pub fn should_extract_thumbnail(self, disable_thumbnail: bool) -> bool {
-        !disable_thumbnail && !matches!(self, Self::FullOnly)
+        !disable_thumbnail && matches!(self, Self::ThumbnailAndFull | Self::ThumbnailOnly)
     }
 
     /// Returns true if the loader should stop after extracting a valid thumbnail.

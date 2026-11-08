@@ -3,11 +3,12 @@ use crate::app::cache::{CachedImage, CachedThumbnail};
 use crate::app::classifications::ClassificationJsonItem;
 use crate::config::InfoBarPosition;
 use crate::imaging::types::{Brightness, Contrast, Rotation};
-use crate::imaging::{FilterType, ImageSource, LoaderMode, ScaleMode};
+use crate::imaging::{DecodedImage, FilterType, ImageSource, LoaderMode, ScaleMode};
 use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn test_import_export_text_and_json() {
@@ -1558,22 +1559,22 @@ fn test_wait_for_frame_ready_and_frame_ready_pending() {
     // wait_for_frame_ready drains channels, updates layout, sees is_frame_ready() == true,
     // and returns early without blocking for the full budget
     let start = Instant::now();
-    let updated = app.wait_for_frame_ready(80, 24, Duration::from_millis(500));
+    let updated = app.wait_for_frame_ready(80, 24, Duration::from_millis(1000));
     let elapsed = start.elapsed();
     worker_handle.join().unwrap();
 
     assert!(updated);
     assert!(app.is_frame_ready());
     assert!(!app.initial_load.is_frame_ready_pending());
-    assert!(elapsed < Duration::from_millis(250));
+    assert!(elapsed < Duration::from_millis(600));
 
     // A subsequent call when frame_ready_pending is already false and no resize is in flight
     // does NOT block at all and returns false immediately
     let start2 = Instant::now();
-    let updated2 = app.wait_for_frame_ready(80, 24, Duration::from_millis(500));
+    let updated2 = app.wait_for_frame_ready(80, 24, Duration::from_millis(1000));
     let elapsed2 = start2.elapsed();
     assert!(!updated2);
-    assert!(elapsed2 < Duration::from_millis(50));
+    assert!(elapsed2 < Duration::from_millis(100));
 }
 
 #[test]

@@ -3,9 +3,26 @@
 use fast_image_resize as fir;
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
+use super::decoder::{
+    CancellationToken, decode_image_bytes_with_header_cancellable,
+    decode_thumbnail_and_dimensions_for_mode,
+};
 use super::kitty_shm::{KittyShmProtocol, ViewportProtocol};
+use super::raw::{
+    RAW_EXIF_PROBE_LIMIT, probe_raw_header, read_source_bytes_limited,
+    read_source_bytes_with_header,
+};
+use super::thumbcache::{
+    default_thumbnail_cache_root, load_cached_thumbnail_with_metadata,
+    save_cached_thumbnail_with_dims,
+};
 use super::types::*;
 
 /// A request payload sent to the resizing worker threads.
@@ -41,75 +58,632 @@ pub struct ResizeRequest {
     pub use_kitty_shm: bool,
 }
 
-/// Analytical single-sine Lanczos3 filter kernel.
-///
-/// Uses the triple-angle trigonometric identity $\sin(\pi x) = \sin(3\theta) = \sin(\theta)(3 - 4\sin^2\theta)$
-/// where $\theta = \frac{\pi}{3} x$, evaluating only a single sine call per tap instead of two while
-/// remaining mathematically identical to $\text{sinc}(x) \cdot \text{sinc}(x / 3.0)$.
-pub fn fast_lanczos3_kernel(x: f64) -> f64 {
-    if x.abs() < 1e-8 {
-        return 1.0;
-    }
-    if !(-3.0..3.0).contains(&x) {
-        return 0.0;
-    }
-    let theta = (std::f64::consts::PI / 3.0) * x;
-    let s = theta.sin();
-    let s2 = s * s;
-    (s2 * (3.0 - 4.0 * s2)) / (3.0 * theta * theta)
+/// A response payload sent by the resizing worker thread.
+pub struct ResizeResponse {
+    /// Rendered viewport protocol.
+    pub protocol: ViewportProtocol,
+    /// Terminal cells occupied by the rendered image `(columns, rows)`.
+    pub rendered_cells: (u16, u16),
+    /// Wall-clock time spent processing/cropping/resizing the image.
+    pub process_duration: std::time::Duration,
+    /// Wall-clock time spent creating the graphics protocol payload.
+    pub protocol_duration: std::time::Duration,
+    /// Target width in pixels.
+    pub target_width: u32,
+    /// Target height in pixels.
+    pub target_height: u32,
+    /// Generation sequence number.
+    pub sequence: u64,
 }
 
-/// Division-free Horner polynomial Mitchell-Netravali ($B = 1/3, C = 1/3$) filter kernel.
-///
-/// Evaluates the cubic piecewise polynomial using Horner's method with compile-time reciprocal constants.
-pub fn fast_mitchell_kernel(mut x: f64) -> f64 {
-    x = x.abs();
-    if x < 1.0 {
-        ((7.0 / 6.0) * x - 2.0) * x * x + (8.0 / 9.0)
-    } else if x < 2.0 {
-        (((-7.0 / 18.0) * x + 2.0) * x - (10.0 / 3.0)) * x + (16.0 / 9.0)
-    } else {
-        0.0
-    }
-}
+#[cfg(test)]
+pub use super::types::{fast_lanczos3_kernel, fast_mitchell_kernel};
+pub use super::types::{maybe_reclaim_resizer_scratch, to_fir_resize_alg};
 
-/// Maps `FilterType` to `fir::ResizeAlg`, utilizing pure SIMD Convolution kernels
-/// with analytical formulations for Mitchell and Lanczos.
-pub fn to_fir_resize_alg(filter_type: FilterType) -> fir::ResizeAlg {
-    match filter_type {
-        FilterType::Nearest => fir::ResizeAlg::Nearest,
-        FilterType::Box => fir::ResizeAlg::Convolution(fir::FilterType::Box),
-        FilterType::Linear => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
-        FilterType::Mitchell => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
-            fir::Filter::new("Mitchell", fast_mitchell_kernel, 2.0)
-                .expect("Valid custom Mitchell filter"),
-        )),
-        FilterType::Lanczos => fir::ResizeAlg::Convolution(fir::FilterType::Custom(
-            fir::Filter::new("Lanczos3", fast_lanczos3_kernel, 3.0)
-                .expect("Valid custom Lanczos3 filter"),
-        )),
-    }
-}
-
-/// Maximum source or destination pixel count before `fir::Resizer` scratch memory is reset.
-/// Resizing images larger than this threshold (>16 MP) causes `Resizer` to allocate large
-/// internal scratch buffers; resetting back to a fresh instance releases this peak memory.
-pub const MAX_RESIZER_SCRATCH_PIXELS: u64 = 16_000_000;
-
-/// Resets a `fir::Resizer` instance back to `fir::Resizer::new()` if the processed dimensions
-/// exceeded `MAX_RESIZER_SCRATCH_PIXELS`.
-pub fn maybe_reclaim_resizer_scratch(
-    resizer: &mut fir::Resizer,
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
+/// Spawns the persistent background viewport resizer worker thread.
+pub fn spawn_resize_worker(
+    resize_rx: Receiver<ResizeRequest>,
+    protocol_tx: Sender<ResizeResponse>,
+    resize_active_seq: Arc<AtomicUsize>,
 ) {
-    let src_pixels = (src_w as u64) * (src_h as u64);
-    let dst_pixels = (dst_w as u64) * (dst_h as u64);
-    if src_pixels > MAX_RESIZER_SCRATCH_PIXELS || dst_pixels > MAX_RESIZER_SCRATCH_PIXELS {
-        *resizer = fir::Resizer::new();
+    std::thread::spawn(move || {
+        let mut resizer = fir::Resizer::new();
+        while let Ok(req) = resize_rx.recv() {
+            let mut latest_req = req;
+            while let Ok(next_req) = resize_rx.try_recv() {
+                latest_req = next_req;
+            }
+            if (latest_req.sequence as usize) < resize_active_seq.load(Ordering::Acquire) {
+                continue;
+            }
+            let rendered_cells = latest_req.rendered_size_cells;
+            let target_w = latest_req.target_w;
+            let target_h = latest_req.target_h;
+            let sequence = latest_req.sequence;
+            let (protocol, proc_dur, proto_dur) = process_resize(latest_req, &mut resizer);
+            if (sequence as usize) >= resize_active_seq.load(Ordering::Acquire) {
+                let _ = protocol_tx.send(ResizeResponse {
+                    protocol,
+                    rendered_cells,
+                    process_duration: proc_dur,
+                    protocol_duration: proto_dur,
+                    target_width: target_w,
+                    target_height: target_h,
+                    sequence,
+                });
+            }
+        }
+    });
+}
+
+/// Maximum number of concurrent full-image decode worker threads in the loader pool.
+pub const MAX_DECODE_WORKERS: usize = 5;
+
+/// Returns the number of parallel full-image decode worker threads to spawn (`2..=5`).
+pub fn decode_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, MAX_DECODE_WORKERS))
+        .unwrap_or(2)
+}
+
+/// Internal pending decode job enqueued for parallel decode workers.
+struct DecodeJob {
+    idx: usize,
+    source: ImageSource,
+    mode: LoaderMode,
+    sequence: u64,
+    bytes_opt: Option<Vec<u8>>,
+    raw_header_opt: Option<Vec<u8>>,
+    local_path: Option<PathBuf>,
+    has_thumbnail: bool,
+}
+
+/// Represents an active decode job executing in a parallel worker slot.
+struct InFlightSlot {
+    idx: usize,
+    sequence: Arc<AtomicU64>,
+    mode: LoaderMode,
+    has_thumbnail: bool,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+/// Shared coordinator-worker synchronization state.
+struct DecodeQueueState {
+    pending: VecDeque<DecodeJob>,
+    in_flight: Vec<Option<InFlightSlot>>,
+    shutdown: bool,
+}
+
+/// Predicate checking if the next job in `pending` can be popped by an idle worker.
+///
+/// Ensures only 1 foreground decode executes at any given time so intermediate scroll steps
+/// coalesce in `pending` in 0ns, while reserving at least 1 idle worker for foreground execution
+/// by limiting active prefetch threads to `max_workers.saturating_sub(1).max(1)`.
+fn can_pop_job(state: &DecodeQueueState, max_workers: usize) -> bool {
+    let Some(front) = state.pending.front() else {
+        return false;
+    };
+    let any_foreground_in_flight = state
+        .in_flight
+        .iter()
+        .flatten()
+        .any(|slot| !slot.mode.is_prefetch());
+    if any_foreground_in_flight {
+        return false;
     }
+    if !front.mode.is_prefetch() {
+        true
+    } else {
+        let active_prefetches = state
+            .in_flight
+            .iter()
+            .flatten()
+            .filter(|slot| slot.mode.is_prefetch())
+            .count();
+        active_prefetches < max_workers.saturating_sub(1).max(1)
+    }
+}
+
+/// Spawns the 2-stage image loader pool: 1 fast-thumbnail coordinator thread and
+/// `decode_worker_count()` parallel full-resolution decode worker threads.
+pub fn spawn_loader_pool(
+    loader_rx: Receiver<LoaderRequest>,
+    response_tx: Sender<LoaderResponse>,
+    active_seq: Arc<AtomicUsize>,
+    disable_thumbnail: bool,
+) {
+    let num_workers = decode_worker_count();
+    let queue_state = Arc::new((
+        Mutex::new(DecodeQueueState {
+            pending: VecDeque::new(),
+            in_flight: (0..num_workers).map(|_| None).collect(),
+            shutdown: false,
+        }),
+        Condvar::new(),
+    ));
+
+    let thumb_cache_root = default_thumbnail_cache_root();
+
+    // Spawn Stage 2 parallel decode workers
+    for worker_id in 0..num_workers {
+        let queue_pair = Arc::clone(&queue_state);
+        let response_tx = response_tx.clone();
+        let active_seq = Arc::clone(&active_seq);
+        let thumb_cache_root = thumb_cache_root.clone();
+
+        std::thread::spawn(move || {
+            let mut thumb_resizer = fir::Resizer::new();
+            loop {
+                let (job, cancel_flag, slot_seq) = {
+                    let (lock, cvar) = &*queue_pair;
+                    let mut state = lock.lock().unwrap();
+                    while !can_pop_job(&state, num_workers) && !state.shutdown {
+                        state = cvar.wait(state).unwrap();
+                    }
+                    if state.shutdown && !can_pop_job(&state, num_workers) {
+                        break;
+                    }
+                    let job = state.pending.pop_front().unwrap();
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    let slot_seq = Arc::new(AtomicU64::new(job.sequence));
+                    state.in_flight[worker_id] = Some(InFlightSlot {
+                        idx: job.idx,
+                        sequence: Arc::clone(&slot_seq),
+                        mode: job.mode,
+                        has_thumbnail: job.has_thumbnail,
+                        cancel_flag: Arc::clone(&cancel_flag),
+                    });
+                    (job, cancel_flag, slot_seq)
+                };
+
+                let cancel = CancellationToken::from_flag(&cancel_flag);
+
+                let is_aborted = || {
+                    cancel.is_cancelled()
+                        || (slot_seq.load(Ordering::Acquire) as usize)
+                            < active_seq.load(Ordering::Acquire)
+                };
+
+                if is_aborted() {
+                    let (lock, cvar) = &*queue_pair;
+                    let mut state = lock.lock().unwrap();
+                    state.in_flight[worker_id] = None;
+                    if !state.pending.is_empty() && can_pop_job(&state, num_workers) {
+                        cvar.notify_all();
+                    }
+                    continue;
+                }
+
+                let decode_start = Instant::now();
+                let read_result = if let Some(bytes) = job.bytes_opt {
+                    Ok(bytes)
+                } else {
+                    read_source_bytes_with_header(&job.source, job.raw_header_opt.as_deref())
+                };
+
+                let res = if is_aborted() {
+                    Err("Cancelled".to_string())
+                } else {
+                    match read_result {
+                        Ok(ref bytes) => decode_image_bytes_with_header_cancellable(
+                            bytes,
+                            &job.source,
+                            job.raw_header_opt.as_deref(),
+                            &cancel,
+                        ),
+                        Err(e) => Err(e),
+                    }
+                };
+                let decode_duration = decode_start.elapsed();
+
+                let (final_seq, final_mode, has_thumbnail) = {
+                    let (lock, cvar) = &*queue_pair;
+                    let mut state = lock.lock().unwrap();
+                    let finished_slot = state.in_flight[worker_id].take();
+                    let final_seq = finished_slot
+                        .as_ref()
+                        .map(|s| s.sequence.load(Ordering::Acquire))
+                        .unwrap_or(job.sequence);
+                    let final_mode = finished_slot.as_ref().map(|s| s.mode).unwrap_or(job.mode);
+                    let has_thumb = finished_slot
+                        .as_ref()
+                        .map(|s| s.has_thumbnail)
+                        .unwrap_or(job.has_thumbnail);
+                    if !state.pending.is_empty() && can_pop_job(&state, num_workers) {
+                        cvar.notify_all();
+                    }
+                    (final_seq, final_mode, has_thumb)
+                };
+
+                let is_cancelled = cancel.is_cancelled()
+                    || (final_seq as usize) < active_seq.load(Ordering::Acquire);
+
+                if !is_cancelled {
+                    if let Ok(ref decoded) = res {
+                        if !has_thumbnail
+                            && !disable_thumbnail
+                            && let Some(ref path) = job.local_path
+                            && let Some(ref cache_root) = thumb_cache_root
+                        {
+                            save_cached_thumbnail_with_dims(
+                                cache_root,
+                                &mut thumb_resizer,
+                                path,
+                                &decoded.image,
+                                decoded
+                                    .raw_dimensions
+                                    .unwrap_or((decoded.width, decoded.height)),
+                            );
+                        }
+
+                        let _ = response_tx.send(LoaderResponse {
+                            idx: job.idx,
+                            result: res,
+                            is_prefetch: final_mode.is_prefetch(),
+                            sequence: final_seq,
+                            decode_duration,
+                            thumbnail_source: None,
+                        });
+                    } else if let Err(e) = res
+                        && e != "Cancelled"
+                    {
+                        let _ = response_tx.send(LoaderResponse {
+                            idx: job.idx,
+                            result: Err(e),
+                            is_prefetch: final_mode.is_prefetch(),
+                            sequence: final_seq,
+                            decode_duration,
+                            thumbnail_source: None,
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn Stage 1 fast-thumbnail coordinator thread
+    let queue_pair = queue_state;
+    std::thread::spawn(move || {
+        let mut pending_requests = Vec::new();
+        let mut requests: Vec<LoaderRequest> = Vec::with_capacity(16);
+        let mut current_requests: VecDeque<LoaderRequest> = VecDeque::with_capacity(16);
+        let mut new_reqs: Vec<LoaderRequest> = Vec::with_capacity(16);
+        let mut seen_indices = std::collections::HashSet::new();
+
+        loop {
+            requests.clear();
+            if pending_requests.is_empty() {
+                match loader_rx.recv() {
+                    Ok(req) => requests.push(req),
+                    Err(_) => {
+                        let (lock, cvar) = &*queue_pair;
+                        let mut state = lock.lock().unwrap();
+                        state.shutdown = true;
+                        for slot in state.in_flight.iter_mut().flatten() {
+                            slot.cancel_flag.store(true, Ordering::Release);
+                        }
+                        cvar.notify_all();
+                        break;
+                    }
+                }
+            } else {
+                requests.append(&mut pending_requests);
+            }
+
+            while let Ok(r) = loader_rx.try_recv() {
+                requests.push(r);
+            }
+
+            let highest_seq = requests.iter().map(|r| r.sequence).max().unwrap_or(0);
+            let mut matching: Vec<LoaderRequest> = requests
+                .drain(..)
+                .filter(|r| r.sequence == highest_seq)
+                .collect();
+            matching.sort_by_key(|r| r.mode.is_prefetch());
+            seen_indices.clear();
+            matching.retain(|r| seen_indices.insert(r.idx));
+            current_requests.clear();
+            current_requests.extend(matching);
+
+            // Reconcile DecodeQueueState with current_requests
+            {
+                let (lock, cvar) = &*queue_pair;
+                let mut state = lock.lock().unwrap();
+
+                let is_fast_scroll_batch =
+                    current_requests.iter().any(|r| r.mode.is_thumbnail_only());
+
+                for slot in state.in_flight.iter_mut().flatten() {
+                    if is_fast_scroll_batch {
+                        slot.cancel_flag.store(true, Ordering::Release);
+                    } else if let Some(matching_req) =
+                        current_requests.iter().find(|r| r.idx == slot.idx)
+                    {
+                        slot.sequence.store(highest_seq, Ordering::Release);
+                        if !matching_req.mode.is_prefetch() {
+                            slot.mode = matching_req.mode;
+                        }
+                    } else if slot.sequence.load(Ordering::Acquire) < highest_seq {
+                        slot.cancel_flag.store(true, Ordering::Release);
+                    }
+                }
+
+                if is_fast_scroll_batch {
+                    state.pending.clear();
+                } else {
+                    state.pending.retain(|job| {
+                        job.sequence == highest_seq
+                            || current_requests.iter().any(|r| r.idx == job.idx)
+                    });
+
+                    for job in &mut state.pending {
+                        if let Some(matching_req) =
+                            current_requests.iter().find(|r| r.idx == job.idx)
+                        {
+                            if job.sequence < highest_seq || !matching_req.mode.is_prefetch() {
+                                job.mode = matching_req.mode;
+                            }
+                            job.sequence = highest_seq;
+                        }
+                    }
+
+                    let (foreground, prefetch): (VecDeque<_>, VecDeque<_>) = state
+                        .pending
+                        .drain(..)
+                        .partition(|job| !job.mode.is_prefetch());
+                    state.pending.extend(foreground);
+                    state.pending.extend(prefetch);
+                }
+
+                if can_pop_job(&state, num_workers) {
+                    cvar.notify_all();
+                }
+            }
+
+            while let Some(r) = current_requests.pop_front() {
+                let cancel = CancellationToken::with_sequence(r.sequence as usize, &active_seq);
+                if cancel.is_cancelled() {
+                    continue;
+                }
+
+                new_reqs.clear();
+                while let Ok(nr) = loader_rx.try_recv() {
+                    new_reqs.push(nr);
+                }
+                if !new_reqs.is_empty() {
+                    let new_max_seq = new_reqs.iter().map(|nr| nr.sequence).max().unwrap_or(0);
+                    let has_foreground = new_reqs.iter().any(|nr| !nr.mode.is_prefetch());
+                    pending_requests.append(&mut new_reqs);
+                    if new_max_seq > highest_seq {
+                        current_requests.clear();
+                        break;
+                    } else if has_foreground {
+                        pending_requests.extend(current_requests.drain(..));
+                        break;
+                    }
+                }
+
+                if cancel.is_cancelled() {
+                    continue;
+                }
+
+                let (already_queued, thumb_already_extracted) = {
+                    let (lock, _) = &*queue_pair;
+                    let state = lock.lock().unwrap();
+                    let in_flight_slot = state
+                        .in_flight
+                        .iter()
+                        .flatten()
+                        .find(|s| s.idx == r.idx && !s.cancel_flag.load(Ordering::Acquire));
+                    let pending_job = state.pending.iter().find(|job| job.idx == r.idx);
+
+                    let already_queued = in_flight_slot.is_some() || pending_job.is_some();
+                    let thumb_already_extracted =
+                        in_flight_slot.map(|s| s.has_thumbnail).unwrap_or(false)
+                            || pending_job.map(|j| j.has_thumbnail).unwrap_or(false);
+                    (already_queued, thumb_already_extracted)
+                };
+
+                let should_extract =
+                    r.mode.should_extract_thumbnail(disable_thumbnail) && !thumb_already_extracted;
+
+                if already_queued && !should_extract {
+                    continue;
+                }
+
+                let start = Instant::now();
+                let mut bytes_opt: Option<Vec<u8>> = None;
+                let mut raw_header_opt: Option<Vec<u8>> = None;
+                let is_raw = r.source.is_raw();
+                let limit = if is_raw {
+                    RAW_EXIF_PROBE_LIMIT
+                } else {
+                    256 * 1024
+                };
+
+                let local_path = match &r.source {
+                    ImageSource::Local(p) => Some(p.clone()),
+                    _ => None,
+                };
+
+                let mut has_thumbnail = false;
+
+                if r.mode.should_extract_thumbnail(disable_thumbnail) {
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
+                    let read_res = read_source_bytes_limited(&r.source, limit);
+                    if let Ok(partial_bytes) = read_res {
+                        if cancel.is_cancelled() {
+                            continue;
+                        }
+                        if let Some((thumb_img, real_w, real_h)) =
+                            decode_thumbnail_and_dimensions_for_mode(
+                                &partial_bytes,
+                                Some(&r.source),
+                                r.mode.is_thumbnail_only(),
+                            )
+                            && !cancel.is_cancelled()
+                        {
+                            let thumb_dur = start.elapsed();
+                            let _ = response_tx.send(LoaderResponse {
+                                idx: r.idx,
+                                result: Ok(DecodedImage {
+                                    image: thumb_img,
+                                    width: real_w,
+                                    height: real_h,
+                                    format: Some(image::ImageFormat::Jpeg),
+                                    disk_size: 0,
+                                    raw_dimensions: Some((real_w, real_h)),
+                                }),
+                                is_prefetch: r.mode.is_prefetch(),
+                                sequence: r.sequence,
+                                decode_duration: thumb_dur,
+                                thumbnail_source: Some(ThumbnailSource::Exif),
+                            });
+                            has_thumbnail = true;
+                        }
+                        if !is_raw && partial_bytes.len() < limit {
+                            bytes_opt = Some(partial_bytes);
+                        } else if is_raw {
+                            raw_header_opt = Some(partial_bytes);
+                        }
+                    }
+
+                    if !has_thumbnail
+                        && !cancel.is_cancelled()
+                        && let Some(ref path) = local_path
+                        && let Some(ref cache_root) = thumb_cache_root
+                        && let Some(cached) = load_cached_thumbnail_with_metadata(cache_root, path)
+                    {
+                        let (mut real_w, mut real_h) = if let Some(dims) = cached.source_dims {
+                            dims
+                        } else if is_raw && let Some(ref hb) = raw_header_opt {
+                            let probe = probe_raw_header(hb, Some(&r.source));
+                            if let Some((w, h)) = probe.sensor_dims {
+                                if orientation_swaps_dimensions(probe.orientation) {
+                                    (h, w)
+                                } else {
+                                    (w, h)
+                                }
+                            } else {
+                                image::image_dimensions(path)
+                                    .unwrap_or((cached.image.width(), cached.image.height()))
+                            }
+                        } else {
+                            image::image_dimensions(path)
+                                .unwrap_or((cached.image.width(), cached.image.height()))
+                        };
+                        if cached.image.width() != cached.image.height()
+                            && (real_w > real_h) != (cached.image.width() > cached.image.height())
+                        {
+                            std::mem::swap(&mut real_w, &mut real_h);
+                        }
+                        let thumb_dur = start.elapsed();
+                        let _ = response_tx.send(LoaderResponse {
+                            idx: r.idx,
+                            result: Ok(DecodedImage {
+                                image: cached.image,
+                                width: real_w,
+                                height: real_h,
+                                format: Some(image::ImageFormat::Png),
+                                disk_size: 0,
+                                raw_dimensions: Some((real_w, real_h)),
+                            }),
+                            is_prefetch: r.mode.is_prefetch(),
+                            sequence: r.sequence,
+                            decode_duration: thumb_dur,
+                            thumbnail_source: Some(ThumbnailSource::XdgCache),
+                        });
+                        has_thumbnail = true;
+                    }
+                }
+
+                if r.mode.is_thumbnail_only() && has_thumbnail {
+                    continue;
+                }
+
+                if cancel.is_cancelled() || r.sequence < active_seq.load(Ordering::Acquire) as u64 {
+                    continue;
+                }
+
+                let (lock, cvar) = &*queue_pair;
+                let mut state = lock.lock().unwrap();
+
+                let mut already_in_flight = false;
+                for slot in state.in_flight.iter_mut().flatten() {
+                    if slot.idx == r.idx && !slot.cancel_flag.load(Ordering::Acquire) {
+                        already_in_flight = true;
+                        slot.has_thumbnail |= has_thumbnail;
+                        slot.sequence.store(r.sequence, Ordering::Release);
+                        if !r.mode.is_prefetch() {
+                            slot.mode = r.mode;
+                        }
+                    }
+                }
+
+                let mut already_pending = false;
+                for job in &mut state.pending {
+                    if job.idx == r.idx {
+                        already_pending = true;
+                        job.has_thumbnail |= has_thumbnail;
+                        job.sequence = r.sequence;
+                        if !r.mode.is_prefetch() && job.mode.is_prefetch() {
+                            job.mode = r.mode;
+                        }
+                    }
+                }
+
+                if already_pending && !r.mode.is_prefetch() {
+                    let (foreground, prefetch): (VecDeque<_>, VecDeque<_>) = state
+                        .pending
+                        .drain(..)
+                        .partition(|job| !job.mode.is_prefetch());
+                    state.pending.extend(foreground);
+                    state.pending.extend(prefetch);
+                    cvar.notify_one();
+                }
+
+                if !already_in_flight && !already_pending {
+                    let job = DecodeJob {
+                        idx: r.idx,
+                        source: r.source,
+                        mode: r.mode,
+                        sequence: r.sequence,
+                        bytes_opt,
+                        raw_header_opt,
+                        local_path,
+                        has_thumbnail,
+                    };
+                    if !r.mode.is_prefetch() {
+                        state.pending.push_front(job);
+                        cvar.notify_one();
+                    } else {
+                        state.pending.push_back(job);
+                        if can_pop_job(&state, num_workers) {
+                            cvar.notify_all();
+                        }
+                    }
+                }
+            }
+
+            requests.clear();
+            if requests.capacity() > 64 {
+                requests.shrink_to(16);
+            }
+            current_requests.clear();
+            if current_requests.capacity() > 64 {
+                current_requests.shrink_to(16);
+            }
+            new_reqs.clear();
+            if new_reqs.capacity() > 64 {
+                new_reqs.shrink_to(16);
+            }
+            if pending_requests.capacity() > 64 {
+                pending_requests.shrink_to(16);
+            }
+        }
+    });
 }
 
 /// Helper resizing function leveraging fast_image_resize for sub-millisecond execution speeds.
@@ -701,7 +1275,7 @@ mod tests {
             target_w: 50,
             target_h: 50,
             filter_type: FilterType::Nearest,
-            picker,
+            picker: picker.clone(),
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
             rendered_size_cells: (5, 3),
@@ -800,7 +1374,7 @@ mod tests {
             target_w: 100,
             target_h: 100,
             filter_type: FilterType::Nearest,
-            picker,
+            picker: picker.clone(),
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
             rendered_size_cells: (50, 50),
@@ -844,7 +1418,7 @@ mod tests {
             target_w: 80,
             target_h: 80,
             filter_type: FilterType::Linear,
-            picker,
+            picker: picker.clone(),
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
             rendered_size_cells: (40, 40),
@@ -915,7 +1489,7 @@ mod tests {
             target_w: 60,
             target_h: 60,
             filter_type: FilterType::Nearest,
-            picker,
+            picker: picker.clone(),
             brightness: Brightness::new(-30),
             contrast: Contrast::new(-20.0),
             rendered_size_cells: (30, 30),
@@ -1433,5 +2007,409 @@ mod tests {
 
         maybe_reclaim_resizer_scratch(&mut resizer, 100, 100, 4000, 4001);
         assert_eq!(resizer.size_of_internal_buffers(), 0);
+    }
+
+    #[test]
+    fn test_spawn_loader_pool_parallel_prefetch_and_foreground_promotion() {
+        let test_dir = std::path::PathBuf::from("target/tmp/loader_pool_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        // Create 16 small test images on disk
+        let mut paths = Vec::new();
+        for i in 0..16 {
+            let p = test_dir.join(format!("test_img_{}.png", i));
+            let img = image::RgbImage::new(40, 40);
+            img.save(&p).unwrap();
+            paths.push(p);
+        }
+
+        let (loader_tx, loader_rx) = std::sync::mpsc::channel();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let active_seq = Arc::new(AtomicUsize::new(1));
+
+        spawn_loader_pool(loader_rx, response_tx, Arc::clone(&active_seq), false);
+
+        // 1. Dispatch foreground load (idx 0) and prefetch loads (idx 1, 2) with sequence 1
+        loader_tx
+            .send(LoaderRequest {
+                idx: 0,
+                source: ImageSource::Local(paths[0].clone()),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 1,
+            })
+            .unwrap();
+        loader_tx
+            .send(LoaderRequest {
+                idx: 1,
+                source: ImageSource::Local(paths[1].clone()),
+                mode: LoaderMode::Prefetch,
+                sequence: 1,
+            })
+            .unwrap();
+        loader_tx
+            .send(LoaderRequest {
+                idx: 2,
+                source: ImageSource::Local(paths[2].clone()),
+                mode: LoaderMode::Prefetch,
+                sequence: 1,
+            })
+            .unwrap();
+
+        // Collect full decoded responses for sequence 1
+        let mut seq1_responses = Vec::new();
+        let timeout = std::time::Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        while seq1_responses.len() < 3 && start.elapsed() < timeout {
+            if let Ok(resp) = response_rx.recv_timeout(std::time::Duration::from_millis(500))
+                && resp.thumbnail_source.is_none()
+            {
+                seq1_responses.push(resp);
+            }
+        }
+        assert_eq!(seq1_responses.len(), 3);
+        for resp in &seq1_responses {
+            assert!(resp.result.is_ok());
+            assert_eq!(resp.sequence, 1);
+        }
+
+        // 2. Test promotion and deduplication:
+        // Set active sequence to 2
+        active_seq.store(2, Ordering::Release);
+
+        // Queue prefetch for multiple images so the last one is guaranteed to be pending,
+        // then dispatch foreground promotion for image 15
+        for (i, p) in paths.iter().enumerate().take(16).skip(3) {
+            loader_tx
+                .send(LoaderRequest {
+                    idx: i,
+                    source: ImageSource::Local(p.clone()),
+                    mode: LoaderMode::Prefetch,
+                    sequence: 2,
+                })
+                .unwrap();
+        }
+        loader_tx
+            .send(LoaderRequest {
+                idx: 15,
+                source: ImageSource::Local(paths[15].clone()),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 2,
+            })
+            .unwrap();
+
+        let mut got_promoted = false;
+        let mut img15_full_count = 0;
+        let start2 = std::time::Instant::now();
+        while start2.elapsed() < timeout {
+            if let Ok(resp) = response_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                if resp.idx == 15 && resp.sequence == 2 && resp.thumbnail_source.is_none() {
+                    img15_full_count += 1;
+                    if !resp.is_prefetch {
+                        assert!(resp.result.is_ok());
+                        got_promoted = true;
+                    }
+                }
+            } else if got_promoted {
+                break;
+            }
+        }
+        assert!(got_promoted, "Promoted job should complete as foreground");
+        assert_eq!(
+            img15_full_count, 1,
+            "Deduplication must prevent duplicate full-resolution decodes"
+        );
+
+        // 3. Test cancellation on sequence bump:
+        active_seq.store(3, Ordering::Release);
+        loader_tx
+            .send(LoaderRequest {
+                idx: 1,
+                source: ImageSource::Local(paths[1].clone()),
+                mode: LoaderMode::Prefetch,
+                sequence: 2, // Stale sequence
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        while let Ok(resp) = response_rx.try_recv() {
+            assert!(
+                resp.sequence >= 3 || resp.idx != 1 || resp.thumbnail_source.is_some(),
+                "Stale decode for sequence 2 should be cancelled"
+            );
+        }
+
+        // 4. Verify clean shutdown when loader_tx is dropped
+        drop(loader_tx);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_spawn_loader_pool_promoted_prefetch_thumbnail_and_fast_scroll_cancellation() {
+        let test_dir = std::path::PathBuf::from("target/tmp/loader_pool_thumb_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        // 1. Create source image and pre-generate XDG thumbnail (> 256 px)
+        let src_path = test_dir.join("thumb_test.png");
+        let src_img = DynamicImage::ImageRgb8(image::RgbImage::new(400, 400));
+        src_img.save(&src_path).unwrap();
+
+        let cache_root = default_thumbnail_cache_root().expect("Cache root must exist");
+        let mut resizer = fir::Resizer::new();
+        let saved_thumb = save_cached_thumbnail_with_dims(
+            &cache_root,
+            &mut resizer,
+            &src_path,
+            &src_img,
+            (400, 400),
+        );
+        assert!(
+            saved_thumb.is_some(),
+            "Thumbnail must be saved for >256 image"
+        );
+
+        let (loader_tx, loader_rx) = std::sync::mpsc::channel();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let active_seq = Arc::new(AtomicUsize::new(1));
+
+        spawn_loader_pool(loader_rx, response_tx, Arc::clone(&active_seq), false);
+
+        // 2. Dispatch Prefetch first (which does not extract thumbnail)
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path.clone()),
+                mode: LoaderMode::Prefetch,
+                sequence: 1,
+            })
+            .unwrap();
+
+        // Immediately step onto the same index with ThumbnailAndFull
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path.clone()),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 1,
+            })
+            .unwrap();
+
+        // Verify that the thumbnail response is emitted even though the job was already queued as Prefetch
+        let mut got_thumb = false;
+        let mut got_full = false;
+        let timeout = std::time::Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        while (!got_thumb || !got_full) && start.elapsed() < timeout {
+            if let Ok(resp) = response_rx.recv_timeout(std::time::Duration::from_millis(500))
+                && resp.idx == 42
+                && resp.sequence == 1
+            {
+                if resp.thumbnail_source.is_some() {
+                    got_thumb = true;
+                } else {
+                    got_full = true;
+                    assert!(
+                        !resp.is_prefetch,
+                        "Promoted job must complete as foreground"
+                    );
+                }
+            }
+        }
+        assert!(
+            got_thumb,
+            "Promoted prefetch job must emit fast thumbnail response"
+        );
+        assert!(got_full, "Full resolution decode must complete");
+
+        // 3. Test fast scrolling cancellation: dispatch ThumbnailOnly at sequence 2
+        active_seq.store(2, Ordering::Release);
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path),
+                mode: LoaderMode::ThumbnailOnly,
+                sequence: 2,
+            })
+            .unwrap();
+
+        let mut got_seq2_thumb = false;
+        let start2 = std::time::Instant::now();
+        while start2.elapsed() < std::time::Duration::from_millis(500) {
+            if let Ok(resp) = response_rx.recv_timeout(std::time::Duration::from_millis(50))
+                && resp.sequence == 2
+            {
+                if resp.thumbnail_source.is_some() {
+                    got_seq2_thumb = true;
+                } else {
+                    panic!(
+                        "ThumbnailOnly during fast-scrolling must NOT emit full resolution decode"
+                    );
+                }
+            }
+        }
+        assert!(got_seq2_thumb, "ThumbnailOnly must emit fast thumbnail");
+
+        drop(loader_tx);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_can_pop_job_and_pending_demotion() {
+        let mut state = DecodeQueueState {
+            pending: VecDeque::new(),
+            in_flight: Vec::new(),
+            shutdown: false,
+        };
+        let max_workers = 5;
+
+        let make_job = |idx: usize, sequence: u64, mode: LoaderMode| DecodeJob {
+            idx,
+            source: ImageSource::Local(std::path::PathBuf::from("dummy.png")),
+            mode,
+            sequence,
+            bytes_opt: None,
+            raw_header_opt: None,
+            local_path: None,
+            has_thumbnail: false,
+        };
+
+        let make_slot = |idx: usize, sequence: u64, mode: LoaderMode| InFlightSlot {
+            idx,
+            sequence: Arc::new(AtomicU64::new(sequence)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            mode,
+            has_thumbnail: false,
+        };
+
+        // 1. Empty queue cannot pop
+        assert!(!can_pop_job(&state, max_workers));
+
+        // 2. Pending foreground job when no foreground in flight -> can pop
+        state
+            .pending
+            .push_back(make_job(1, 1, LoaderMode::ThumbnailAndFull));
+        assert!(can_pop_job(&state, max_workers));
+
+        // 3. If a foreground job is in flight, cannot pop another foreground job
+        state
+            .in_flight
+            .push(Some(make_slot(0, 1, LoaderMode::ThumbnailAndFull)));
+        assert!(!can_pop_job(&state, max_workers));
+
+        // 4. When foreground finishes, if front pending job is Prefetch and active prefetch < max_workers - 1, can pop
+        state.in_flight.clear();
+        state.pending.clear();
+        state
+            .pending
+            .push_back(make_job(1, 1, LoaderMode::Prefetch));
+        assert!(can_pop_job(&state, max_workers));
+
+        // 5. If prefetch workers saturate reserved slots (4 out of 5), cannot pop more prefetch
+        for i in 0..3 {
+            state
+                .in_flight
+                .push(Some(make_slot(i, 1, LoaderMode::Prefetch)));
+        }
+        assert!(can_pop_job(&state, max_workers));
+        state
+            .in_flight
+            .push(Some(make_slot(3, 1, LoaderMode::Prefetch)));
+        assert!(!can_pop_job(&state, max_workers));
+
+        // 6. Test pending demotion on sequence advancement
+        state.pending.clear();
+        state
+            .pending
+            .push_back(make_job(1, 1, LoaderMode::ThumbnailAndFull));
+        let highest_seq = 2;
+        let current_requests = [
+            LoaderRequest {
+                idx: 2,
+                source: ImageSource::Local(std::path::PathBuf::from("dummy2.png")),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 2,
+            },
+            LoaderRequest {
+                idx: 1,
+                source: ImageSource::Local(std::path::PathBuf::from("dummy1.png")),
+                mode: LoaderMode::Prefetch,
+                sequence: 2,
+            },
+        ];
+
+        for job in &mut state.pending {
+            if let Some(matching_req) = current_requests.iter().find(|r| r.idx == job.idx) {
+                if job.sequence < highest_seq || !matching_req.mode.is_prefetch() {
+                    job.mode = matching_req.mode;
+                }
+                job.sequence = highest_seq;
+            }
+        }
+
+        assert_eq!(state.pending[0].mode, LoaderMode::Prefetch);
+        assert_eq!(state.pending[0].sequence, 2);
+    }
+
+    #[test]
+    fn test_spawn_resize_worker_coalescing_and_stale_skip() {
+        let (resize_tx, resize_rx) = std::sync::mpsc::channel();
+        let (protocol_tx, protocol_rx) = std::sync::mpsc::channel();
+        let active_seq = Arc::new(AtomicUsize::new(1));
+
+        spawn_resize_worker(resize_rx, protocol_tx, Arc::clone(&active_seq));
+
+        let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
+        let picker = Picker::halfblocks();
+
+        let make_req = |seq: u64| ResizeRequest {
+            img: Arc::clone(&img),
+            original_size: (100, 100),
+            scale: 1.0,
+            crop: CropBox {
+                x1: 0,
+                y1: 0,
+                x2: 100,
+                y2: 100,
+            },
+            intersection: ImageIntersection {
+                x1: 0,
+                y1: 0,
+                x2: 100,
+                y2: 100,
+            },
+            target_w: 40,
+            target_h: 20,
+            filter_type: FilterType::Nearest,
+            picker: picker.clone(),
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (40, 20),
+            sequence: seq,
+            use_kitty_shm: false,
+        };
+
+        // 1. Send stale request (seq 0 < active_seq 1) -> should be skipped
+        resize_tx.send(make_req(0)).unwrap();
+
+        // 2. Send two requests rapidly (seq 1 and seq 2) -> seq 1 should coalesce into seq 2
+        active_seq.store(2, Ordering::Release);
+        resize_tx.send(make_req(1)).unwrap();
+        resize_tx.send(make_req(2)).unwrap();
+
+        let resp = protocol_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Expected a coalesced resize response");
+        assert_eq!(resp.sequence, 2);
+        assert_eq!(resp.rendered_cells, (40, 20));
+
+        // Drop tx to verify clean worker exit
+        drop(resize_tx);
+        assert!(
+            protocol_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
     }
 }

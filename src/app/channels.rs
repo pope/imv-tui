@@ -266,35 +266,46 @@ impl App {
                             .unwrap_or(shared_img);
 
                         if let Some(thumb_src) = resp.thumbnail_source {
-                            if self.load_phase == LoadPhase::ThumbnailInFlightDeferred {
-                                self.load_phase = LoadPhase::FullDeferred;
-                            }
-                            let (orig_w, orig_h) = if adj.rotation == Rotation::D90
-                                || adj.rotation == Rotation::D270
+                            if self.load_phase == LoadPhase::Complete
+                                && !self.show_thumbnail_only
+                                && self.original_image.is_some()
                             {
-                                (h, w)
+                                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                                    load_duration: resp.decode_duration,
+                                    dimensions: (rotated_img.width(), rotated_img.height()),
+                                    source: thumb_src,
+                                });
                             } else {
-                                (w, h)
-                            };
-                            self.img_width = orig_w;
-                            self.img_height = orig_h;
-                            let thumb_w = rotated_img.width();
-                            let thumb_h = rotated_img.height();
-                            self.original_image = Some(rotated_img.clone());
-                            self.thumbnail_image = Some(rotated_img);
-                            self.show_thumbnail_only = true;
-                            self.error_message = None;
-                            self.resize_state.mark_dirty_with_init_zoom();
+                                if self.load_phase == LoadPhase::ThumbnailInFlightDeferred {
+                                    self.load_phase = LoadPhase::FullDeferred;
+                                }
+                                let (orig_w, orig_h) = if adj.rotation == Rotation::D90
+                                    || adj.rotation == Rotation::D270
+                                {
+                                    (h, w)
+                                } else {
+                                    (w, h)
+                                };
+                                self.img_width = orig_w;
+                                self.img_height = orig_h;
+                                let thumb_w = rotated_img.width();
+                                let thumb_h = rotated_img.height();
+                                self.original_image = Some(rotated_img.clone());
+                                self.thumbnail_image = Some(rotated_img);
+                                self.show_thumbnail_only = true;
+                                self.error_message = None;
+                                self.resize_state.mark_dirty_with_init_zoom();
 
-                            self.stats.thumbnail = Some(ThumbnailTelemetry {
-                                load_duration: resp.decode_duration,
-                                dimensions: (thumb_w, thumb_h),
-                                source: thumb_src,
-                            });
-                            self.stats.is_prefetch_cache_hit = false;
-                            self.stats.disk_size = disk_size;
-                            self.stats.format = format;
-                            self.stats.raw_dimensions = decoded.raw_dimensions;
+                                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                                    load_duration: resp.decode_duration,
+                                    dimensions: (thumb_w, thumb_h),
+                                    source: thumb_src,
+                                });
+                                self.stats.is_prefetch_cache_hit = false;
+                                self.stats.disk_size = disk_size;
+                                self.stats.format = format;
+                                self.stats.raw_dimensions = decoded.raw_dimensions;
+                            }
                         } else {
                             self.img_width = rotated_img.width();
                             self.img_height = rotated_img.height();

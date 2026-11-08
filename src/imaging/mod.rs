@@ -3,13 +3,14 @@
 pub mod types;
 pub use types::*;
 
-mod raw;
+pub mod raw;
+#[cfg(test)]
 pub use raw::*;
 
 mod decoder;
 pub use decoder::*;
 
-mod worker;
+pub mod worker;
 pub use worker::*;
 
 pub mod thumbcache;

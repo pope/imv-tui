@@ -9,8 +9,10 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::types::{FilterType, into_rgba8_fast, to_rgba8_fast, unpack_rgb24_to_rgba32};
-use super::worker::{maybe_reclaim_resizer_scratch, to_fir_resize_alg};
+use super::types::{
+    FilterType, into_rgba8_fast, maybe_reclaim_resizer_scratch, to_fir_resize_alg, to_rgba8_fast,
+    unpack_rgb24_to_rgba32,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -508,6 +510,8 @@ pub fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf
     }
 }
 
+static TMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Atomically writes an encoded PNG thumbnail with full Freedesktop metadata to the thumbnail directory.
 pub fn write_freedesktop_thumbnail_with_metadata(
     cache_root: &Path,
@@ -537,7 +541,8 @@ pub fn write_freedesktop_thumbnail_with_metadata(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_filename = format!(".tmp.{}_{}_{}", pid, now, md5_filename);
+    let seq = TMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_filename = format!(".tmp.{}_{}_{}_{}", pid, now, seq, md5_filename);
     let tmp_path = target_dir.join(&tmp_filename);
 
     let mut open_opts = OpenOptions::new();
