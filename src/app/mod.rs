@@ -330,62 +330,6 @@ impl ScrollCadence {
     }
 }
 
-/// Telemetry metadata for a decoded thumbnail placeholder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThumbnailTelemetry {
-    /// Time taken to extract and decode the thumbnail.
-    pub load_duration: std::time::Duration,
-    /// Dimensions of the decoded thumbnail placeholder (`(width, height)`).
-    pub dimensions: (u32, u32),
-    /// Source of the thumbnail placeholder (EXIF or XDG cache).
-    pub source: ThumbnailSource,
-}
-
-/// Diagnostic and telemetry instrumentation for image decoding, resizing, and protocol delivery.
-#[derive(Debug, Clone, Default)]
-pub struct StatsForNerds {
-    /// Time taken to load (decode) the photo from disk or zip, or None while loading.
-    pub load_duration: Option<std::time::Duration>,
-    /// Telemetry metadata for the decoded thumbnail placeholder, if any.
-    pub thumbnail: Option<ThumbnailTelemetry>,
-    /// Was it loaded from the prefetch cache.
-    pub is_prefetch_cache_hit: bool,
-    /// Time taken to resize, apply filters, adjustments, etc.
-    pub process_duration: std::time::Duration,
-    /// Time taken to send it to the pixel handlers (writing to sixel or kitty APIs).
-    pub protocol_duration: std::time::Duration,
-    /// Target width in pixels sent to the graphics protocol.
-    pub protocol_width: u32,
-    /// Target height in pixels sent to the graphics protocol.
-    pub protocol_height: u32,
-    /// Size of the image on disk in bytes.
-    pub disk_size: u64,
-    /// Image format of the loaded image.
-    pub format: Option<image::ImageFormat>,
-    /// The original raw/sensor dimensions of the raw image (`(width, height)`), if any.
-    pub raw_dimensions: Option<(u32, u32)>,
-}
-
-impl StatsForNerds {
-    /// Computes the active foreground pipeline duration (`decode + resize + protocol encode`)
-    /// for the currently displayed frame:
-    /// - On a prefetch cache hit (`is_prefetch_cache_hit == true`), decode already completed
-    ///   in the background prior to navigation (`0 ms` foreground decode wait), so only
-    ///   `process_duration + protocol_duration` is counted.
-    /// - When displaying a thumbnail placeholder (`show_thumbnail_only` or `load_duration.is_none()`),
-    ///   uses the thumbnail's `load_duration` instead of `0 ms` or the full image's `load_duration`.
-    pub fn total_pipeline_duration(&self, show_thumbnail_only: bool) -> std::time::Duration {
-        let active_decode_dur = if self.is_prefetch_cache_hit {
-            std::time::Duration::ZERO
-        } else if show_thumbnail_only || self.load_duration.is_none() {
-            self.thumbnail.map(|t| t.load_duration).unwrap_or_default()
-        } else {
-            self.load_duration.unwrap_or_default()
-        };
-        active_decode_dur + self.process_duration + self.protocol_duration
-    }
-}
-
 /// A response payload sent by the resizing worker thread.
 pub struct ResizeResponse {
     pub protocol: ViewportProtocol,
@@ -451,7 +395,7 @@ pub struct MockChannels {
     pub protocol_tx: mpsc::Sender<ResizeResponse>,
 }
 
-pub use crate::ui::ImageDisplayState;
+pub use crate::ui::{ImageDisplayState, StatsForNerds, ThumbnailTelemetry};
 
 /// The central application state controller.
 pub struct App {

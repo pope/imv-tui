@@ -6,68 +6,7 @@ use crate::app::adjustments::ImageAdjustments;
 use crate::imaging::ImageSource;
 use crate::imaging::types::{Brightness, Contrast, Rotation};
 
-/// The classification/flagged state for an image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Classification {
-    Unflagged,
-    Pick,
-    Reject,
-}
-
-impl Classification {
-    pub fn icon(&self) -> &'static str {
-        match self {
-            Self::Unflagged => "⚪",
-            Self::Pick => "⭐",
-            Self::Reject => "❌",
-        }
-    }
-
-    pub fn display_label(&self) -> &'static str {
-        match self {
-            Self::Unflagged => "⚪ Unflagged",
-            Self::Pick => "⭐ Pick",
-            Self::Reject => "❌ Reject",
-        }
-    }
-
-    pub fn search_prefix(&self) -> &'static str {
-        match self {
-            Self::Unflagged => "   ",
-            Self::Pick => "⭐ ",
-            Self::Reject => "❌ ",
-        }
-    }
-
-    pub fn export_prefix(&self) -> &'static str {
-        match self {
-            Self::Pick => "PICK",
-            Self::Reject => "REJECT",
-            Self::Unflagged => "UNFLAGGED",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ViewMode {
-    Default,
-    Unflagged,
-    Picks,
-    Rejects,
-    All,
-}
-
-impl ViewMode {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Default => "Unflagged + Picks",
-            Self::Unflagged => "Unflagged Only",
-            Self::Picks => "Picks Only",
-            Self::Rejects => "Rejects Only",
-            Self::All => "All Files",
-        }
-    }
-}
+pub use crate::config::{Classification, ViewMode};
 
 /// Helper struct for JSON serialization/deserialization of classifications.
 #[derive(Debug, Clone, Serialize, Deserialize)]

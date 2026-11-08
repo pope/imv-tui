@@ -93,24 +93,6 @@ pub fn filter_commands(
     scratch.clear();
 }
 
-/// Computes the centered scroll offset (`start_idx`) for a palette list of `total_items`
-/// with `visible_count` rows and current selection `selected_index`.
-#[inline]
-pub fn centered_scroll_offset(
-    selected_index: usize,
-    total_items: usize,
-    visible_count: usize,
-) -> usize {
-    let half_visible = visible_count / 2;
-    if total_items <= visible_count || selected_index < half_visible {
-        0
-    } else if selected_index >= total_items.saturating_sub(half_visible) {
-        total_items.saturating_sub(visible_count)
-    } else {
-        selected_index.saturating_sub(half_visible)
-    }
-}
-
 /// Computes the page jump step size for palette `PageUp` / `PageDown` navigation.
 #[inline]
 pub fn palette_page_size(terminal_height: u16, total_items: usize) -> usize {
@@ -126,25 +108,6 @@ pub fn palette_page_size(terminal_height: u16, total_items: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_centered_scroll_offset() {
-        // total_items <= visible_count: always 0
-        assert_eq!(centered_scroll_offset(0, 5, 10), 0);
-        assert_eq!(centered_scroll_offset(4, 5, 10), 0);
-
-        // total_items = 20, visible_count = 6 (half_visible = 3)
-        // At head
-        assert_eq!(centered_scroll_offset(0, 20, 6), 0);
-        assert_eq!(centered_scroll_offset(2, 20, 6), 0);
-        // In middle
-        assert_eq!(centered_scroll_offset(3, 20, 6), 0);
-        assert_eq!(centered_scroll_offset(5, 20, 6), 2);
-        assert_eq!(centered_scroll_offset(10, 20, 6), 7);
-        // Near tail: total_items - half_visible = 17
-        assert_eq!(centered_scroll_offset(17, 20, 6), 14);
-        assert_eq!(centered_scroll_offset(19, 20, 6), 14);
-    }
 
     #[test]
     fn test_palette_page_size() {

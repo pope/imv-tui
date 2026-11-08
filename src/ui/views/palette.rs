@@ -40,11 +40,8 @@ pub fn draw(frame: &mut Frame, model: &PaletteViewModel<'_>, area: Rect) {
             classifications,
         } => {
             let total_files = filtered_files.len();
-            let start_idx = crate::app::palette::centered_scroll_offset(
-                model.selected_index,
-                total_files,
-                visible_count,
-            );
+            let start_idx =
+                centered_scroll_offset(model.selected_index, total_files, visible_count);
 
             let max_path_len = inner_w.saturating_sub(6);
 
@@ -84,11 +81,7 @@ pub fn draw(frame: &mut Frame, model: &PaletteViewModel<'_>, area: Rect) {
             let all_commands = crate::commands::get_commands();
 
             let total_cmds = filtered_commands.len();
-            let start_idx = crate::app::palette::centered_scroll_offset(
-                model.selected_index,
-                total_cmds,
-                visible_count,
-            );
+            let start_idx = centered_scroll_offset(model.selected_index, total_cmds, visible_count);
 
             for (i, &cmd_idx) in filtered_commands
                 .iter()
@@ -177,6 +170,24 @@ pub fn draw(frame: &mut Frame, model: &PaletteViewModel<'_>, area: Rect) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
+/// Computes the centered scroll offset (`start_idx`) for a palette list of `total_items`
+/// with `visible_count` rows and current selection `selected_index`.
+#[inline]
+pub fn centered_scroll_offset(
+    selected_index: usize,
+    total_items: usize,
+    visible_count: usize,
+) -> usize {
+    let half_visible = visible_count / 2;
+    if total_items <= visible_count || selected_index < half_visible {
+        0
+    } else if selected_index >= total_items.saturating_sub(half_visible) {
+        total_items.saturating_sub(visible_count)
+    } else {
+        selected_index.saturating_sub(half_visible)
+    }
+}
+
 fn get_elided_suffix(s: &str, elided_len: usize) -> std::borrow::Cow<'_, str> {
     if elided_len == 0 {
         return std::borrow::Cow::Borrowed("...");
@@ -238,6 +249,25 @@ fn shorten_path(path_str: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_centered_scroll_offset() {
+        // total_items <= visible_count: always 0
+        assert_eq!(centered_scroll_offset(0, 5, 10), 0);
+        assert_eq!(centered_scroll_offset(4, 5, 10), 0);
+
+        // total_items = 20, visible_count = 6 (half_visible = 3)
+        // At head
+        assert_eq!(centered_scroll_offset(0, 20, 6), 0);
+        assert_eq!(centered_scroll_offset(2, 20, 6), 0);
+        // In middle
+        assert_eq!(centered_scroll_offset(3, 20, 6), 0);
+        assert_eq!(centered_scroll_offset(5, 20, 6), 2);
+        assert_eq!(centered_scroll_offset(10, 20, 6), 7);
+        // Near tail: total_items - half_visible = 17
+        assert_eq!(centered_scroll_offset(17, 20, 6), 14);
+        assert_eq!(centered_scroll_offset(19, 20, 6), 14);
+    }
 
     #[test]
     fn test_shorten_path() {

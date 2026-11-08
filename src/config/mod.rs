@@ -24,6 +24,85 @@ impl InfoBarPosition {
     }
 }
 
+/// The classification/flagged state for an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Classification {
+    /// Image has not been flagged (`⚪`).
+    #[default]
+    Unflagged,
+    /// Image is marked as a keeper/favorite (`⭐`).
+    Pick,
+    /// Image is marked for rejection/deletion (`❌`).
+    Reject,
+}
+
+impl Classification {
+    /// Returns the emoji icon representing the classification.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Unflagged => "⚪",
+            Self::Pick => "⭐",
+            Self::Reject => "❌",
+        }
+    }
+
+    /// Returns the user-facing display label with emoji.
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Unflagged => "⚪ Unflagged",
+            Self::Pick => "⭐ Pick",
+            Self::Reject => "❌ Reject",
+        }
+    }
+
+    /// Returns the leading prefix used in search/palette listings.
+    pub fn search_prefix(&self) -> &'static str {
+        match self {
+            Self::Unflagged => "   ",
+            Self::Pick => "⭐ ",
+            Self::Reject => "❌ ",
+        }
+    }
+
+    /// Returns the uppercase text representation for export/serialization.
+    pub fn export_prefix(&self) -> &'static str {
+        match self {
+            Self::Pick => "PICK",
+            Self::Reject => "REJECT",
+            Self::Unflagged => "UNFLAGGED",
+        }
+    }
+}
+
+/// Active filtering view mode controlling which classified images are visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ViewMode {
+    /// Default view mode showing unflagged images and picks.
+    #[default]
+    Default,
+    /// Show unflagged images only.
+    Unflagged,
+    /// Show picks only.
+    Picks,
+    /// Show rejected images only.
+    Rejects,
+    /// Show all files regardless of classification.
+    All,
+}
+
+impl ViewMode {
+    /// Returns the user-facing name for this view mode.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Default => "Unflagged + Picks",
+            Self::Unflagged => "Unflagged Only",
+            Self::Picks => "Picks Only",
+            Self::Rejects => "Rejects Only",
+            Self::All => "All Files",
+        }
+    }
+}
+
 /// Represents the slideshow transition delay state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SlideshowState {

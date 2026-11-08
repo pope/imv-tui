@@ -1,4 +1,4 @@
-use crate::app::Classification;
+use crate::config::Classification;
 use crate::ui::InfoBoxModel;
 use ratatui::{
     Frame,
