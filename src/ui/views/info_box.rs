@@ -195,6 +195,11 @@ pub fn draw(frame: &mut Frame, model: &InfoBoxModel<'_>, area: Rect) {
                     )
                     .bold(),
                 ])
+            } else if stats.is_prefetch_cache_hit {
+                Line::from(vec![
+                    "   Thumbnail Load: ".gray(),
+                    "Skipped (Prefetched)".gray(),
+                ])
             } else {
                 Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()])
             };

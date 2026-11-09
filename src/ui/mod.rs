@@ -274,6 +274,21 @@ mod tests {
         terminal.draw(|f| ui(f, &mut model)).unwrap();
         let rendered_kitty_shm = buffer_to_string(&terminal);
         assert!(rendered_kitty_shm.contains("Kitty (SHM)"));
+        assert!(rendered_kitty_shm.contains("Thumbnail Load: N/A"));
+
+        // Test Skipped (Prefetched) when full image hit comes from prefetch cache without thumbnail
+        let prefetched_stats = StatsForNerds {
+            is_prefetch_cache_hit: true,
+            thumbnail: None,
+            load_duration: Some(std::time::Duration::from_millis(8)),
+            ..StatsForNerds::default()
+        };
+        if let OverlayModel::Info(InfoBoxModel::Populated { ref mut stats, .. }) = model.overlay {
+            *stats = &prefetched_stats;
+        }
+        terminal.draw(|f| ui(f, &mut model)).unwrap();
+        let rendered_prefetched = buffer_to_string(&terminal);
+        assert!(rendered_prefetched.contains("Skipped (Prefetched)"));
 
         // 5. SlideshowPaused overlay
         let mut model = sample_ui_model();
