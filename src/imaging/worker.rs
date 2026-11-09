@@ -19,10 +19,7 @@ use super::raw::{
     RAW_EXIF_PROBE_LIMIT, probe_raw_header, read_source_bytes_limited,
     read_source_bytes_with_header,
 };
-use super::thumbcache::{
-    default_thumbnail_cache_root, load_cached_thumbnail_with_metadata,
-    save_cached_thumbnail_with_dims,
-};
+use super::thumbcache::{load_cached_thumbnail_with_metadata, save_cached_thumbnail_with_dims};
 use super::types::*;
 
 /// A request payload sent to the resizing worker threads.
@@ -191,6 +188,7 @@ pub fn spawn_loader_pool(
     response_tx: Sender<LoaderResponse>,
     active_seq: Arc<AtomicUsize>,
     disable_thumbnail: bool,
+    thumb_cache_root: Option<PathBuf>,
 ) {
     let num_workers = decode_worker_count();
     let queue_state = Arc::new((
@@ -201,8 +199,6 @@ pub fn spawn_loader_pool(
         }),
         Condvar::new(),
     ));
-
-    let thumb_cache_root = default_thumbnail_cache_root();
 
     // Spawn Stage 2 parallel decode workers
     for worker_id in 0..num_workers {
@@ -2028,7 +2024,13 @@ mod tests {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let active_seq = Arc::new(AtomicUsize::new(1));
 
-        spawn_loader_pool(loader_rx, response_tx, Arc::clone(&active_seq), false);
+        spawn_loader_pool(
+            loader_rx,
+            response_tx,
+            Arc::clone(&active_seq),
+            false,
+            Some(test_dir.join("thumbnails")),
+        );
 
         // 1. Dispatch foreground load (idx 0) and prefetch loads (idx 1, 2) with sequence 1
         loader_tx
@@ -2155,7 +2157,7 @@ mod tests {
         let src_img = DynamicImage::ImageRgb8(image::RgbImage::new(400, 400));
         src_img.save(&src_path).unwrap();
 
-        let cache_root = default_thumbnail_cache_root().expect("Cache root must exist");
+        let cache_root = test_dir.join("thumbnails");
         let mut resizer = fir::Resizer::new();
         let saved_thumb = save_cached_thumbnail_with_dims(
             &cache_root,
@@ -2173,7 +2175,13 @@ mod tests {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         let active_seq = Arc::new(AtomicUsize::new(1));
 
-        spawn_loader_pool(loader_rx, response_tx, Arc::clone(&active_seq), false);
+        spawn_loader_pool(
+            loader_rx,
+            response_tx,
+            Arc::clone(&active_seq),
+            false,
+            Some(cache_root),
+        );
 
         // 2. Dispatch Prefetch first (which does not extract thumbnail)
         loader_tx

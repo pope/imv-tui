@@ -516,6 +516,7 @@ impl App {
             response_tx,
             active_seq,
             config.disable_thumbnail,
+            crate::imaging::thumbcache::default_thumbnail_cache_root(),
         );
 
         let mut app = Self::with_channels(

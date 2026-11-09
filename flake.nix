@@ -73,7 +73,7 @@
             cargo-watch
             clang
             clippy
-            mold
+            llvmPackages.bintools
             rust-analyzer
             rustc
             rustfmt
@@ -90,6 +90,7 @@
               cargoLock = {
                 lockFile = ./Cargo.lock;
               };
+              nativeBuildInputs = [ pkgs.llvmPackages.bintools ];
             };
             default = imv-tui;
           }
