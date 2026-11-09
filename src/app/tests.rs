@@ -481,6 +481,63 @@ fn test_prefetch_cache_retention_and_hits() {
 }
 
 #[test]
+fn test_trigger_prefetch_dispatches_for_thumbnail_only_neighbor() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    // Drain startup requests sent during App::new_mocked()
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // 1. Neighbor (index 1) has only a thumbnail cached in app.prefetch_cache
+    let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+    app.prefetch_cache.upsert_thumbnail(
+        1,
+        CachedThumbnail {
+            image: thumb,
+            source: crate::imaging::ThumbnailSource::Exif,
+            decode_duration: std::time::Duration::from_millis(2),
+        },
+        100,
+        100,
+        Some(image::ImageFormat::Jpeg),
+        1000,
+        None,
+    );
+    let entry = app.prefetch_cache.get(1).expect("entry must exist");
+    assert!(entry.image.is_none());
+    assert!(entry.thumbnail.is_some());
+    assert!(!app.prefetch_cache.has_full_image(1));
+
+    // Calling trigger_prefetch() must dispatch LoaderMode::Prefetch for index 1
+    app.trigger_prefetch();
+    let req = channels
+        .loader_rx
+        .try_recv()
+        .expect("Expected prefetch LoaderRequest for thumbnail-only neighbor");
+    assert_eq!(req.idx, 1);
+    assert_eq!(req.mode, LoaderMode::Prefetch);
+    assert!(channels.loader_rx.try_recv().is_err());
+
+    // 2. Once a full image is cached, trigger_prefetch() skips index 1
+    let full = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
+    app.prefetch_cache.upsert_full(
+        1,
+        full,
+        std::time::Duration::from_millis(10),
+        100,
+        100,
+        Some(image::ImageFormat::Jpeg),
+        1000,
+        None,
+    );
+    let entry_after_full = app.prefetch_cache.get(1).expect("entry must exist");
+    assert!(entry_after_full.image.is_some());
+    assert!(app.prefetch_cache.has_full_image(1));
+
+    // Calling trigger_prefetch() must now skip index 1
+    app.trigger_prefetch();
+    assert!(channels.loader_rx.try_recv().is_err());
+}
+
+#[test]
 fn test_sequence_number_protection() {
     let (mut app, channels) = setup_test_app_with_channels();
     while channels.loader_rx.try_recv().is_ok() {}

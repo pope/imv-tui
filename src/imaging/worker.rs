@@ -207,7 +207,7 @@ fn can_pop_job(state: &DecodeQueueState, max_workers: usize) -> bool {
         .in_flight
         .iter()
         .flatten()
-        .any(|slot| !slot.mode.is_prefetch());
+        .any(|slot| !slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire));
     if any_foreground_in_flight {
         return false;
     }
@@ -498,15 +498,45 @@ pub fn spawn_loader_pool(
                 for slot in state.in_flight.iter_mut().flatten() {
                     if is_fast_scroll_batch {
                         slot.cancel_flag.store(true, Ordering::Release);
-                    } else if let Some(matching_req) =
-                        current_requests.iter().find(|r| r.idx == slot.idx)
+                    } else if !slot.cancel_flag.load(Ordering::Acquire)
+                        && let Some(matching_req) =
+                            current_requests.iter().find(|r| r.idx == slot.idx)
                     {
-                        slot.sequence.store(highest_seq, Ordering::Release);
-                        if !matching_req.mode.is_prefetch() {
+                        let prev_seq = slot.sequence.swap(highest_seq, Ordering::AcqRel);
+                        if prev_seq < highest_seq || !matching_req.mode.is_prefetch() {
                             slot.mode = matching_req.mode;
                         }
                     } else if slot.sequence.load(Ordering::Acquire) < highest_seq {
                         slot.cancel_flag.store(true, Ordering::Release);
+                    }
+                }
+
+                if !is_fast_scroll_batch
+                    && current_requests.iter().any(|r| !r.mode.is_prefetch())
+                    && !state.in_flight.iter().flatten().any(|slot| {
+                        !slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
+                    })
+                {
+                    let max_prefetch = num_workers.saturating_sub(1).max(1);
+                    let mut active_prefetches = state
+                        .in_flight
+                        .iter()
+                        .flatten()
+                        .filter(|slot| {
+                            slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
+                        })
+                        .count();
+                    if active_prefetches > max_prefetch {
+                        for slot in state.in_flight.iter_mut().flatten() {
+                            if active_prefetches <= max_prefetch {
+                                break;
+                            }
+                            if slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
+                            {
+                                slot.cancel_flag.store(true, Ordering::Release);
+                                active_prefetches -= 1;
+                            }
+                        }
                     }
                 }
 
@@ -717,8 +747,8 @@ pub fn spawn_loader_pool(
                     if slot.idx == r.idx && !slot.cancel_flag.load(Ordering::Acquire) {
                         already_in_flight = true;
                         slot.has_thumbnail |= has_thumbnail;
-                        slot.sequence.store(r.sequence, Ordering::Release);
-                        if !r.mode.is_prefetch() {
+                        let prev_seq = slot.sequence.swap(r.sequence, Ordering::AcqRel);
+                        if prev_seq < r.sequence || !r.mode.is_prefetch() {
                             slot.mode = r.mode;
                         }
                     }
@@ -729,10 +759,10 @@ pub fn spawn_loader_pool(
                     if job.idx == r.idx {
                         already_pending = true;
                         job.has_thumbnail |= has_thumbnail;
-                        job.sequence = r.sequence;
-                        if !r.mode.is_prefetch() && job.mode.is_prefetch() {
+                        if job.sequence < r.sequence || !r.mode.is_prefetch() {
                             job.mode = r.mode;
                         }
+                        job.sequence = r.sequence;
                     }
                 }
 
@@ -2464,6 +2494,149 @@ mod tests {
 
         assert_eq!(state.pending[0].mode, LoaderMode::Prefetch);
         assert_eq!(state.pending[0].sequence, 2);
+    }
+
+    #[test]
+    fn test_in_flight_foreground_demotion_to_prefetch_unblocks_new_foreground() {
+        let max_workers = 5;
+        let mut state = DecodeQueueState {
+            pending: VecDeque::new(),
+            in_flight: Vec::new(),
+            shutdown: false,
+        };
+
+        let make_job = |idx: usize, sequence: u64, mode: LoaderMode| DecodeJob {
+            idx,
+            source: ImageSource::Local(std::path::PathBuf::from("dummy.png")),
+            mode,
+            sequence,
+            bytes_opt: None,
+            raw_header_opt: None,
+            local_path: None,
+            has_thumbnail: false,
+        };
+
+        let make_slot = |idx: usize, sequence: u64, mode: LoaderMode| InFlightSlot {
+            idx,
+            sequence: Arc::new(AtomicU64::new(sequence)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            mode,
+            has_thumbnail: false,
+        };
+
+        // 1. Foreground job (idx 0) is in flight at sequence 1
+        state
+            .in_flight
+            .push(Some(make_slot(0, 1, LoaderMode::ThumbnailAndFull)));
+
+        // Pending foreground job (idx 1) for sequence 2
+        state
+            .pending
+            .push_back(make_job(1, 2, LoaderMode::ThumbnailAndFull));
+
+        // While foreground job (idx 0) is in flight, can_pop_job cannot pop idx 1
+        assert!(!can_pop_job(&state, max_workers));
+
+        // When the in-flight foreground slot is cancelled, can_pop_job can immediately pop idx 1
+        state.in_flight[0]
+            .as_ref()
+            .unwrap()
+            .cancel_flag
+            .store(true, Ordering::Release);
+        assert!(can_pop_job(&state, max_workers));
+        state.in_flight[0]
+            .as_ref()
+            .unwrap()
+            .cancel_flag
+            .store(false, Ordering::Release);
+        assert!(!can_pop_job(&state, max_workers));
+
+        // 2. Next sequence 2 requests arrive: idx 1 is foreground, idx 0 is demoted to prefetch
+        let highest_seq = 2;
+        let current_requests = [
+            LoaderRequest {
+                idx: 1,
+                source: ImageSource::Local(std::path::PathBuf::from("dummy1.png")),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 2,
+            },
+            LoaderRequest {
+                idx: 0,
+                source: ImageSource::Local(std::path::PathBuf::from("dummy0.png")),
+                mode: LoaderMode::Prefetch,
+                sequence: 2,
+            },
+        ];
+
+        // Reconcile in_flight slots with current_requests
+        for slot in state.in_flight.iter_mut().flatten() {
+            if !slot.cancel_flag.load(Ordering::Acquire)
+                && let Some(matching_req) = current_requests.iter().find(|r| r.idx == slot.idx)
+            {
+                let prev_seq = slot.sequence.swap(highest_seq, Ordering::AcqRel);
+                if prev_seq < highest_seq || !matching_req.mode.is_prefetch() {
+                    slot.mode = matching_req.mode;
+                }
+            } else if slot.sequence.load(Ordering::Acquire) < highest_seq {
+                slot.cancel_flag.store(true, Ordering::Release);
+            }
+        }
+
+        // Verify slot 0 is demoted to Prefetch
+        let slot0 = state.in_flight[0].as_ref().unwrap();
+        assert!(slot0.mode.is_prefetch());
+        assert_eq!(slot0.sequence.load(Ordering::Acquire), 2);
+
+        // Verify can_pop_job now allows popping the new foreground job (idx 1) without waiting for idx 0
+        assert!(can_pop_job(&state, max_workers));
+
+        // 3. Verify worker reservation when all workers are saturated with prefetches
+        // Add 4 more prefetch slots so all 5 workers are busy with prefetches
+        for i in 2..6 {
+            state
+                .in_flight
+                .push(Some(make_slot(i, 2, LoaderMode::Prefetch)));
+        }
+        assert_eq!(state.in_flight.len(), 5);
+
+        // Total active prefetches = 5, but max_prefetch = max_workers - 1 = 4
+        let max_prefetch = max_workers.saturating_sub(1).max(1);
+        let mut active_prefetches = state
+            .in_flight
+            .iter()
+            .flatten()
+            .filter(|slot| slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire))
+            .count();
+        assert_eq!(active_prefetches, 5);
+
+        // Run worker reservation reconciliation
+        if current_requests.iter().any(|r| !r.mode.is_prefetch())
+            && !state
+                .in_flight
+                .iter()
+                .flatten()
+                .any(|slot| !slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire))
+            && active_prefetches > max_prefetch
+        {
+            for slot in state.in_flight.iter_mut().flatten() {
+                if active_prefetches <= max_prefetch {
+                    break;
+                }
+                if slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire) {
+                    slot.cancel_flag.store(true, Ordering::Release);
+                    active_prefetches -= 1;
+                }
+            }
+        }
+
+        // Exactly 1 prefetch was cancelled so active prefetch slots <= max_prefetch (4)
+        let non_cancelled = state
+            .in_flight
+            .iter()
+            .flatten()
+            .filter(|slot| !slot.cancel_flag.load(Ordering::Acquire))
+            .count();
+        assert_eq!(non_cancelled, 4);
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl App {
             if idx == self.queue.current_index {
                 continue;
             }
-            if !self.prefetch_cache.contains_key(idx) {
+            if !self.prefetch_cache.has_full_image(idx) {
                 let source = self.queue.images()[idx].clone();
                 let _ = self.loader_tx.send(LoaderRequest {
                     idx,

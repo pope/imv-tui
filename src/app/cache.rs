@@ -61,7 +61,13 @@ impl PrefetchCache {
         self.entries.get(&idx)
     }
 
+    /// Returns true if the cache contains a decoded full-resolution image for `idx`.
+    pub fn has_full_image(&self, idx: usize) -> bool {
+        self.entries.get(&idx).is_some_and(|e| e.image.is_some())
+    }
+
     /// Returns true if the cache contains an entry for `idx`.
+    #[cfg(test)]
     pub fn contains_key(&self, idx: usize) -> bool {
         self.entries.contains_key(&idx)
     }
@@ -374,6 +380,7 @@ mod cache_sliding_window_tests {
         let mut cache = PrefetchCache::new();
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
+        assert!(!cache.has_full_image(1));
 
         let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
         cache.upsert_thumbnail(
@@ -393,6 +400,8 @@ mod cache_sliding_window_tests {
         let entry = cache.get(1).expect("entry must exist");
         assert!(entry.image.is_none());
         assert!(entry.thumbnail.is_some());
+        assert!(!cache.has_full_image(1));
+        assert!(cache.contains_key(1));
         assert_eq!(
             entry.thumbnail.as_ref().map(|t| t.source),
             Some(ThumbnailSource::Exif)
@@ -413,6 +422,8 @@ mod cache_sliding_window_tests {
         let entry = cache.get(1).expect("entry must exist");
         assert!(entry.image.is_some());
         assert!(entry.thumbnail.is_some());
+        assert!(cache.has_full_image(1));
+        assert!(cache.contains_key(1));
 
         // Insert more than MAX_PREFETCH_CACHE_CAPACITY items (e.g. 25 items) to expand capacity
         for i in 2..27 {
@@ -439,5 +450,47 @@ mod cache_sliding_window_tests {
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(cache.capacity() <= MAX_PREFETCH_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn test_prefetch_cache_has_full_image() {
+        let mut cache = PrefetchCache::new();
+
+        // 1. Empty state
+        assert!(!cache.has_full_image(0));
+        assert!(!cache.contains_key(0));
+
+        // 2. Thumbnail-only state
+        let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+        cache.upsert_thumbnail(
+            0,
+            CachedThumbnail {
+                image: thumb,
+                source: ThumbnailSource::Exif,
+                decode_duration: std::time::Duration::from_millis(2),
+            },
+            100,
+            100,
+            Some(image::ImageFormat::Jpeg),
+            1000,
+            None,
+        );
+        assert!(cache.contains_key(0));
+        assert!(!cache.has_full_image(0));
+
+        // 3. Full-image state
+        let full = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
+        cache.upsert_full(
+            0,
+            full,
+            std::time::Duration::from_millis(10),
+            100,
+            100,
+            Some(image::ImageFormat::Jpeg),
+            1000,
+            None,
+        );
+        assert!(cache.contains_key(0));
+        assert!(cache.has_full_image(0));
     }
 }
