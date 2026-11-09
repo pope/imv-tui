@@ -490,7 +490,6 @@ pub fn parse_png_thumbnail_metadata(header: &[u8]) -> Option<PngThumbMetadata> {
 }
 
 /// Parses the `Thumb::MTime` timestamp from a PNG header buffer without heap allocation.
-#[cfg(test)]
 pub fn parse_png_mtime(header: &[u8]) -> Option<i64> {
     parse_png_thumbnail_metadata(header).and_then(|m| m.mtime_sec)
 }
@@ -498,7 +497,6 @@ pub fn parse_png_mtime(header: &[u8]) -> Option<i64> {
 /// Probes a thumbnail file to verify its `Thumb::MTime` matches `expected_mtime`.
 ///
 /// Reads at most 2,048 bytes on the stack without reading or decoding the whole image.
-#[cfg(test)]
 pub fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf> {
     let mut file = std::fs::File::open(thumb_path).ok()?;
     let mut buf = [0u8; 2048];
@@ -508,6 +506,36 @@ pub fn probe_thumbnail(thumb_path: &Path, expected_mtime: i64) -> Option<PathBuf
     } else {
         None
     }
+}
+
+/// Returns `true` if a valid, up-to-date Freedesktop thumbnail already exists in `cache_root`
+/// for `source_path` across any standard tier (`Large`, `Normal`, `XLarge`, `XXLarge`),
+/// probing only the 2,048-byte PNG header on the stack without decoding the image.
+pub fn has_valid_cached_thumbnail(cache_root: &Path, source_path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(source_path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let mtime = dur.as_secs() as i64;
+    let Some((_uri, md5_filename)) = cache_key_for_path(source_path) else {
+        return false;
+    };
+
+    let tiers = [
+        ThumbTier::Large,
+        ThumbTier::Normal,
+        ThumbTier::XLarge,
+        ThumbTier::XXLarge,
+    ];
+    tiers.iter().any(|tier| {
+        let p = cache_root.join(tier.dir_name()).join(&md5_filename);
+        probe_thumbnail(&p, mtime).is_some()
+    })
 }
 
 static TMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -980,5 +1008,41 @@ mod tests {
         assert!(rgba_buf_size >= 600 * 400 * 4);
         assert!(rgb_buf_size < 500_000);
         assert!(rgba_buf_size > rgb_buf_size + 900_000);
+    }
+
+    #[test]
+    fn test_has_valid_cached_thumbnail() {
+        let test_dir = std::path::PathBuf::from("target/tmp/test_has_valid_cached_thumb");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let cache_root = test_dir.join("thumbnails");
+        let source_path = test_dir.join("test_img.png");
+
+        let src_img = DynamicImage::ImageRgb8(image::RgbImage::new(400, 300));
+        src_img.save(&source_path).unwrap();
+
+        // 1. Initially no cached thumbnail
+        assert!(!has_valid_cached_thumbnail(&cache_root, &source_path));
+
+        // 2. Generate and save thumbnail
+        let mut resizer = fir::Resizer::new();
+        let saved = save_cached_thumbnail_with_dims(
+            &cache_root,
+            &mut resizer,
+            &source_path,
+            &src_img,
+            (400, 300),
+        );
+        assert!(saved.is_some());
+
+        // 3. Now valid cached thumbnail exists
+        assert!(has_valid_cached_thumbnail(&cache_root, &source_path));
+
+        // 4. Non-existent source path returns false
+        let nonexistent = test_dir.join("does_not_exist.png");
+        assert!(!has_valid_cached_thumbnail(&cache_root, &nonexistent));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

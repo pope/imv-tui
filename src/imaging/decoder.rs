@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::raw::*;
@@ -531,7 +532,7 @@ fn decode_single_payload_cancellable(
             let h = img.height();
             let final_raw_dims = raw_dimensions.unwrap_or((w, h));
             return Ok(DecodedImage {
-                image: img,
+                image: Arc::new(img),
                 width: w,
                 height: h,
                 format: Some(image::ImageFormat::Jpeg),
@@ -589,7 +590,7 @@ fn decode_single_payload_cancellable(
             let h = img.height();
             let final_raw_dims = raw_dimensions.unwrap_or((w, h));
             Ok(DecodedImage {
-                image: img,
+                image: Arc::new(img),
                 width: w,
                 height: h,
                 format,
@@ -1424,7 +1425,7 @@ mod tests {
         let src_jpg = ImageSource::Local(PathBuf::from("test.jpg"));
         let decoded_jpg = decode_image_bytes(&jpeg_bytes, &src_jpg).expect("JPEG decode failed");
         assert!(
-            matches!(decoded_jpg.image, DynamicImage::ImageRgb8(_)),
+            matches!(*decoded_jpg.image, DynamicImage::ImageRgb8(_)),
             "Expected JPEG to decode directly as DynamicImage::ImageRgb8"
         );
 
@@ -1432,7 +1433,7 @@ mod tests {
         let decoded_rgb_png =
             decode_image_bytes(&rgb_png_bytes, &src_rgb_png).expect("RGB PNG decode failed");
         assert!(
-            matches!(decoded_rgb_png.image, DynamicImage::ImageRgb8(_)),
+            matches!(*decoded_rgb_png.image, DynamicImage::ImageRgb8(_)),
             "Expected RGB PNG to decode directly as DynamicImage::ImageRgb8"
         );
 
@@ -1441,7 +1442,7 @@ mod tests {
         let decoded_rgba_png =
             decode_image_bytes(&rgba_png_bytes, &src_rgba_png).expect("RGBA PNG decode failed");
         assert!(
-            matches!(decoded_rgba_png.image, DynamicImage::ImageRgba8(_)),
+            matches!(*decoded_rgba_png.image, DynamicImage::ImageRgba8(_)),
             "Expected RGBA PNG to decode as DynamicImage::ImageRgba8"
         );
 

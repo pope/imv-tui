@@ -222,12 +222,11 @@ impl App {
 
             match resp.result {
                 Ok(decoded) => {
-                    let img = decoded.image;
+                    let shared_img = decoded.image;
                     let w = decoded.width;
                     let h = decoded.height;
                     let format = decoded.format;
                     let disk_size = decoded.disk_size;
-                    let shared_img = Arc::new(img);
                     let window = self.get_sliding_window();
                     if window.contains(resp.idx) {
                         if let Some(thumb_src) = resp.thumbnail_source {

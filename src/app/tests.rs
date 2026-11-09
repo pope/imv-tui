@@ -8,6 +8,7 @@ use image::DynamicImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 #[test]
@@ -494,7 +495,7 @@ fn test_sequence_number_protection() {
         thumbnail_source: None,
         sequence: 9,
         result: Ok(DecodedImage {
-            image: dummy_img,
+            image: Arc::new(dummy_img),
             width: 1,
             height: 1,
             format: None,
@@ -605,7 +606,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
         thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
         sequence: app.current_sequence,
         result: Ok(DecodedImage {
-            image: thumb_img,
+            image: Arc::new(thumb_img),
             width: 160,
             height: 120,
             format: Some(image::ImageFormat::Jpeg),
@@ -650,7 +651,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
         thumbnail_source: None,
         sequence: app.current_sequence,
         result: Ok(DecodedImage {
-            image: full_img,
+            image: Arc::new(full_img),
             width: 1920,
             height: 1080,
             format: Some(image::ImageFormat::Jpeg),
@@ -702,7 +703,7 @@ fn test_sequence_number_invalidation() {
         thumbnail_source: None,
         sequence: 9,
         result: Ok(DecodedImage {
-            image: dummy_img,
+            image: Arc::new(dummy_img),
             width: 100,
             height: 100,
             format: None,
@@ -761,7 +762,7 @@ fn test_sequence_number_invalidation() {
         thumbnail_source: None,
         sequence: seq_before,
         result: Ok(DecodedImage {
-            image: DynamicImage::ImageRgb8(image::RgbImage::new(50, 50)),
+            image: Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(50, 50))),
             width: 50,
             height: 50,
             format: None,
@@ -1524,7 +1525,7 @@ fn test_wait_for_frame_ready_and_frame_ready_pending() {
             thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
             sequence: app.current_sequence,
             result: Ok(DecodedImage {
-                image: thumb_img,
+                image: Arc::new(thumb_img),
                 width: 40,
                 height: 30,
                 format: Some(image::ImageFormat::Jpeg),

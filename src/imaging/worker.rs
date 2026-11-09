@@ -19,7 +19,12 @@ use super::raw::{
     RAW_EXIF_PROBE_LIMIT, probe_raw_header, read_source_bytes_limited,
     read_source_bytes_with_header,
 };
-use super::thumbcache::{load_cached_thumbnail_with_metadata, save_cached_thumbnail_with_dims};
+#[cfg(test)]
+use super::thumbcache::cache_key_for_path;
+use super::thumbcache::{
+    has_valid_cached_thumbnail, load_cached_thumbnail_with_metadata,
+    save_cached_thumbnail_with_dims,
+};
 use super::types::*;
 
 /// A request payload sent to the resizing worker threads.
@@ -116,6 +121,44 @@ pub fn spawn_resize_worker(
 /// Maximum number of concurrent full-image decode worker threads in the loader pool.
 pub const MAX_DECODE_WORKERS: usize = 5;
 
+/// Maximum capacity for the non-blocking background thumbnail writer queue.
+pub const MAX_THUMB_WRITE_QUEUE: usize = 8;
+
+/// Work item for background Freedesktop thumbnail writing.
+struct ThumbWriteJob {
+    path: PathBuf,
+    image: Arc<DynamicImage>,
+    source_dims: (u32, u32),
+}
+
+/// Shared state for the background thumbnail-writer thread.
+struct ThumbWriteQueue {
+    pending: VecDeque<ThumbWriteJob>,
+    shutdown: bool,
+}
+
+/// Enqueues a thumbnail generation job into the bounded writer queue.
+///
+/// Discards images whose dimensions are already within standard thumbnail boundaries (`<= 256x256`),
+/// deduplicates jobs matching existing pending paths, and applies non-blocking backpressure
+/// by popping the oldest unwritten job when `queue.pending.len() >= max_capacity`.
+fn enqueue_thumb_write_job(queue: &mut ThumbWriteQueue, job: ThumbWriteJob, max_capacity: usize) {
+    if queue.shutdown || (job.image.width() <= 256 && job.image.height() <= 256) {
+        return;
+    }
+    if queue
+        .pending
+        .iter()
+        .any(|existing| existing.path == job.path)
+    {
+        return;
+    }
+    if queue.pending.len() >= max_capacity {
+        queue.pending.pop_front();
+    }
+    queue.pending.push_back(job);
+}
+
 /// Returns the number of parallel full-image decode worker threads to spawn (`2..=5`).
 pub fn decode_worker_count() -> usize {
     std::thread::available_parallelism()
@@ -200,15 +243,60 @@ pub fn spawn_loader_pool(
         Condvar::new(),
     ));
 
+    let thumb_writer_queue: Option<Arc<(Mutex<ThumbWriteQueue>, Condvar)>> =
+        if !disable_thumbnail && let Some(ref cache_root) = thumb_cache_root {
+            let queue = Arc::new((
+                Mutex::new(ThumbWriteQueue {
+                    pending: VecDeque::new(),
+                    shutdown: false,
+                }),
+                Condvar::new(),
+            ));
+            let queue_clone = Arc::clone(&queue);
+            let cache_root = cache_root.clone();
+
+            std::thread::spawn(move || {
+                let mut thumb_resizer = fir::Resizer::new();
+                let (lock, cvar) = &*queue_clone;
+                loop {
+                    let job = {
+                        let mut state = lock.lock().unwrap();
+                        while state.pending.is_empty() && !state.shutdown {
+                            state = cvar.wait(state).unwrap();
+                        }
+                        if state.pending.is_empty() && state.shutdown {
+                            break;
+                        }
+                        state.pending.pop_front()
+                    };
+
+                    if let Some(job) = job
+                        && !has_valid_cached_thumbnail(&cache_root, &job.path)
+                    {
+                        save_cached_thumbnail_with_dims(
+                            &cache_root,
+                            &mut thumb_resizer,
+                            &job.path,
+                            &job.image,
+                            job.source_dims,
+                        );
+                    }
+                }
+            });
+
+            Some(queue)
+        } else {
+            None
+        };
+
     // Spawn Stage 2 parallel decode workers
     for worker_id in 0..num_workers {
         let queue_pair = Arc::clone(&queue_state);
         let response_tx = response_tx.clone();
         let active_seq = Arc::clone(&active_seq);
-        let thumb_cache_root = thumb_cache_root.clone();
+        let thumb_writer_queue = thumb_writer_queue.clone();
 
         std::thread::spawn(move || {
-            let mut thumb_resizer = fir::Resizer::new();
             loop {
                 let (job, cancel_flag, slot_seq) = {
                     let (lock, cvar) = &*queue_pair;
@@ -216,7 +304,7 @@ pub fn spawn_loader_pool(
                     while !can_pop_job(&state, num_workers) && !state.shutdown {
                         state = cvar.wait(state).unwrap();
                     }
-                    if state.shutdown && !can_pop_job(&state, num_workers) {
+                    if state.shutdown {
                         break;
                     }
                     let job = state.pending.pop_front().unwrap();
@@ -272,7 +360,7 @@ pub fn spawn_loader_pool(
                 };
                 let decode_duration = decode_start.elapsed();
 
-                let (final_seq, final_mode, has_thumbnail) = {
+                let (final_seq, final_mode, has_thumb) = {
                     let (lock, cvar) = &*queue_pair;
                     let mut state = lock.lock().unwrap();
                     let finished_slot = state.in_flight[worker_id].take();
@@ -296,21 +384,22 @@ pub fn spawn_loader_pool(
 
                 if !is_cancelled {
                     if let Ok(ref decoded) = res {
-                        if !has_thumbnail
+                        let thumb_job = if !has_thumb
                             && !disable_thumbnail
+                            && (decoded.width > 256 || decoded.height > 256)
                             && let Some(ref path) = job.local_path
-                            && let Some(ref cache_root) = thumb_cache_root
+                            && thumb_writer_queue.is_some()
                         {
-                            save_cached_thumbnail_with_dims(
-                                cache_root,
-                                &mut thumb_resizer,
-                                path,
-                                &decoded.image,
-                                decoded
+                            Some(ThumbWriteJob {
+                                path: path.clone(),
+                                image: Arc::clone(&decoded.image),
+                                source_dims: decoded
                                     .raw_dimensions
                                     .unwrap_or((decoded.width, decoded.height)),
-                            );
-                        }
+                            })
+                        } else {
+                            None
+                        };
 
                         let _ = response_tx.send(LoaderResponse {
                             idx: job.idx,
@@ -320,6 +409,15 @@ pub fn spawn_loader_pool(
                             decode_duration,
                             thumbnail_source: None,
                         });
+
+                        if let Some(t_job) = thumb_job
+                            && let Some(ref queue_pair) = thumb_writer_queue
+                        {
+                            let (ref lock, ref cvar) = **queue_pair;
+                            let mut q = lock.lock().unwrap();
+                            enqueue_thumb_write_job(&mut q, t_job, MAX_THUMB_WRITE_QUEUE);
+                            cvar.notify_one();
+                        }
                     } else if let Err(e) = res
                         && e != "Cancelled"
                     {
@@ -339,6 +437,7 @@ pub fn spawn_loader_pool(
 
     // Spawn Stage 1 fast-thumbnail coordinator thread
     let queue_pair = queue_state;
+    let thumb_writer_queue_coord = thumb_writer_queue;
     std::thread::spawn(move || {
         let mut pending_requests = Vec::new();
         let mut requests: Vec<LoaderRequest> = Vec::with_capacity(16);
@@ -355,10 +454,17 @@ pub fn spawn_loader_pool(
                         let (lock, cvar) = &*queue_pair;
                         let mut state = lock.lock().unwrap();
                         state.shutdown = true;
+                        state.pending.clear();
                         for slot in state.in_flight.iter_mut().flatten() {
                             slot.cancel_flag.store(true, Ordering::Release);
                         }
                         cvar.notify_all();
+                        if let Some(ref thumb_q) = thumb_writer_queue_coord {
+                            let (ref lock, ref cvar) = **thumb_q;
+                            let mut state = lock.lock().unwrap();
+                            state.shutdown = true;
+                            cvar.notify_all();
+                        }
                         break;
                     }
                 }
@@ -525,7 +631,7 @@ pub fn spawn_loader_pool(
                             let _ = response_tx.send(LoaderResponse {
                                 idx: r.idx,
                                 result: Ok(DecodedImage {
-                                    image: thumb_img,
+                                    image: Arc::new(thumb_img),
                                     width: real_w,
                                     height: real_h,
                                     format: Some(image::ImageFormat::Jpeg),
@@ -579,7 +685,7 @@ pub fn spawn_loader_pool(
                         let _ = response_tx.send(LoaderResponse {
                             idx: r.idx,
                             result: Ok(DecodedImage {
-                                image: cached.image,
+                                image: Arc::new(cached.image),
                                 width: real_w,
                                 height: real_h,
                                 format: Some(image::ImageFormat::Png),
@@ -2419,5 +2525,178 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_millis(100))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_thumb_writer_queue_bounded_and_async_write_no_overwrite() {
+        // 1. Test enqueue_thumb_write_job bounds, deduplication, and <=256 filtering
+        let mut queue = ThumbWriteQueue {
+            pending: VecDeque::new(),
+            shutdown: false,
+        };
+
+        // A. Filter out images <= 256x256
+        let small_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(256, 256)));
+        enqueue_thumb_write_job(
+            &mut queue,
+            ThumbWriteJob {
+                path: PathBuf::from("small.png"),
+                image: small_img,
+                source_dims: (256, 256),
+            },
+            MAX_THUMB_WRITE_QUEUE,
+        );
+        assert_eq!(queue.pending.len(), 0);
+
+        // B. Enqueue image > 256
+        let large_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(400, 300)));
+        enqueue_thumb_write_job(
+            &mut queue,
+            ThumbWriteJob {
+                path: PathBuf::from("img_0.png"),
+                image: Arc::clone(&large_img),
+                source_dims: (400, 300),
+            },
+            MAX_THUMB_WRITE_QUEUE,
+        );
+        assert_eq!(queue.pending.len(), 1);
+
+        // C. Deduplicate same path
+        enqueue_thumb_write_job(
+            &mut queue,
+            ThumbWriteJob {
+                path: PathBuf::from("img_0.png"),
+                image: Arc::clone(&large_img),
+                source_dims: (400, 300),
+            },
+            MAX_THUMB_WRITE_QUEUE,
+        );
+        assert_eq!(queue.pending.len(), 1);
+
+        // D. Fill up to MAX_THUMB_WRITE_QUEUE (8)
+        for i in 1..MAX_THUMB_WRITE_QUEUE {
+            enqueue_thumb_write_job(
+                &mut queue,
+                ThumbWriteJob {
+                    path: PathBuf::from(format!("img_{}.png", i)),
+                    image: Arc::clone(&large_img),
+                    source_dims: (400, 300),
+                },
+                MAX_THUMB_WRITE_QUEUE,
+            );
+        }
+        assert_eq!(queue.pending.len(), MAX_THUMB_WRITE_QUEUE);
+        assert_eq!(
+            queue.pending.front().unwrap().path,
+            PathBuf::from("img_0.png")
+        );
+
+        // E. Enqueue 9th job -> pops oldest (img_0.png)
+        enqueue_thumb_write_job(
+            &mut queue,
+            ThumbWriteJob {
+                path: PathBuf::from("img_8.png"),
+                image: Arc::clone(&large_img),
+                source_dims: (400, 300),
+            },
+            MAX_THUMB_WRITE_QUEUE,
+        );
+        assert_eq!(queue.pending.len(), MAX_THUMB_WRITE_QUEUE);
+        assert_eq!(
+            queue.pending.front().unwrap().path,
+            PathBuf::from("img_1.png")
+        );
+        assert_eq!(
+            queue.pending.back().unwrap().path,
+            PathBuf::from("img_8.png")
+        );
+
+        // 2. Integration test: background thumbnail writer writes asynchronously and skips overwriting
+        let test_dir = std::path::PathBuf::from("target/tmp/async_thumb_writer_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let src_path = test_dir.join("async_test.png");
+        let src_img = DynamicImage::ImageRgb8(image::RgbImage::new(400, 400));
+        src_img.save(&src_path).unwrap();
+
+        let cache_root = test_dir.join("thumbnails");
+        assert!(!has_valid_cached_thumbnail(&cache_root, &src_path));
+
+        let (loader_tx, loader_rx) = std::sync::mpsc::channel();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let active_seq = Arc::new(AtomicUsize::new(1));
+
+        spawn_loader_pool(
+            loader_rx,
+            response_tx,
+            Arc::clone(&active_seq),
+            false,
+            Some(cache_root.clone()),
+        );
+
+        // Dispatch full decode request without pre-existing thumbnail
+        loader_tx
+            .send(LoaderRequest {
+                idx: 0,
+                source: ImageSource::Local(src_path.clone()),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 1,
+            })
+            .unwrap();
+
+        // UI receives decoded response first
+        let resp = response_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Expected LoaderResponse");
+        assert!(resp.result.is_ok());
+
+        // Poll until background thumbnail writer finishes writing to cache_root
+        let poll_start = std::time::Instant::now();
+        let mut thumb_written = false;
+        while poll_start.elapsed() < std::time::Duration::from_secs(3) {
+            if has_valid_cached_thumbnail(&cache_root, &src_path) {
+                thumb_written = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            thumb_written,
+            "Background thumbnail writer must write thumbnail"
+        );
+
+        // Verify that existing thumbnail is not overwritten
+        let (_uri, md5_name) = super::cache_key_for_path(&src_path).unwrap();
+        let thumb_file = cache_root.join("large").join(&md5_name);
+        assert!(thumb_file.exists());
+        let mtime_first = std::fs::metadata(&thumb_file).unwrap().modified().unwrap();
+
+        // Dispatch second request for the same image with Prefetch mode so Stage 1 skips thumbnail extraction,
+        // forcing Stage 2 to enqueue a ThumbWriteJob and exercising !has_valid_cached_thumbnail on the writer thread
+        active_seq.store(2, Ordering::Release);
+        loader_tx
+            .send(LoaderRequest {
+                idx: 0,
+                source: ImageSource::Local(src_path),
+                mode: LoaderMode::Prefetch,
+                sequence: 2,
+            })
+            .unwrap();
+
+        let _ = response_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("Expected second LoaderResponse");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mtime_second = std::fs::metadata(&thumb_file).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_first, mtime_second,
+            "Background thumbnail writer must skip overwriting already-valid thumbnail"
+        );
+
+        drop(loader_tx);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

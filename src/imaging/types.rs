@@ -691,7 +691,7 @@ pub struct LoaderRequest {
 /// Encapsulates success values for a decoded image.
 pub struct DecodedImage {
     /// The decoded DynamicImage.
-    pub image: DynamicImage,
+    pub image: std::sync::Arc<DynamicImage>,
     /// Width of the image in pixels.
     pub width: u32,
     /// Height of the image in pixels.
