@@ -32,8 +32,8 @@ description: Guidelines on aspect ratio crop mapping, high-performance resizing,
 - **Sliding Window Bounds**: Maintain a sliding window around `current_index` of size $N=2$ (caches the current image + 2 preceding + 2 succeeding visible indices).
 - **Dynamic Pruning**: Call `cache.retain_window(&window_indices)` on every navigation to discard entries outside the active window while preserving active allocations.
 - **No Eviction on Hit**: Never evict cached images on hit; return shared references wrapped in `Arc<DecodedImage>`.
-- **Encapsulated `CachedThumbnail`**: Store `CachedImage` containing `image: Option<Arc<DecodedImage>>` and `thumbnail: Option<CachedThumbnail>`.
-- **Thumbnail Placeholders**: If a cache entry contains `thumbnail: Some(CachedThumbnail)`, display it immediately as a fast low-resolution placeholder while the background worker decodes the full-resolution image.
+- **Encapsulated `CachedThumbnail`**: Store `CachedImage` containing `full: Option<CachedFullImage>` and `thumbnail: ThumbnailState<CachedThumbnail>`.
+- **Thumbnail Placeholders**: If a cache entry contains `thumbnail: ThumbnailState::Loaded(CachedThumbnail)`, display it immediately as a fast low-resolution placeholder while the background worker decodes the full-resolution image.
 
 ### 4. SIMD Adjustments & Precomputed LUTs
 

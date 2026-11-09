@@ -526,16 +526,25 @@ pub fn spawn_loader_pool(
                             slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
                         })
                         .count();
-                    if active_prefetches > max_prefetch {
-                        for slot in state.in_flight.iter_mut().flatten() {
-                            if active_prefetches <= max_prefetch {
-                                break;
-                            }
-                            if slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
-                            {
-                                slot.cancel_flag.store(true, Ordering::Release);
-                                active_prefetches -= 1;
-                            }
+                    while active_prefetches > max_prefetch {
+                        if let Some(victim) = state
+                            .in_flight
+                            .iter_mut()
+                            .flatten()
+                            .filter(|slot| {
+                                slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
+                            })
+                            .max_by_key(|slot| {
+                                current_requests
+                                    .iter()
+                                    .position(|r| r.idx == slot.idx)
+                                    .unwrap_or(usize::MAX)
+                            })
+                        {
+                            victim.cancel_flag.store(true, Ordering::Release);
+                            active_prefetches -= 1;
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -2618,13 +2627,25 @@ mod tests {
                 .any(|slot| !slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire))
             && active_prefetches > max_prefetch
         {
-            for slot in state.in_flight.iter_mut().flatten() {
-                if active_prefetches <= max_prefetch {
-                    break;
-                }
-                if slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire) {
-                    slot.cancel_flag.store(true, Ordering::Release);
+            while active_prefetches > max_prefetch {
+                if let Some(victim) = state
+                    .in_flight
+                    .iter_mut()
+                    .flatten()
+                    .filter(|slot| {
+                        slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
+                    })
+                    .max_by_key(|slot| {
+                        current_requests
+                            .iter()
+                            .position(|r| r.idx == slot.idx)
+                            .unwrap_or(usize::MAX)
+                    })
+                {
+                    victim.cancel_flag.store(true, Ordering::Release);
                     active_prefetches -= 1;
+                } else {
+                    break;
                 }
             }
         }
@@ -2637,6 +2658,156 @@ mod tests {
             .filter(|slot| !slot.cancel_flag.load(Ordering::Acquire))
             .count();
         assert_eq!(non_cancelled, 4);
+    }
+
+    #[test]
+    fn test_worker_reservation_cancels_lowest_priority_prefetch() {
+        let max_workers: usize = 3; // max_prefetch = 2
+        let mut state = DecodeQueueState {
+            pending: VecDeque::new(),
+            in_flight: Vec::new(),
+            shutdown: false,
+        };
+
+        let make_slot = |idx: usize, sequence: u64, mode: LoaderMode| InFlightSlot {
+            idx,
+            sequence: Arc::new(AtomicU64::new(sequence)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            mode,
+            has_thumbnail: false,
+        };
+
+        // Slots in order of insertion:
+        // Slot 0: idx 1 (immediate neighbor +1)
+        // Slot 1: idx 2 (outer neighbor +2)
+        // Slot 2: idx 3 (far neighbor +3, absent from current_requests)
+        state
+            .in_flight
+            .push(Some(make_slot(1, 2, LoaderMode::Prefetch)));
+        state
+            .in_flight
+            .push(Some(make_slot(2, 2, LoaderMode::Prefetch)));
+        state
+            .in_flight
+            .push(Some(make_slot(3, 2, LoaderMode::Prefetch)));
+
+        // Current requests: idx 0 (foreground), idx 1 (immediate neighbor, pos 1), idx 2 (outer neighbor, pos 2)
+        let current_requests = [
+            LoaderRequest {
+                idx: 0,
+                source: ImageSource::Local(std::path::PathBuf::from("img0.png")),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 2,
+            },
+            LoaderRequest {
+                idx: 1,
+                source: ImageSource::Local(std::path::PathBuf::from("img1.png")),
+                mode: LoaderMode::Prefetch,
+                sequence: 2,
+            },
+            LoaderRequest {
+                idx: 2,
+                source: ImageSource::Local(std::path::PathBuf::from("img2.png")),
+                mode: LoaderMode::Prefetch,
+                sequence: 2,
+            },
+        ];
+
+        let max_prefetch = max_workers.saturating_sub(1).max(1); // 2
+        let mut active_prefetches = state
+            .in_flight
+            .iter()
+            .flatten()
+            .filter(|slot| slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire))
+            .count();
+        assert_eq!(active_prefetches, 3);
+
+        while active_prefetches > max_prefetch {
+            if let Some(victim) = state
+                .in_flight
+                .iter_mut()
+                .flatten()
+                .filter(|slot| slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire))
+                .max_by_key(|slot| {
+                    current_requests
+                        .iter()
+                        .position(|r| r.idx == slot.idx)
+                        .unwrap_or(usize::MAX)
+                })
+            {
+                victim.cancel_flag.store(true, Ordering::Release);
+                active_prefetches -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Active prefetches is now 2.
+        assert_eq!(active_prefetches, 2);
+        // Slot 2 (idx 3, not in requests) was cancelled!
+        assert!(
+            state.in_flight[2]
+                .as_ref()
+                .unwrap()
+                .cancel_flag
+                .load(Ordering::Acquire)
+        );
+        // Slot 0 (idx 1) and Slot 1 (idx 2) were NOT cancelled.
+        assert!(
+            !state.in_flight[0]
+                .as_ref()
+                .unwrap()
+                .cancel_flag
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            !state.in_flight[1]
+                .as_ref()
+                .unwrap()
+                .cancel_flag
+                .load(Ordering::Acquire)
+        );
+
+        // Now test when both remaining slots are in current_requests (outer neighbor idx 2 vs immediate neighbor idx 1)
+        // If max_workers was 2 (max_prefetch = 1):
+        let max_prefetch_1 = 1;
+        while active_prefetches > max_prefetch_1 {
+            if let Some(victim) = state
+                .in_flight
+                .iter_mut()
+                .flatten()
+                .filter(|slot| slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire))
+                .max_by_key(|slot| {
+                    current_requests
+                        .iter()
+                        .position(|r| r.idx == slot.idx)
+                        .unwrap_or(usize::MAX)
+                })
+            {
+                victim.cancel_flag.store(true, Ordering::Release);
+                active_prefetches -= 1;
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(active_prefetches, 1);
+        // Slot 1 (outer neighbor idx 2) was cancelled!
+        assert!(
+            state.in_flight[1]
+                .as_ref()
+                .unwrap()
+                .cancel_flag
+                .load(Ordering::Acquire)
+        );
+        // Slot 0 (immediate neighbor idx 1) remains active!
+        assert!(
+            !state.in_flight[0]
+                .as_ref()
+                .unwrap()
+                .cancel_flag
+                .load(Ordering::Acquire)
+        );
     }
 
     #[test]

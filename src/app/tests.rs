@@ -640,6 +640,102 @@ fn test_sequence_number_protection() {
 }
 
 #[test]
+fn test_salvage_in_window_decode_across_sequence_steps() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // Initially current_sequence = 1. User navigated forward so sequence bumped to 2.
+    app.current_sequence = 2;
+    app.active_sequence.store(2, Ordering::Release);
+
+    // Image 1 is in the visible sliding window
+    assert!(app.get_sliding_window().contains(1));
+
+    // A prefetch response for image 1 arrives that was dispatched at sequence 1 (< current_sequence 2)
+    let dummy_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(50, 50)));
+    let resp = LoaderResponse {
+        idx: 1,
+        is_prefetch: true,
+        thumbnail_source: None,
+        sequence: 1,
+        result: Ok(DecodedImage {
+            image: dummy_img,
+            width: 50,
+            height: 50,
+            format: image::ImageFormat::Png,
+            disk_size: 1234,
+            raw_dimensions: None,
+        }),
+        decode_duration: std::time::Duration::from_millis(15),
+    };
+    channels.response_tx.send(resp).unwrap();
+
+    let updated = app.update_channels();
+    assert!(updated);
+
+    // Stale sequence must NOT mutate foreground viewport state
+    assert!(app.original_image.is_none());
+    assert_eq!(app.img_width, 0);
+    assert_eq!(app.img_height, 0);
+
+    // But it MUST be salvaged into prefetch_cache since it's within the sliding window
+    assert!(app.prefetch_cache.has_full_image(1));
+    let cached = app.prefetch_cache.get(1).expect("image 1 must be cached");
+    assert_eq!(cached.width, 50);
+    assert_eq!(cached.height, 50);
+}
+
+#[test]
+fn test_prefetch_cache_invalidate_drops_stale_sequences() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    app.current_sequence = 5;
+    app.active_sequence.store(5, Ordering::Release);
+
+    // Directory rescan or invalidation occurs at sequence 5, setting min_valid_sequence to 6
+    app.prefetch_cache.invalidate(6);
+    assert_eq!(app.prefetch_cache.min_valid_sequence(), 6);
+
+    // A response arrives with sequence 5 (< min_valid_sequence 6)
+    let dummy_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(50, 50)));
+    let resp = LoaderResponse {
+        idx: 1,
+        is_prefetch: true,
+        thumbnail_source: None,
+        sequence: 5,
+        result: Ok(DecodedImage {
+            image: dummy_img,
+            width: 50,
+            height: 50,
+            format: image::ImageFormat::Png,
+            disk_size: 1234,
+            raw_dimensions: None,
+        }),
+        decode_duration: std::time::Duration::from_millis(15),
+    };
+    channels.response_tx.send(resp).unwrap();
+
+    let updated = app.update_channels();
+    assert!(updated);
+
+    // Dropped completely: not in cache and not mutating foreground
+    assert!(!app.prefetch_cache.has_full_image(1));
+    assert!(app.prefetch_cache.is_empty());
+    assert!(app.original_image.is_none());
+}
+
+#[test]
+fn test_rescan_directory_invalidates_prefetch_cache_sequence() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    let seq_before = app.current_sequence;
+    app.prefetch_cache.invalidate(app.current_sequence + 1);
+    assert_eq!(app.prefetch_cache.min_valid_sequence(), seq_before + 1);
+}
+
+#[test]
 fn test_error_propagation_boundary() {
     let (mut app, channels) = setup_test_app_with_channels();
     while channels.loader_rx.try_recv().is_ok() {}

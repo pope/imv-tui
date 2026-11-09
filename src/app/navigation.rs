@@ -172,8 +172,8 @@ impl App {
             return Err("No supported images found".to_string());
         }
 
-        // Clear prefetch cache immediately since index associations have changed
-        self.prefetch_cache.clear();
+        // Invalidate prefetch cache immediately so stale in-flight decodes from before the rescan are dropped
+        self.prefetch_cache.invalidate(self.current_sequence + 1);
 
         // Atomically rescan and preserve existing classifications and adjustments
         self.queue

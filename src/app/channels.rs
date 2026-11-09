@@ -224,7 +224,7 @@ impl App {
         let mut received = false;
         while let Ok(resp) = self.response_rx.try_recv() {
             received = true;
-            if resp.sequence < self.current_sequence {
+            if resp.sequence < self.prefetch_cache.min_valid_sequence() {
                 continue;
             }
 
@@ -264,6 +264,10 @@ impl App {
                                 resp.is_prefetch,
                             );
                         }
+                    }
+
+                    if resp.sequence < self.current_sequence {
+                        continue;
                     }
 
                     if !resp.is_prefetch && resp.idx == self.queue.current_index {
@@ -344,7 +348,10 @@ impl App {
                     }
                 }
                 Err(err) => {
-                    if !resp.is_prefetch && resp.idx == self.queue.current_index {
+                    if resp.sequence == self.current_sequence
+                        && !resp.is_prefetch
+                        && resp.idx == self.queue.current_index
+                    {
                         self.set_error_state(err);
                     }
                 }

@@ -54,6 +54,7 @@ const INITIAL_PREFETCH_CACHE_CAPACITY: usize = 8;
 #[derive(Default)]
 pub struct PrefetchCache {
     entries: HashMap<usize, CachedImage>,
+    min_valid_sequence: u64,
 }
 
 impl PrefetchCache {
@@ -61,7 +62,23 @@ impl PrefetchCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::with_capacity(INITIAL_PREFETCH_CACHE_CAPACITY),
+            min_valid_sequence: 0,
         }
+    }
+
+    /// Returns the minimum loader sequence number accepted by the cache.
+    pub fn min_valid_sequence(&self) -> u64 {
+        self.min_valid_sequence
+    }
+
+    /// Clears all cached entries and updates the minimum valid sequence threshold.
+    ///
+    /// Any incoming loader response with a sequence number strictly less than
+    /// `min_valid_sequence` will be rejected to prevent stale prefetch decodes
+    /// from older queue/directory states polluting the cache.
+    pub fn invalidate(&mut self, min_valid_sequence: u64) {
+        self.clear();
+        self.min_valid_sequence = min_valid_sequence;
     }
 
     /// Returns a reference to the cached entry for `idx`, if present.
@@ -719,5 +736,31 @@ mod cache_sliding_window_tests {
         assert_eq!(full_after.format, image::ImageFormat::Tiff);
         assert_eq!(full_after.disk_size, 50_000_000);
         assert_eq!(entry1_after_thumb.raw_dimensions, Some((4000, 3000)));
+    }
+
+    #[test]
+    fn test_prefetch_cache_invalidate_and_min_valid_sequence() {
+        let mut cache = PrefetchCache::new();
+        assert_eq!(cache.min_valid_sequence(), 0);
+
+        let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+        cache.upsert_full(
+            1,
+            CachedFullImage {
+                image: img,
+                decode_duration: std::time::Duration::from_millis(5),
+                format: image::ImageFormat::Png,
+                disk_size: 100,
+            },
+            10,
+            10,
+            None,
+            false,
+        );
+        assert_eq!(cache.len(), 1);
+
+        cache.invalidate(42);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.min_valid_sequence(), 42);
     }
 }
