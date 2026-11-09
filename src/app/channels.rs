@@ -2,7 +2,7 @@
 
 use crate::app::cache::{CachedThumbnail, VisibleWindow};
 use crate::app::palette::PaletteMode;
-use crate::app::{App, InitialLoadState, LoadPhase, ThumbnailTelemetry};
+use crate::app::{App, InitialLoadState, LoadPhase, ThumbnailState, ThumbnailTelemetry};
 use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -88,20 +88,27 @@ impl App {
                 };
                 self.original_image = Some(display_img);
 
-                if let Some(cached_thumb) = cached_img.thumbnail {
-                    let rotated_thumb = adj
-                        .rotate_image(&cached_thumb.image)
-                        .map(Arc::new)
-                        .unwrap_or(cached_thumb.image);
-                    self.stats.thumbnail = Some(ThumbnailTelemetry {
-                        load_duration: cached_thumb.decode_duration,
-                        dimensions: (rotated_thumb.width(), rotated_thumb.height()),
-                        source: cached_thumb.source,
-                    });
-                    self.thumbnail_image = Some(rotated_thumb);
-                } else {
-                    self.thumbnail_image = None;
-                    self.stats.thumbnail = None;
+                match cached_img.thumbnail {
+                    ThumbnailState::Loaded(cached_thumb) => {
+                        let rotated_thumb = adj
+                            .rotate_image(&cached_thumb.image)
+                            .map(Arc::new)
+                            .unwrap_or(cached_thumb.image);
+                        self.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
+                            load_duration: cached_thumb.decode_duration,
+                            dimensions: (rotated_thumb.width(), rotated_thumb.height()),
+                            source: cached_thumb.source,
+                        });
+                        self.thumbnail_image = Some(rotated_thumb);
+                    }
+                    ThumbnailState::Skipped => {
+                        self.thumbnail_image = None;
+                        self.stats.thumbnail = ThumbnailState::Skipped;
+                    }
+                    ThumbnailState::Absent => {
+                        self.thumbnail_image = None;
+                        self.stats.thumbnail = ThumbnailState::Absent;
+                    }
                 }
                 self.show_thumbnail_only = false;
                 self.load_phase = LoadPhase::Complete;
@@ -124,7 +131,7 @@ impl App {
                     self.trigger_prefetch();
                 }
                 return;
-            } else if let Some(cached_thumb) = cached_img.thumbnail {
+            } else if let ThumbnailState::Loaded(cached_thumb) = cached_img.thumbnail {
                 // If we only have a thumbnail, display it immediately as a fast placeholder,
                 // but continue loading the full resolution image in the background.
                 let rotated_thumb = adj
@@ -148,7 +155,7 @@ impl App {
                 self.resize_state.mark_dirty_with_init_zoom();
                 loaded_cached_thumb = true;
                 self.stats.is_prefetch_cache_hit = true;
-                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                self.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
                     load_duration: cached_thumb.decode_duration,
                     dimensions: (tw, th),
                     source: cached_thumb.source,
@@ -163,7 +170,7 @@ impl App {
             self.thumbnail_image = None;
             self.show_thumbnail_only = false;
             self.stats.is_prefetch_cache_hit = false;
-            self.stats.thumbnail = None;
+            self.stats.thumbnail = ThumbnailState::Absent;
             self.stats.raw_dimensions = None;
         }
         self.stats.load_duration = None;
@@ -253,6 +260,7 @@ impl App {
                                 format,
                                 disk_size,
                                 decoded.raw_dimensions,
+                                resp.is_prefetch,
                             );
                         }
                     }
@@ -269,7 +277,7 @@ impl App {
                                 && !self.show_thumbnail_only
                                 && self.original_image.is_some()
                             {
-                                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                                self.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
                                     load_duration: resp.decode_duration,
                                     dimensions: (rotated_img.width(), rotated_img.height()),
                                     source: thumb_src,
@@ -295,7 +303,7 @@ impl App {
                                 self.error_message = None;
                                 self.resize_state.mark_dirty_with_init_zoom();
 
-                                self.stats.thumbnail = Some(ThumbnailTelemetry {
+                                self.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
                                     load_duration: resp.decode_duration,
                                     dimensions: (thumb_w, thumb_h),
                                     source: thumb_src,
@@ -322,6 +330,9 @@ impl App {
 
                             self.stats.load_duration = Some(resp.decode_duration);
                             self.stats.is_prefetch_cache_hit = false;
+                            if self.stats.thumbnail.is_skipped() {
+                                self.stats.thumbnail = ThumbnailState::Absent;
+                            }
                             self.stats.disk_size = disk_size;
                             self.stats.format = format;
                             self.stats.raw_dimensions = decoded.raw_dimensions;

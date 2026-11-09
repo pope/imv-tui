@@ -384,7 +384,7 @@ pub struct MockChannels {
     pub protocol_tx: mpsc::Sender<ResizeResponse>,
 }
 
-pub use crate::ui::{ImageDisplayState, StatsForNerds, ThumbnailTelemetry};
+pub use crate::ui::{ImageDisplayState, StatsForNerds, ThumbnailState, ThumbnailTelemetry};
 
 /// The central application state controller.
 pub struct App {

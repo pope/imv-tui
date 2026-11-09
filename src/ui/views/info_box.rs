@@ -1,5 +1,5 @@
 use crate::config::Classification;
-use crate::ui::model::InfoBoxModel;
+use crate::ui::model::{InfoBoxModel, ThumbnailState};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -183,25 +183,27 @@ pub fn draw(frame: &mut Frame, model: &InfoBoxModel<'_>, area: Rect) {
 
             let thumb_load_line = if *disable_thumbnail {
                 Line::from(vec!["   Thumbnail Load: ".gray(), "N/A (Disabled)".gray()])
-            } else if let Some(ref thumb) = stats.thumbnail {
-                Line::from(vec![
-                    "   Thumbnail Load: ".gray(),
-                    format!(
-                        "{:.2} ms @ {} x {} px ({})",
-                        thumb.load_duration.as_secs_f64() * 1000.0,
-                        thumb.dimensions.0,
-                        thumb.dimensions.1,
-                        thumb.source.display_label()
-                    )
-                    .bold(),
-                ])
-            } else if stats.is_prefetch_cache_hit {
-                Line::from(vec![
-                    "   Thumbnail Load: ".gray(),
-                    "Skipped (Prefetched)".gray(),
-                ])
             } else {
-                Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()])
+                match stats.thumbnail {
+                    ThumbnailState::Loaded(ref thumb) => Line::from(vec![
+                        "   Thumbnail Load: ".gray(),
+                        format!(
+                            "{:.2} ms @ {} x {} px ({})",
+                            thumb.load_duration.as_secs_f64() * 1000.0,
+                            thumb.dimensions.0,
+                            thumb.dimensions.1,
+                            thumb.source.display_label()
+                        )
+                        .bold(),
+                    ]),
+                    ThumbnailState::Skipped => Line::from(vec![
+                        "   Thumbnail Load: ".gray(),
+                        "Skipped (Prefetched)".gray(),
+                    ]),
+                    ThumbnailState::Absent => {
+                        Line::from(vec!["   Thumbnail Load: ".gray(), "N/A".gray()])
+                    }
+                }
             };
             lines.push(thumb_load_line);
 

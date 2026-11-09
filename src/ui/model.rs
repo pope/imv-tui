@@ -15,13 +15,50 @@ pub struct ThumbnailTelemetry {
     pub source: ThumbnailSource,
 }
 
+/// Mutually-exclusive state of a thumbnail placeholder or telemetry entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThumbnailState<T> {
+    /// No thumbnail was found (or none has been loaded yet).
+    #[default]
+    Absent,
+    /// Thumbnail extraction was bypassed because the full image was decoded via background prefetch.
+    Skipped,
+    /// A thumbnail placeholder was extracted and decoded.
+    Loaded(T),
+}
+
+impl<T> ThumbnailState<T> {
+    /// Returns true if a thumbnail is loaded.
+    pub const fn is_loaded(&self) -> bool {
+        matches!(self, Self::Loaded(_))
+    }
+
+    /// Returns true if no thumbnail is present.
+    pub const fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// Returns true if thumbnail extraction was skipped.
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+
+    /// Returns a reference to the loaded value, if any.
+    pub const fn loaded(&self) -> Option<&T> {
+        match self {
+            Self::Loaded(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 /// Diagnostic and telemetry instrumentation for image decoding, resizing, and protocol delivery.
 #[derive(Debug, Clone, Default)]
 pub struct StatsForNerds {
     /// Time taken to load (decode) the photo from disk or zip, or None while loading.
     pub load_duration: Option<std::time::Duration>,
     /// Telemetry metadata for the decoded thumbnail placeholder, if any.
-    pub thumbnail: Option<ThumbnailTelemetry>,
+    pub thumbnail: ThumbnailState<ThumbnailTelemetry>,
     /// Was it loaded from the prefetch cache.
     pub is_prefetch_cache_hit: bool,
     /// Time taken to resize, apply filters, adjustments, etc.
@@ -51,8 +88,15 @@ impl StatsForNerds {
     pub fn total_pipeline_duration(&self, show_thumbnail_only: bool) -> std::time::Duration {
         let active_decode_dur = if self.is_prefetch_cache_hit {
             std::time::Duration::ZERO
+        } else if (show_thumbnail_only || self.load_duration.is_none())
+            && self.thumbnail.is_loaded()
+        {
+            self.thumbnail
+                .loaded()
+                .map(|t| t.load_duration)
+                .unwrap_or_default()
         } else if show_thumbnail_only || self.load_duration.is_none() {
-            self.thumbnail.map(|t| t.load_duration).unwrap_or_default()
+            std::time::Duration::ZERO
         } else {
             self.load_duration.unwrap_or_default()
         };

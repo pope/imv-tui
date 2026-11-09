@@ -1,6 +1,7 @@
 use crate::app::classifications::ViewMode;
 use crate::app::queue::MediaList;
 use crate::imaging::ThumbnailSource;
+use crate::ui::ThumbnailState;
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ pub struct CachedThumbnail {
 pub struct CachedImage {
     /// The cached full-resolution decoded image, if loaded.
     pub image: Option<Arc<DynamicImage>>,
-    /// The cached low-resolution thumbnail image and metadata, if loaded.
-    pub thumbnail: Option<CachedThumbnail>,
+    /// The cached low-resolution thumbnail placeholder or extraction state.
+    pub thumbnail: ThumbnailState<CachedThumbnail>,
     /// The width of the image.
     pub width: u32,
     /// The height of the image.
@@ -119,14 +120,14 @@ impl PrefetchCache {
         raw_dimensions: Option<(u32, u32)>,
     ) {
         if let Some(cached) = self.entries.get_mut(&idx) {
-            cached.thumbnail = Some(thumbnail);
+            cached.thumbnail = ThumbnailState::Loaded(thumbnail);
             cached.raw_dimensions = raw_dimensions;
         } else {
             self.entries.insert(
                 idx,
                 CachedImage {
                     image: None,
-                    thumbnail: Some(thumbnail),
+                    thumbnail: ThumbnailState::Loaded(thumbnail),
                     width,
                     height,
                     format,
@@ -150,8 +151,14 @@ impl PrefetchCache {
         format: Option<image::ImageFormat>,
         disk_size: u64,
         raw_dimensions: Option<(u32, u32)>,
+        is_prefetch: bool,
     ) {
         if let Some(cached) = self.entries.get_mut(&idx) {
+            if cached.image.is_none() && cached.thumbnail.is_absent() && is_prefetch {
+                cached.thumbnail = ThumbnailState::Skipped;
+            } else if !is_prefetch && cached.thumbnail.is_skipped() {
+                cached.thumbnail = ThumbnailState::Absent;
+            }
             cached.image = Some(image);
             cached.width = width;
             cached.height = height;
@@ -164,7 +171,11 @@ impl PrefetchCache {
                 idx,
                 CachedImage {
                     image: Some(image),
-                    thumbnail: None,
+                    thumbnail: if is_prefetch {
+                        ThumbnailState::Skipped
+                    } else {
+                        ThumbnailState::Absent
+                    },
                     width,
                     height,
                     format,
@@ -183,7 +194,7 @@ impl PrefetchCache {
             if let Some(ref img) = entry.image {
                 total_bytes = total_bytes.saturating_add(img.as_bytes().len() as u64);
             }
-            if let Some(ref thumb) = entry.thumbnail {
+            if let ThumbnailState::Loaded(ref thumb) = entry.thumbnail {
                 total_bytes = total_bytes.saturating_add(thumb.image.as_bytes().len() as u64);
             }
         }
@@ -399,11 +410,11 @@ mod cache_sliding_window_tests {
         assert_eq!(cache.len(), 1);
         let entry = cache.get(1).expect("entry must exist");
         assert!(entry.image.is_none());
-        assert!(entry.thumbnail.is_some());
+        assert!(entry.thumbnail.is_loaded());
         assert!(!cache.has_full_image(1));
         assert!(cache.contains_key(1));
         assert_eq!(
-            entry.thumbnail.as_ref().map(|t| t.source),
+            entry.thumbnail.loaded().map(|t| t.source),
             Some(ThumbnailSource::Exif)
         );
 
@@ -417,18 +428,29 @@ mod cache_sliding_window_tests {
             Some(image::ImageFormat::Jpeg),
             1000,
             Some((1000, 1000)),
+            false,
         );
         assert_eq!(cache.len(), 1);
         let entry = cache.get(1).expect("entry must exist");
         assert!(entry.image.is_some());
-        assert!(entry.thumbnail.is_some());
+        assert!(entry.thumbnail.is_loaded());
         assert!(cache.has_full_image(1));
         assert!(cache.contains_key(1));
 
         // Insert more than MAX_PREFETCH_CACHE_CAPACITY items (e.g. 25 items) to expand capacity
         for i in 2..27 {
             let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(5, 5)));
-            cache.upsert_full(i, img, std::time::Duration::ZERO, 5, 5, None, 0, None);
+            cache.upsert_full(
+                i,
+                img,
+                std::time::Duration::ZERO,
+                5,
+                5,
+                None,
+                0,
+                None,
+                false,
+            );
         }
         assert!(cache.capacity() > MAX_PREFETCH_CACHE_CAPACITY);
 
@@ -444,7 +466,17 @@ mod cache_sliding_window_tests {
         // Re-expand capacity and test clear() shrinks capacity
         for i in 100..125 {
             let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(5, 5)));
-            cache.upsert_full(i, img, std::time::Duration::ZERO, 5, 5, None, 0, None);
+            cache.upsert_full(
+                i,
+                img,
+                std::time::Duration::ZERO,
+                5,
+                5,
+                None,
+                0,
+                None,
+                false,
+            );
         }
         assert!(cache.capacity() > MAX_PREFETCH_CACHE_CAPACITY);
         cache.clear();
@@ -489,8 +521,111 @@ mod cache_sliding_window_tests {
             Some(image::ImageFormat::Jpeg),
             1000,
             None,
+            false,
         );
         assert!(cache.contains_key(0));
         assert!(cache.has_full_image(0));
+    }
+
+    #[test]
+    fn test_prefetch_cache_thumbnail_skipped() {
+        let mut cache = PrefetchCache::new();
+
+        // 1. Insert full image via foreground (is_prefetch = false): thumbnail state must be Absent
+        let full1 = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(50, 50)));
+        cache.upsert_full(
+            0,
+            full1.clone(),
+            std::time::Duration::from_millis(5),
+            50,
+            50,
+            Some(image::ImageFormat::Png),
+            500,
+            None,
+            false,
+        );
+        let entry0 = cache.get(0).expect("entry must exist");
+        assert!(entry0.thumbnail.is_absent());
+
+        // 2. Insert full image via background prefetch (is_prefetch = true): thumbnail state must be Skipped
+        let full2 = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(50, 50)));
+        cache.upsert_full(
+            1,
+            full2,
+            std::time::Duration::from_millis(5),
+            50,
+            50,
+            Some(image::ImageFormat::Png),
+            500,
+            None,
+            true,
+        );
+        let entry1 = cache.get(1).expect("entry must exist");
+        assert!(entry1.thumbnail.is_skipped());
+
+        // 3. Updating an existing entry that already has a thumbnail with is_prefetch = true:
+        // thumbnail state must remain Loaded (thumbnail is already present)
+        let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+        cache.upsert_thumbnail(
+            2,
+            CachedThumbnail {
+                image: thumb,
+                source: ThumbnailSource::Exif,
+                decode_duration: std::time::Duration::from_millis(1),
+            },
+            100,
+            100,
+            Some(image::ImageFormat::Jpeg),
+            1000,
+            None,
+        );
+        let full3 = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
+        cache.upsert_full(
+            2,
+            full3,
+            std::time::Duration::from_millis(10),
+            100,
+            100,
+            Some(image::ImageFormat::Jpeg),
+            1000,
+            None,
+            true,
+        );
+        let entry2 = cache.get(2).expect("entry must exist");
+        assert!(entry2.thumbnail.is_loaded());
+
+        // 4. Updating an entry that had ThumbnailState::Skipped with a thumbnail later:
+        // thumbnail becomes Loaded
+        cache.upsert_thumbnail(
+            1,
+            CachedThumbnail {
+                image: Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10))),
+                source: ThumbnailSource::Exif,
+                decode_duration: std::time::Duration::from_millis(1),
+            },
+            50,
+            50,
+            Some(image::ImageFormat::Png),
+            500,
+            None,
+        );
+        let entry1_updated = cache.get(1).expect("entry must exist");
+        assert!(entry1_updated.thumbnail.is_loaded());
+
+        // 5. Updating an existing foreground full-image entry (ThumbnailState::Absent)
+        // with is_prefetch = true: thumbnail must remain Absent!
+        cache.upsert_full(
+            0,
+            full1,
+            std::time::Duration::from_millis(5),
+            50,
+            50,
+            Some(image::ImageFormat::Png),
+            500,
+            None,
+            true,
+        );
+        let entry0_updated = cache.get(0).expect("entry must exist");
+        assert!(entry0_updated.thumbnail.is_absent());
     }
 }

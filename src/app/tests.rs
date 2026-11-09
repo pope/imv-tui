@@ -456,7 +456,7 @@ fn test_prefetch_cache_retention_and_hits() {
         1,
         CachedImage {
             image: Some(shared_img.clone()),
-            thumbnail: None,
+            thumbnail: ThumbnailState::Absent,
             width: 10,
             height: 10,
             format: Some(image::ImageFormat::Png),
@@ -503,7 +503,7 @@ fn test_trigger_prefetch_dispatches_for_thumbnail_only_neighbor() {
     );
     let entry = app.prefetch_cache.get(1).expect("entry must exist");
     assert!(entry.image.is_none());
-    assert!(entry.thumbnail.is_some());
+    assert!(entry.thumbnail.is_loaded());
     assert!(!app.prefetch_cache.has_full_image(1));
 
     // Calling trigger_prefetch() must dispatch LoaderMode::Prefetch for index 1
@@ -527,6 +527,7 @@ fn test_trigger_prefetch_dispatches_for_thumbnail_only_neighbor() {
         Some(image::ImageFormat::Jpeg),
         1000,
         None,
+        false,
     );
     let entry_after_full = app.prefetch_cache.get(1).expect("entry must exist");
     assert!(entry_after_full.image.is_some());
@@ -535,6 +536,72 @@ fn test_trigger_prefetch_dispatches_for_thumbnail_only_neighbor() {
     // Calling trigger_prefetch() must now skip index 1
     app.trigger_prefetch();
     assert!(channels.loader_rx.try_recv().is_err());
+}
+
+#[test]
+fn test_thumbnail_skipped_foreground_revisit_vs_prefetch_hit() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    // Drain startup requests sent during App::new_mocked()
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // Case 1: Foreground full decode for image 0 without thumbnail (is_prefetch: false)
+    let dummy_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)));
+    let resp_foreground = LoaderResponse {
+        idx: 0,
+        is_prefetch: false,
+        thumbnail_source: None,
+        sequence: app.current_sequence,
+        result: Ok(DecodedImage {
+            image: dummy_img.clone(),
+            width: 10,
+            height: 10,
+            format: Some(image::ImageFormat::Png),
+            disk_size: 100,
+            raw_dimensions: None,
+        }),
+        decode_duration: std::time::Duration::from_millis(5),
+    };
+    channels.response_tx.send(resp_foreground).unwrap();
+    app.update_channels();
+
+    // Verify foreground load has thumbnail state Absent
+    assert!(!app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.thumbnail, ThumbnailState::Absent);
+    assert!(app.stats.thumbnail.is_absent());
+
+    // Case 2: Background prefetch full decode for image 1 (is_prefetch: true)
+    let resp_prefetch = LoaderResponse {
+        idx: 1,
+        is_prefetch: true,
+        thumbnail_source: None,
+        sequence: app.current_sequence,
+        result: Ok(DecodedImage {
+            image: dummy_img,
+            width: 10,
+            height: 10,
+            format: Some(image::ImageFormat::Png),
+            disk_size: 100,
+            raw_dimensions: None,
+        }),
+        decode_duration: std::time::Duration::from_millis(4),
+    };
+    channels.response_tx.send(resp_prefetch).unwrap();
+    app.update_channels();
+
+    // Navigate to image 1: should be a prefetch cache hit with thumbnail state Skipped
+    app.next_image();
+    assert_eq!(app.queue.current_index, 1);
+    assert!(app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.thumbnail, ThumbnailState::Skipped);
+    assert!(app.stats.thumbnail.is_skipped());
+
+    // Navigate back to image 0: should be a cache hit, but because it was originally decoded
+    // in foreground without thumbnail, thumbnail state MUST be Absent!
+    app.prev_image();
+    assert_eq!(app.queue.current_index, 0);
+    assert!(app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.thumbnail, ThumbnailState::Absent);
+    assert!(app.stats.thumbnail.is_absent());
 }
 
 #[test]
@@ -681,7 +748,11 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     assert!(app.thumbnail_image.is_some());
     assert_eq!(app.img_width, 160);
     assert_eq!(app.img_height, 120);
-    let thumb_telemetry = app.stats.thumbnail.expect("Expected thumbnail telemetry");
+    let thumb_telemetry = *app
+        .stats
+        .thumbnail
+        .loaded()
+        .expect("Expected thumbnail telemetry");
     assert_eq!(
         thumb_telemetry.source,
         crate::imaging::ThumbnailSource::Exif
@@ -1380,7 +1451,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     app.thumbnail_image = Some(fake_thumb.clone());
     app.original_image = Some(fake_thumb);
     app.show_thumbnail_only = true;
-    app.stats.thumbnail = Some(ThumbnailTelemetry {
+    app.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
         load_duration: Duration::from_millis(2),
         dimensions: (16, 16),
         source: crate::imaging::ThumbnailSource::Exif,
@@ -1402,7 +1473,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     assert!(app.original_image.is_none());
     assert!(!app.show_thumbnail_only);
     assert!(!app.stats.is_prefetch_cache_hit);
-    assert!(app.stats.thumbnail.is_none());
+    assert!(app.stats.thumbnail.is_absent());
 
     // 3. Verify has_pending_work() is true while loading or resizing
     assert!(app.is_loading());
@@ -1418,7 +1489,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
         0,
         CachedImage {
             image: None,
-            thumbnail: Some(CachedThumbnail {
+            thumbnail: ThumbnailState::Loaded(CachedThumbnail {
                 image: cached_thumb,
                 source: crate::imaging::ThumbnailSource::Exif,
                 decode_duration: Duration::from_millis(3),
@@ -1438,7 +1509,10 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     assert!(app.thumbnail_image.is_some());
     assert!(app.show_thumbnail_only);
     assert!(app.stats.is_prefetch_cache_hit);
-    assert_eq!(app.stats.thumbnail.map(|t| t.dimensions), Some((24, 24)));
+    assert_eq!(
+        app.stats.thumbnail.loaded().map(|t| t.dimensions),
+        Some((24, 24))
+    );
 }
 
 #[test]
@@ -1455,7 +1529,7 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
         0,
         CachedImage {
             image: Some(img),
-            thumbnail: Some(CachedThumbnail {
+            thumbnail: ThumbnailState::Loaded(CachedThumbnail {
                 image: thumb,
                 source: crate::imaging::ThumbnailSource::XdgCache,
                 decode_duration: std::time::Duration::from_millis(2),
@@ -1488,7 +1562,7 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
 #[test]
 fn test_total_pipeline_duration_thumbnail_and_cache_hit_math() {
     let mut stats = StatsForNerds {
-        thumbnail: Some(ThumbnailTelemetry {
+        thumbnail: ThumbnailState::Loaded(ThumbnailTelemetry {
             load_duration: Duration::from_micros(1260),
             dimensions: (160, 120),
             source: crate::imaging::ThumbnailSource::Exif,
