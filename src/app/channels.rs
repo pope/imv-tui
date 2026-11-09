@@ -152,7 +152,6 @@ impl App {
                 self.img_height = orig_h;
 
                 self.show_thumbnail_only = true;
-                self.resize_state.mark_dirty_with_init_zoom();
                 loaded_cached_thumb = true;
                 self.stats.is_prefetch_cache_hit = true;
                 self.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
@@ -160,6 +159,8 @@ impl App {
                     dimensions: (tw, th),
                     source: cached_thumb.source,
                 });
+                self.stats.disk_size = cached_img.disk_size;
+                self.stats.format = cached_img.format;
                 self.stats.raw_dimensions = cached_img.raw_dimensions;
             }
         }
@@ -171,6 +172,8 @@ impl App {
             self.show_thumbnail_only = false;
             self.stats.is_prefetch_cache_hit = false;
             self.stats.thumbnail = ThumbnailState::Absent;
+            self.stats.disk_size = 0;
+            self.stats.format = None;
             self.stats.raw_dimensions = None;
         }
         self.stats.load_duration = None;

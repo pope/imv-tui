@@ -121,7 +121,13 @@ impl PrefetchCache {
     ) {
         if let Some(cached) = self.entries.get_mut(&idx) {
             cached.thumbnail = ThumbnailState::Loaded(thumbnail);
-            cached.raw_dimensions = raw_dimensions;
+            if cached.image.is_none() {
+                cached.width = width;
+                cached.height = height;
+                cached.format = format;
+                cached.disk_size = disk_size;
+                cached.raw_dimensions = raw_dimensions;
+            }
         } else {
             self.entries.insert(
                 idx,
@@ -627,5 +633,100 @@ mod cache_sliding_window_tests {
         );
         let entry0_updated = cache.get(0).expect("entry must exist");
         assert!(entry0_updated.thumbnail.is_absent());
+    }
+
+    #[test]
+    fn test_upsert_thumbnail_metadata_preservation_when_full_image_loaded() {
+        let mut cache = PrefetchCache::new();
+
+        // 1. Initial upsert_thumbnail on empty entry (image is None) sets all metadata
+        cache.upsert_thumbnail(
+            0,
+            CachedThumbnail {
+                image: Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120))),
+                source: ThumbnailSource::Exif,
+                decode_duration: std::time::Duration::from_millis(1),
+            },
+            160,
+            120,
+            Some(image::ImageFormat::Jpeg),
+            1024,
+            Some((1920, 1080)),
+        );
+        let entry0 = cache.get(0).expect("entry must exist");
+        assert!(entry0.image.is_none());
+        assert!(entry0.thumbnail.is_loaded());
+        assert_eq!(entry0.width, 160);
+        assert_eq!(entry0.height, 120);
+        assert_eq!(entry0.format, Some(image::ImageFormat::Jpeg));
+        assert_eq!(entry0.disk_size, 1024);
+        assert_eq!(entry0.raw_dimensions, Some((1920, 1080)));
+
+        // Updating thumbnail when image is still None updates metadata
+        cache.upsert_thumbnail(
+            0,
+            CachedThumbnail {
+                image: Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(320, 240))),
+                source: ThumbnailSource::XdgCache,
+                decode_duration: std::time::Duration::from_millis(2),
+            },
+            320,
+            240,
+            Some(image::ImageFormat::Png),
+            2048,
+            Some((3840, 2160)),
+        );
+        let entry0_updated = cache.get(0).expect("entry must exist");
+        assert_eq!(entry0_updated.width, 320);
+        assert_eq!(entry0_updated.height, 240);
+        assert_eq!(entry0_updated.format, Some(image::ImageFormat::Png));
+        assert_eq!(entry0_updated.disk_size, 2048);
+        assert_eq!(entry0_updated.raw_dimensions, Some((3840, 2160)));
+
+        // 2. Full image decode completes: entry1 has image = Some(...) and full-resolution metadata
+        let full_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(4000, 3000)));
+        cache.upsert_full(
+            1,
+            full_img,
+            std::time::Duration::from_millis(20),
+            4000,
+            3000,
+            Some(image::ImageFormat::Tiff),
+            50_000_000,
+            Some((4000, 3000)),
+            false,
+        );
+        let entry1 = cache.get(1).expect("entry must exist");
+        assert!(entry1.image.is_some());
+        assert!(entry1.thumbnail.is_absent());
+        assert_eq!(entry1.width, 4000);
+        assert_eq!(entry1.height, 3000);
+        assert_eq!(entry1.format, Some(image::ImageFormat::Tiff));
+        assert_eq!(entry1.disk_size, 50_000_000);
+        assert_eq!(entry1.raw_dimensions, Some((4000, 3000)));
+
+        // 3. Late-arriving thumbnail for entry1:
+        // Must attach thumbnail as Loaded, but must NOT overwrite width, height, format, disk_size, or raw_dimensions
+        cache.upsert_thumbnail(
+            1,
+            CachedThumbnail {
+                image: Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120))),
+                source: ThumbnailSource::Exif,
+                decode_duration: std::time::Duration::from_millis(2),
+            },
+            160,
+            120,
+            Some(image::ImageFormat::Jpeg),
+            1024,
+            Some((160, 120)),
+        );
+        let entry1_after_thumb = cache.get(1).expect("entry must exist");
+        assert!(entry1_after_thumb.image.is_some());
+        assert!(entry1_after_thumb.thumbnail.is_loaded());
+        assert_eq!(entry1_after_thumb.width, 4000);
+        assert_eq!(entry1_after_thumb.height, 3000);
+        assert_eq!(entry1_after_thumb.format, Some(image::ImageFormat::Tiff));
+        assert_eq!(entry1_after_thumb.disk_size, 50_000_000);
+        assert_eq!(entry1_after_thumb.raw_dimensions, Some((4000, 3000)));
     }
 }

@@ -714,6 +714,58 @@ fn test_start_load_image_channel_dispatch() {
 }
 
 #[test]
+fn test_start_load_image_thumbnail_cache_hit_metadata_and_cold_miss_reset() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // Populate prefetch cache index 1 with a thumbnail-only entry
+    let thumb_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120)));
+    app.prefetch_cache.upsert_thumbnail(
+        1,
+        CachedThumbnail {
+            image: thumb_img,
+            source: crate::imaging::ThumbnailSource::Exif,
+            decode_duration: Duration::from_millis(3),
+        },
+        1920,
+        1080,
+        Some(image::ImageFormat::Jpeg),
+        123_456,
+        Some((1920, 1080)),
+    );
+
+    // Give index 0 some dummy stats so we can verify that cold miss resets them
+    app.stats.disk_size = 999_999;
+    app.stats.format = Some(image::ImageFormat::Png);
+
+    // 1. Navigate to index 1: hits thumbnail-only cache entry
+    app.next_image();
+    assert_eq!(app.queue.current_index, 1);
+    assert!(app.show_thumbnail_only);
+    assert!(app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.disk_size, 123_456);
+    assert_eq!(app.stats.format, Some(image::ImageFormat::Jpeg));
+    assert_eq!(app.stats.raw_dimensions, Some((1920, 1080)));
+    assert!(app.stats.thumbnail.is_loaded());
+
+    // Drain loader requests
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // 2. Clear cache to simulate a cold miss on index 0
+    app.prefetch_cache = PrefetchCache::new();
+
+    // Navigate back to index 0: cold miss must reset disk_size = 0, format = None, raw_dimensions = None
+    app.prev_image();
+    assert_eq!(app.queue.current_index, 0);
+    assert!(!app.show_thumbnail_only);
+    assert!(!app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.disk_size, 0);
+    assert_eq!(app.stats.format, None);
+    assert_eq!(app.stats.raw_dimensions, None);
+    assert!(app.stats.thumbnail.is_absent());
+}
+
+#[test]
 fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
     let (mut app, channels) = setup_test_app_with_channels();
 
