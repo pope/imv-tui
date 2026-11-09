@@ -812,6 +812,92 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
 }
 
 #[test]
+fn test_out_of_order_full_before_thumbnail_preserves_thumbnail_image_and_toggle() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // Apply rotation adjustment to index 0 to verify thumbnail rotation handling
+    app.queue.adjustments_mut()[0].rotation = Rotation::D90;
+
+    // 1. Full-resolution response arrives first
+    let full_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(1920, 1080)));
+    let full_resp = LoaderResponse {
+        idx: 0,
+        is_prefetch: false,
+        thumbnail_source: None,
+        sequence: app.current_sequence,
+        result: Ok(DecodedImage {
+            image: full_img,
+            width: 1920,
+            height: 1080,
+            format: Some(image::ImageFormat::Jpeg),
+            disk_size: 20480,
+            raw_dimensions: Some((1920, 1080)),
+        }),
+        decode_duration: std::time::Duration::from_millis(25),
+    };
+    channels.response_tx.send(full_resp).unwrap();
+    assert!(app.check_background_responses());
+
+    assert_eq!(app.load_phase, LoadPhase::Complete);
+    assert!(!app.show_thumbnail_only);
+    assert!(app.original_image.is_some());
+    assert!(app.thumbnail_image.is_none());
+    assert!(app.stats.thumbnail.is_absent());
+
+    // 2. Thumbnail response arrives second (out-of-order)
+    let thumb_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120)));
+    let thumb_resp = LoaderResponse {
+        idx: 0,
+        is_prefetch: false,
+        thumbnail_source: Some(crate::imaging::ThumbnailSource::Exif),
+        sequence: app.current_sequence,
+        result: Ok(DecodedImage {
+            image: thumb_img,
+            width: 160,
+            height: 120,
+            format: Some(image::ImageFormat::Jpeg),
+            disk_size: 1024,
+            raw_dimensions: Some((1920, 1080)),
+        }),
+        decode_duration: std::time::Duration::from_millis(5),
+    };
+    channels.response_tx.send(thumb_resp).unwrap();
+    assert!(app.check_background_responses());
+
+    // Verify thumbnail is retained, rotated according to active adjustment, but doesn't hijack display
+    assert_eq!(app.load_phase, LoadPhase::Complete);
+    assert!(!app.show_thumbnail_only);
+    assert!(app.thumbnail_image.is_some());
+    let thumb = app.thumbnail_image.as_ref().unwrap();
+    assert_eq!(thumb.width(), 120);
+    assert_eq!(thumb.height(), 160);
+
+    let telemetry = app
+        .stats
+        .thumbnail
+        .loaded()
+        .expect("Expected loaded thumbnail telemetry");
+    assert_eq!(telemetry.dimensions, (120, 160));
+    assert_eq!(telemetry.source, crate::imaging::ThumbnailSource::Exif);
+    assert_eq!(telemetry.load_duration, std::time::Duration::from_millis(5));
+
+    // 3. Command::ToggleThumbnail successfully toggles show_thumbnail_only to true
+    app.apply_action(
+        crate::commands::InputAction::Command(crate::commands::Command::ToggleThumbnail),
+        24,
+    );
+    assert!(app.show_thumbnail_only);
+
+    // Toggle back to false
+    app.apply_action(
+        crate::commands::InputAction::Command(crate::commands::Command::ToggleThumbnail),
+        24,
+    );
+    assert!(!app.show_thumbnail_only);
+}
+
+#[test]
 fn test_sequence_number_invalidation() {
     let (mut app, channels) = setup_test_app_with_channels();
 

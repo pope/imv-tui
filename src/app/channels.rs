@@ -282,6 +282,7 @@ impl App {
                                     dimensions: (rotated_img.width(), rotated_img.height()),
                                     source: thumb_src,
                                 });
+                                self.thumbnail_image = Some(rotated_img);
                             } else {
                                 if self.load_phase == LoadPhase::ThumbnailInFlightDeferred {
                                     self.load_phase = LoadPhase::FullDeferred;
