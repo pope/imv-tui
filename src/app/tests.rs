@@ -898,6 +898,115 @@ fn test_out_of_order_full_before_thumbnail_preserves_thumbnail_image_and_toggle(
 }
 
 #[test]
+fn test_rotation_preserves_full_dimensions_during_thumbnail_placeholder_and_updates_stats() {
+    let (mut app, channels) = setup_test_app_with_channels();
+    while channels.loader_rx.try_recv().is_ok() {}
+
+    // Case 1: Thumbnail placeholder phase (show_thumbnail_only = true, load_phase != Complete)
+    // Full resolution is 4000x3000, thumbnail is 160x120.
+    app.load_phase = LoadPhase::ThumbnailInFlightDeferred;
+    app.show_thumbnail_only = true;
+    app.initial_load = InitialLoadState::Idle;
+    app.img_width = 4000;
+    app.img_height = 3000;
+    let thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120)));
+    app.original_image = Some(Arc::clone(&thumb));
+    app.thumbnail_image = Some(thumb);
+    app.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
+        load_duration: Duration::from_millis(5),
+        dimensions: (160, 120),
+        source: crate::imaging::ThumbnailSource::Exif,
+    });
+
+    // 1a. Rotate clockwise: swaps (4000, 3000) -> (3000, 4000), not clobbered to (120, 160)
+    app.rotate_clockwise();
+    assert_eq!(app.img_width, 3000);
+    assert_eq!(app.img_height, 4000);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().width(), 120);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().height(), 160);
+    assert_eq!(app.original_image.as_ref().unwrap().width(), 120);
+    assert_eq!(app.original_image.as_ref().unwrap().height(), 160);
+    // Verifies pointer equality reuse
+    assert!(Arc::ptr_eq(
+        app.original_image.as_ref().unwrap(),
+        app.thumbnail_image.as_ref().unwrap()
+    ));
+    assert_eq!(app.stats.thumbnail.loaded().unwrap().dimensions, (120, 160));
+    assert_eq!(
+        app.queue.adjustment(app.queue.current_index).rotation,
+        Rotation::D90
+    );
+
+    // 1b. Rotate counter-clockwise: swaps back to (4000, 3000) and (160, 120)
+    app.rotate_counter_clockwise();
+    assert_eq!(app.img_width, 4000);
+    assert_eq!(app.img_height, 3000);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().width(), 160);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().height(), 120);
+    assert_eq!(app.stats.thumbnail.loaded().unwrap().dimensions, (160, 120));
+    assert_eq!(
+        app.queue.adjustment(app.queue.current_index).rotation,
+        Rotation::D0
+    );
+
+    // 1c. Rotate counter-clockwise from D0 to D270
+    app.rotate_counter_clockwise();
+    assert_eq!(app.img_width, 3000);
+    assert_eq!(app.img_height, 4000);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().width(), 120);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().height(), 160);
+    assert_eq!(app.stats.thumbnail.loaded().unwrap().dimensions, (120, 160));
+    assert_eq!(
+        app.queue.adjustment(app.queue.current_index).rotation,
+        Rotation::D270
+    );
+
+    // Case 2: Full image is loaded (load_phase = Complete, show_thumbnail_only = false)
+    app.rotate_clockwise(); // Return to D0
+    app.load_phase = LoadPhase::Complete;
+    app.show_thumbnail_only = false;
+    let full_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(4000, 3000)));
+    app.original_image = Some(full_img);
+    let separate_thumb = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120)));
+    app.thumbnail_image = Some(separate_thumb);
+    app.stats.thumbnail = ThumbnailState::Loaded(ThumbnailTelemetry {
+        load_duration: Duration::from_millis(5),
+        dimensions: (160, 120),
+        source: crate::imaging::ThumbnailSource::Exif,
+    });
+    app.img_width = 4000;
+    app.img_height = 3000;
+
+    // 2a. Rotate clockwise: full image dimensions become 3000x4000, thumbnail dimensions become 120x160
+    app.rotate_clockwise();
+    assert_eq!(app.img_width, 3000);
+    assert_eq!(app.img_height, 4000);
+    assert_eq!(app.original_image.as_ref().unwrap().width(), 3000);
+    assert_eq!(app.original_image.as_ref().unwrap().height(), 4000);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().width(), 120);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().height(), 160);
+    assert_eq!(app.stats.thumbnail.loaded().unwrap().dimensions, (120, 160));
+    assert_eq!(
+        app.queue.adjustment(app.queue.current_index).rotation,
+        Rotation::D90
+    );
+
+    // 2b. Rotate counter-clockwise: full image dimensions return to 4000x3000, thumbnail to 160x120
+    app.rotate_counter_clockwise();
+    assert_eq!(app.img_width, 4000);
+    assert_eq!(app.img_height, 3000);
+    assert_eq!(app.original_image.as_ref().unwrap().width(), 4000);
+    assert_eq!(app.original_image.as_ref().unwrap().height(), 3000);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().width(), 160);
+    assert_eq!(app.thumbnail_image.as_ref().unwrap().height(), 120);
+    assert_eq!(app.stats.thumbnail.loaded().unwrap().dimensions, (160, 120));
+    assert_eq!(
+        app.queue.adjustment(app.queue.current_index).rotation,
+        Rotation::D0
+    );
+}
+
+#[test]
 fn test_sequence_number_invalidation() {
     let (mut app, channels) = setup_test_app_with_channels();
 

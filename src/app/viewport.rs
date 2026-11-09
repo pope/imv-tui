@@ -1,11 +1,12 @@
 //! Viewport layout, zooming, panning, adjustments, and rotation for `App`.
 
-use crate::app::App;
 use crate::app::palette::PaletteMode;
+use crate::app::{App, LoadPhase};
 use crate::imaging::{
     Brightness, CellDimensions, Contrast, CropBox, ImageIntersection, PanOffset, PixelDimensions,
     ResizeRequest, Rotation, ScaleMode, ZoomFactor,
 };
+use crate::ui::ThumbnailState;
 use ratatui_image::picker::ProtocolType;
 use std::sync::Arc;
 
@@ -590,24 +591,51 @@ impl App {
         }
     }
 
-    /// Rotates the image clockwise by 90 degrees.
-    pub fn rotate_clockwise(&mut self) {
+    /// Rotates the image clockwise or counter-clockwise by 90 degrees.
+    fn rotate_90_step(&mut self, clockwise: bool) {
         if self.is_loading() {
             return;
         }
         if let Some(img) = self.original_image.take() {
-            let rotated = img.rotate90();
-            self.img_width = rotated.width();
-            self.img_height = rotated.height();
-            self.original_image = Some(Arc::new(rotated));
+            let rotated = if clockwise {
+                img.rotate90()
+            } else {
+                img.rotate270()
+            };
+            let rotated_arc = Arc::new(rotated);
+
+            if self.show_thumbnail_only || self.load_phase != LoadPhase::Complete {
+                std::mem::swap(&mut self.img_width, &mut self.img_height);
+            } else {
+                self.img_width = rotated_arc.width();
+                self.img_height = rotated_arc.height();
+            }
 
             if let Some(thumb) = self.thumbnail_image.take() {
-                self.thumbnail_image = Some(Arc::new(thumb.rotate90()));
+                let rotated_thumb = if Arc::ptr_eq(&img, &thumb) {
+                    Arc::clone(&rotated_arc)
+                } else if clockwise {
+                    Arc::new(thumb.rotate90())
+                } else {
+                    Arc::new(thumb.rotate270())
+                };
+                if let ThumbnailState::Loaded(ref mut t) = self.stats.thumbnail {
+                    t.dimensions = (rotated_thumb.width(), rotated_thumb.height());
+                }
+                self.thumbnail_image = Some(rotated_thumb);
+            } else if let ThumbnailState::Loaded(ref mut t) = self.stats.thumbnail {
+                std::mem::swap(&mut t.dimensions.0, &mut t.dimensions.1);
             }
+
+            self.original_image = Some(rotated_arc);
 
             let idx = self.queue.current_index;
             if let Some(adj) = self.queue.adjustments_mut().get_mut(idx) {
-                adj.rotation = adj.rotation.rotate_clockwise();
+                adj.rotation = if clockwise {
+                    adj.rotation.rotate_clockwise()
+                } else {
+                    adj.rotation.rotate_counter_clockwise()
+                };
             }
 
             self.zoom_factor = ZoomFactor::DEFAULT;
@@ -617,30 +645,13 @@ impl App {
         }
     }
 
+    /// Rotates the image clockwise by 90 degrees.
+    pub fn rotate_clockwise(&mut self) {
+        self.rotate_90_step(true);
+    }
+
     /// Rotates the image counter-clockwise by 90 degrees.
     pub fn rotate_counter_clockwise(&mut self) {
-        if self.is_loading() {
-            return;
-        }
-        if let Some(img) = self.original_image.take() {
-            let rotated = img.rotate270();
-            self.img_width = rotated.width();
-            self.img_height = rotated.height();
-            self.original_image = Some(Arc::new(rotated));
-
-            if let Some(thumb) = self.thumbnail_image.take() {
-                self.thumbnail_image = Some(Arc::new(thumb.rotate270()));
-            }
-
-            let idx = self.queue.current_index;
-            if let Some(adj) = self.queue.adjustments_mut().get_mut(idx) {
-                adj.rotation = adj.rotation.rotate_counter_clockwise();
-            }
-
-            self.zoom_factor = ZoomFactor::DEFAULT;
-            self.pan_offset = PanOffset::ZERO;
-            self.resize_state.mark_dirty();
-            self.screen_clear.defer_until_protocol();
-        }
+        self.rotate_90_step(false);
     }
 }
