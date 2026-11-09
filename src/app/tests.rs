@@ -1,5 +1,5 @@
 use super::*;
-use crate::app::cache::{CachedImage, CachedThumbnail};
+use crate::app::cache::{CachedFullImage, CachedImage, CachedThumbnail};
 use crate::app::classifications::ClassificationJsonItem;
 use crate::config::InfoBarPosition;
 use crate::imaging::types::{Brightness, Contrast, Rotation};
@@ -455,13 +455,15 @@ fn test_prefetch_cache_retention_and_hits() {
     app.prefetch_cache.insert(
         1,
         CachedImage {
-            image: Some(shared_img.clone()),
+            full: Some(CachedFullImage {
+                image: shared_img.clone(),
+                decode_duration: std::time::Duration::from_millis(5),
+                format: image::ImageFormat::Png,
+                disk_size: 100,
+            }),
             thumbnail: ThumbnailState::Absent,
             width: 10,
             height: 10,
-            format: Some(image::ImageFormat::Png),
-            decode_duration: std::time::Duration::from_millis(5),
-            disk_size: 100,
             raw_dimensions: None,
         },
     );
@@ -497,12 +499,10 @@ fn test_trigger_prefetch_dispatches_for_thumbnail_only_neighbor() {
         },
         100,
         100,
-        Some(image::ImageFormat::Jpeg),
-        1000,
         None,
     );
     let entry = app.prefetch_cache.get(1).expect("entry must exist");
-    assert!(entry.image.is_none());
+    assert!(entry.full.is_none());
     assert!(entry.thumbnail.is_loaded());
     assert!(!app.prefetch_cache.has_full_image(1));
 
@@ -520,17 +520,19 @@ fn test_trigger_prefetch_dispatches_for_thumbnail_only_neighbor() {
     let full = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
     app.prefetch_cache.upsert_full(
         1,
-        full,
-        std::time::Duration::from_millis(10),
+        CachedFullImage {
+            image: full,
+            decode_duration: std::time::Duration::from_millis(10),
+            format: image::ImageFormat::Jpeg,
+            disk_size: 1000,
+        },
         100,
         100,
-        Some(image::ImageFormat::Jpeg),
-        1000,
         None,
         false,
     );
     let entry_after_full = app.prefetch_cache.get(1).expect("entry must exist");
-    assert!(entry_after_full.image.is_some());
+    assert!(entry_after_full.full.is_some());
     assert!(app.prefetch_cache.has_full_image(1));
 
     // Calling trigger_prefetch() must now skip index 1
@@ -555,7 +557,7 @@ fn test_thumbnail_skipped_foreground_revisit_vs_prefetch_hit() {
             image: dummy_img.clone(),
             width: 10,
             height: 10,
-            format: Some(image::ImageFormat::Png),
+            format: image::ImageFormat::Png,
             disk_size: 100,
             raw_dimensions: None,
         }),
@@ -579,7 +581,7 @@ fn test_thumbnail_skipped_foreground_revisit_vs_prefetch_hit() {
             image: dummy_img,
             width: 10,
             height: 10,
-            format: Some(image::ImageFormat::Png),
+            format: image::ImageFormat::Png,
             disk_size: 100,
             raw_dimensions: None,
         }),
@@ -622,7 +624,7 @@ fn test_sequence_number_protection() {
             image: Arc::new(dummy_img),
             width: 1,
             height: 1,
-            format: None,
+            format: image::ImageFormat::Png,
             disk_size: 0,
             raw_dimensions: None,
         }),
@@ -718,7 +720,23 @@ fn test_start_load_image_thumbnail_cache_hit_metadata_and_cold_miss_reset() {
     let (mut app, channels) = setup_test_app_with_channels();
     while channels.loader_rx.try_recv().is_ok() {}
 
-    // Populate prefetch cache index 1 with a thumbnail-only entry
+    // 1. Populate cache index 0 with a full image entry
+    let full_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)));
+    app.prefetch_cache.upsert_full(
+        0,
+        CachedFullImage {
+            image: full_img,
+            decode_duration: Duration::from_millis(15),
+            format: image::ImageFormat::Png,
+            disk_size: 999_999,
+        },
+        100,
+        100,
+        None,
+        false,
+    );
+
+    // 2. Populate prefetch cache index 1 with a thumbnail-only entry
     let thumb_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(160, 120)));
     app.prefetch_cache.upsert_thumbnail(
         1,
@@ -729,29 +747,33 @@ fn test_start_load_image_thumbnail_cache_hit_metadata_and_cold_miss_reset() {
         },
         1920,
         1080,
-        Some(image::ImageFormat::Jpeg),
-        123_456,
         Some((1920, 1080)),
     );
 
-    // Give index 0 some dummy stats so we can verify that cold miss resets them
-    app.stats.disk_size = 999_999;
-    app.stats.format = Some(image::ImageFormat::Png);
+    // Initial load on image 0 hits full-image cache entry
+    app.start_load_image();
+    assert_eq!(app.queue.current_index, 0);
+    assert!(!app.show_thumbnail_only);
+    assert!(app.stats.is_prefetch_cache_hit);
+    assert_eq!(app.stats.disk_size, 999_999);
+    assert_eq!(app.stats.format, Some(image::ImageFormat::Png));
+    assert_eq!(app.stats.load_duration, Some(Duration::from_millis(15)));
 
-    // 1. Navigate to index 1: hits thumbnail-only cache entry
+    // 3. Navigate to index 1: hits thumbnail-only cache entry; full-image metadata resets to 0 / None
     app.next_image();
     assert_eq!(app.queue.current_index, 1);
     assert!(app.show_thumbnail_only);
     assert!(app.stats.is_prefetch_cache_hit);
-    assert_eq!(app.stats.disk_size, 123_456);
-    assert_eq!(app.stats.format, Some(image::ImageFormat::Jpeg));
+    assert_eq!(app.stats.disk_size, 0);
+    assert_eq!(app.stats.format, None);
+    assert_eq!(app.stats.load_duration, None);
     assert_eq!(app.stats.raw_dimensions, Some((1920, 1080)));
     assert!(app.stats.thumbnail.is_loaded());
 
     // Drain loader requests
     while channels.loader_rx.try_recv().is_ok() {}
 
-    // 2. Clear cache to simulate a cold miss on index 0
+    // 4. Clear cache to simulate a cold miss on index 0
     app.prefetch_cache = PrefetchCache::new();
 
     // Navigate back to index 0: cold miss must reset disk_size = 0, format = None, raw_dimensions = None
@@ -785,7 +807,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
             image: Arc::new(thumb_img),
             width: 160,
             height: 120,
-            format: Some(image::ImageFormat::Jpeg),
+            format: image::ImageFormat::Jpeg,
             disk_size: 1024,
             raw_dimensions: Some((1920, 1080)),
         }),
@@ -834,7 +856,7 @@ fn test_loader_response_thumbnail_progression_and_resize_dispatch() {
             image: Arc::new(full_img),
             width: 1920,
             height: 1080,
-            format: Some(image::ImageFormat::Jpeg),
+            format: image::ImageFormat::Jpeg,
             disk_size: 20480,
             raw_dimensions: Some((1920, 1080)),
         }),
@@ -882,7 +904,7 @@ fn test_out_of_order_full_before_thumbnail_preserves_thumbnail_image_and_toggle(
             image: full_img,
             width: 1920,
             height: 1080,
-            format: Some(image::ImageFormat::Jpeg),
+            format: image::ImageFormat::Jpeg,
             disk_size: 20480,
             raw_dimensions: Some((1920, 1080)),
         }),
@@ -908,7 +930,7 @@ fn test_out_of_order_full_before_thumbnail_preserves_thumbnail_image_and_toggle(
             image: thumb_img,
             width: 160,
             height: 120,
-            format: Some(image::ImageFormat::Jpeg),
+            format: image::ImageFormat::Jpeg,
             disk_size: 1024,
             raw_dimensions: Some((1920, 1080)),
         }),
@@ -1081,7 +1103,7 @@ fn test_sequence_number_invalidation() {
             image: Arc::new(dummy_img),
             width: 100,
             height: 100,
-            format: None,
+            format: image::ImageFormat::Png,
             disk_size: 0,
             raw_dimensions: None,
         }),
@@ -1140,7 +1162,7 @@ fn test_sequence_number_invalidation() {
             image: Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(50, 50))),
             width: 50,
             height: 50,
-            format: None,
+            format: image::ImageFormat::Png,
             disk_size: 0,
             raw_dimensions: None,
         }),
@@ -1735,7 +1757,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
     app.prefetch_cache.insert(
         0,
         CachedImage {
-            image: None,
+            full: None,
             thumbnail: ThumbnailState::Loaded(CachedThumbnail {
                 image: cached_thumb,
                 source: crate::imaging::ThumbnailSource::Exif,
@@ -1743,9 +1765,6 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
             }),
             width: 240,
             height: 240,
-            format: Some(image::ImageFormat::Jpeg),
-            decode_duration: Duration::from_millis(15),
-            disk_size: 1024,
             raw_dimensions: None,
         },
     );
@@ -1775,7 +1794,12 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
     app.prefetch_cache.insert(
         0,
         CachedImage {
-            image: Some(img),
+            full: Some(CachedFullImage {
+                image: img,
+                decode_duration: std::time::Duration::from_millis(10),
+                format: image::ImageFormat::Png,
+                disk_size: 500,
+            }),
             thumbnail: ThumbnailState::Loaded(CachedThumbnail {
                 image: thumb,
                 source: crate::imaging::ThumbnailSource::XdgCache,
@@ -1783,9 +1807,6 @@ fn test_prefetch_cache_stats_and_thumbnail_sources() {
             }),
             width: 10,
             height: 10,
-            format: Some(image::ImageFormat::Png),
-            decode_duration: std::time::Duration::from_millis(10),
-            disk_size: 500,
             raw_dimensions: None,
         },
     );
@@ -1906,7 +1927,7 @@ fn test_wait_for_frame_ready_and_frame_ready_pending() {
                 image: Arc::new(thumb_img),
                 width: 40,
                 height: 30,
-                format: Some(image::ImageFormat::Jpeg),
+                format: image::ImageFormat::Jpeg,
                 disk_size: 512,
                 raw_dimensions: None,
             }),

@@ -1,6 +1,6 @@
 //! Background channel communication, image loading, and cache prefetching for `App`.
 
-use crate::app::cache::{CachedThumbnail, VisibleWindow};
+use crate::app::cache::{CachedFullImage, CachedThumbnail, VisibleWindow};
 use crate::app::palette::PaletteMode;
 use crate::app::{App, InitialLoadState, LoadPhase, ThumbnailState, ThumbnailTelemetry};
 use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
@@ -73,18 +73,18 @@ impl App {
         let mut loaded_cached_thumb = false;
 
         if let Some(cached_img) = cached {
-            if let Some(ref img) = cached_img.image {
+            if let Some(ref full) = cached_img.full {
                 self.current_sequence += 1;
                 self.active_sequence
                     .store(self.current_sequence as usize, Ordering::Release);
-                let display_img = if let Some(rotated) = adj.rotate_image(img) {
+                let display_img = if let Some(rotated) = adj.rotate_image(&full.image) {
                     self.img_width = rotated.width();
                     self.img_height = rotated.height();
                     Arc::new(rotated)
                 } else {
                     self.img_width = cached_img.width;
                     self.img_height = cached_img.height;
-                    img.clone()
+                    full.image.clone()
                 };
                 self.original_image = Some(display_img);
 
@@ -119,10 +119,10 @@ impl App {
                 self.resize_state.mark_dirty_with_init_zoom();
 
                 // Set stats for cache hit
-                self.stats.load_duration = Some(cached_img.decode_duration);
+                self.stats.load_duration = Some(full.decode_duration);
                 self.stats.is_prefetch_cache_hit = true;
-                self.stats.disk_size = cached_img.disk_size;
-                self.stats.format = cached_img.format;
+                self.stats.disk_size = full.disk_size;
+                self.stats.format = Some(full.format);
                 self.stats.raw_dimensions = cached_img.raw_dimensions;
 
                 let is_fast_scroll = self.scroll_cadence.record_navigation(Instant::now());
@@ -159,8 +159,6 @@ impl App {
                     dimensions: (tw, th),
                     source: cached_thumb.source,
                 });
-                self.stats.disk_size = cached_img.disk_size;
-                self.stats.format = cached_img.format;
                 self.stats.raw_dimensions = cached_img.raw_dimensions;
             }
         }
@@ -172,11 +170,11 @@ impl App {
             self.show_thumbnail_only = false;
             self.stats.is_prefetch_cache_hit = false;
             self.stats.thumbnail = ThumbnailState::Absent;
-            self.stats.disk_size = 0;
-            self.stats.format = None;
             self.stats.raw_dimensions = None;
         }
         self.stats.load_duration = None;
+        self.stats.disk_size = 0;
+        self.stats.format = None;
         self.image_protocol = None;
         self.initial_load = InitialLoadState::start();
         self.current_sequence += 1;
@@ -249,19 +247,19 @@ impl App {
                                 },
                                 w,
                                 h,
-                                format,
-                                disk_size,
                                 decoded.raw_dimensions,
                             );
                         } else {
                             self.prefetch_cache.upsert_full(
                                 resp.idx,
-                                shared_img.clone(),
-                                resp.decode_duration,
+                                CachedFullImage {
+                                    image: shared_img.clone(),
+                                    decode_duration: resp.decode_duration,
+                                    format,
+                                    disk_size,
+                                },
                                 w,
                                 h,
-                                format,
-                                disk_size,
                                 decoded.raw_dimensions,
                                 resp.is_prefetch,
                             );
@@ -313,8 +311,6 @@ impl App {
                                     source: thumb_src,
                                 });
                                 self.stats.is_prefetch_cache_hit = false;
-                                self.stats.disk_size = disk_size;
-                                self.stats.format = format;
                                 self.stats.raw_dimensions = decoded.raw_dimensions;
                             }
                         } else {
@@ -338,7 +334,7 @@ impl App {
                                 self.stats.thumbnail = ThumbnailState::Absent;
                             }
                             self.stats.disk_size = disk_size;
-                            self.stats.format = format;
+                            self.stats.format = Some(format);
                             self.stats.raw_dimensions = decoded.raw_dimensions;
 
                             if self.scroll_cadence.is_settled() {

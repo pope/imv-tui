@@ -696,8 +696,8 @@ pub struct DecodedImage {
     pub width: u32,
     /// Height of the image in pixels.
     pub height: u32,
-    /// Optional format parsed during load.
-    pub format: Option<image::ImageFormat>,
+    /// Image format parsed during load.
+    pub format: image::ImageFormat,
     /// The size of the raw source file in bytes.
     pub disk_size: u64,
     /// Sensor dimensions of the raw container (`(width, height)`), if raw format.

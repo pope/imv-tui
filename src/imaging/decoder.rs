@@ -427,7 +427,7 @@ pub fn decode_image_bytes_with_header_cancellable(
                     cancel,
                 )
             {
-                decoded.format = Some(image::ImageFormat::Jpeg);
+                decoded.format = image::ImageFormat::Jpeg;
                 decoded.disk_size = file_size;
                 if raw_dimensions.is_some() {
                     decoded.raw_dimensions = raw_dimensions;
@@ -469,7 +469,7 @@ pub fn decode_image_bytes_with_header_cancellable(
                     cancel,
                 )
             {
-                decoded.format = Some(image::ImageFormat::Jpeg);
+                decoded.format = image::ImageFormat::Jpeg;
                 decoded.disk_size = file_size;
                 if raw_dimensions.is_some() {
                     decoded.raw_dimensions = raw_dimensions;
@@ -535,7 +535,7 @@ fn decode_single_payload_cancellable(
                 image: Arc::new(img),
                 width: w,
                 height: h,
-                format: Some(image::ImageFormat::Jpeg),
+                format: image::ImageFormat::Jpeg,
                 disk_size: file_size,
                 raw_dimensions: Some(final_raw_dims),
             });
@@ -543,61 +543,59 @@ fn decode_single_payload_cancellable(
     }
 
     let cursor = std::io::Cursor::new(bytes);
-    image::ImageReader::new(cursor)
+    let reader = image::ImageReader::new(cursor)
         .with_guessed_format()
         .map_err(|e| {
             format!(
                 "Failed to parse image from memory:\n{}\nError: {}",
                 display_name, e
             )
-        })
-        .and_then(|reader| {
-            reader
-                .into_decoder()
-                .map_err(|e| format!("Failed to read metadata:\n{}\n\nError: {}", display_name, e))
-        })
-        .and_then(|mut decoder| {
-            let mut orientation = decoder
-                .orientation()
-                .unwrap_or(image::metadata::Orientation::NoTransforms);
-            if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
-                orientation =
-                    container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
-            }
+        })?;
+    let resolved_format = format
+        .or_else(|| reader.format())
+        .ok_or_else(|| format!("Unknown image format for {}", display_name))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("Failed to read metadata:\n{}\n\nError: {}", display_name, e))?;
 
-            // Checkpoint 2 before image-rs decoding
-            if cancel.is_cancelled() {
-                return Err("Operation cancelled".to_string());
-            }
+    let mut orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    if orientation == image::metadata::Orientation::NoTransforms && is_raw_extension {
+        orientation = container_orientation.unwrap_or(image::metadata::Orientation::NoTransforms);
+    }
 
-            let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
-                format!("Failed to decode image:\n{}\n\nError: {}", display_name, e)
-            })?;
+    // Checkpoint 2 before image-rs decoding
+    if cancel.is_cancelled() {
+        return Err("Operation cancelled".to_string());
+    }
 
-            // Checkpoint 3 before orientation transforms
-            if orientation != image::metadata::Orientation::NoTransforms {
-                if cancel.is_cancelled() {
-                    return Err("Operation cancelled".to_string());
-                }
-                img.apply_orientation(orientation);
-            }
+    let mut img = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("Failed to decode image:\n{}\n\nError: {}", display_name, e))?;
 
-            let img = match img {
-                image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageRgba8(_) => img,
-                other => image::DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-            };
-            let w = img.width();
-            let h = img.height();
-            let final_raw_dims = raw_dimensions.unwrap_or((w, h));
-            Ok(DecodedImage {
-                image: Arc::new(img),
-                width: w,
-                height: h,
-                format,
-                disk_size: file_size,
-                raw_dimensions: Some(final_raw_dims),
-            })
-        })
+    // Checkpoint 3 before orientation transforms
+    if orientation != image::metadata::Orientation::NoTransforms {
+        if cancel.is_cancelled() {
+            return Err("Operation cancelled".to_string());
+        }
+        img.apply_orientation(orientation);
+    }
+
+    let img = match img {
+        image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageRgba8(_) => img,
+        other => image::DynamicImage::ImageRgba8(into_rgba8_fast(other)),
+    };
+    let w = img.width();
+    let h = img.height();
+    let final_raw_dims = raw_dimensions.unwrap_or((w, h));
+    Ok(DecodedImage {
+        image: Arc::new(img),
+        width: w,
+        height: h,
+        format: resolved_format,
+        disk_size: file_size,
+        raw_dimensions: Some(final_raw_dims),
+    })
 }
 
 /// Decodes an image from already loaded memory bytes.
