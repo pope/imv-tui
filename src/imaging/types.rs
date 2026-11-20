@@ -866,6 +866,331 @@ pub fn to_rgba8_fast(img: &DynamicImage) -> std::borrow::Cow<'_, image::RgbaImag
     }
 }
 
+/// Cache-blocked tile edge length (in pixels) for fast 90°/270° image rotations.
+/// A 32×32 tile of RGB8 (3 KB) or RGBA8 (4 KB) fits comfortably inside L1D cache.
+const ROTATE_TILE_SIZE: usize = 32;
+
+/// Minimum pixel count (~1 MP) before rotation spawns scoped worker threads to parallelize
+/// page-faulting and memory bandwidth across disjoint destination slabs.
+const PARALLEL_ROTATE_MIN_PIXELS: usize = 1_000_000;
+
+/// Upper bound on worker threads used for parallel image rotation.
+const MAX_ROTATE_THREADS: usize = 8;
+
+/// Computes the number of worker threads to use for rotating an image of `total_pixels`
+/// partitioned across `dst_rows` destination rows.
+fn rotate_worker_count(total_pixels: usize, dst_rows: usize) -> usize {
+    if total_pixels < PARALLEL_ROTATE_MIN_PIXELS || dst_rows < ROTATE_TILE_SIZE * 2 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_ROTATE_THREADS)
+        .min(dst_rows.div_ceil(ROTATE_TILE_SIZE))
+}
+
+/// Rotates a contiguous horizontal destination slab (`dst_y_start..dst_y_start + slab_rows`)
+/// of a 90° clockwise rotation from `src_px` (`w × h`) into `dst_slab` (`slab_rows × h`),
+/// using destination-sequential outer-`tx`, inner-`ty` cache-blocked tiling.
+fn rotate90_slab<const N: usize>(
+    src_px: &[[u8; N]],
+    dst_slab: &mut [[u8; N]],
+    w: usize,
+    h: usize,
+    dst_y_start: usize,
+) {
+    let slab_rows = dst_slab.len() / h;
+    let mut tile = [[0u8; N]; ROTATE_TILE_SIZE * ROTATE_TILE_SIZE];
+
+    for local_row_start in (0..slab_rows).step_by(ROTATE_TILE_SIZE) {
+        let bw = (slab_rows - local_row_start).min(ROTATE_TILE_SIZE);
+        let tx = dst_y_start + local_row_start;
+
+        for ty in (0..h).step_by(ROTATE_TILE_SIZE) {
+            let bh = (h - ty).min(ROTATE_TILE_SIZE);
+            let dst_x_start = h - ty - bh;
+
+            // Sequential row reads from src, transposed into L1-resident stack tile.
+            for ly in 0..bh {
+                let src_row_start = (ty + ly) * w + tx;
+                let src_row = &src_px[src_row_start..src_row_start + bw];
+                let col = bh - 1 - ly;
+                for (lx, &px) in src_row.iter().enumerate() {
+                    tile[lx * ROTATE_TILE_SIZE + col] = px;
+                }
+            }
+
+            // Sequential row writes from stack tile into destination slab.
+            for lx in 0..bw {
+                let dst_row_start = (local_row_start + lx) * h + dst_x_start;
+                dst_slab[dst_row_start..dst_row_start + bh]
+                    .copy_from_slice(&tile[lx * ROTATE_TILE_SIZE..lx * ROTATE_TILE_SIZE + bh]);
+            }
+        }
+    }
+}
+
+/// Rotates a tightly packed `w × h` pixel buffer (with `N` bytes per pixel) 90° clockwise
+/// into a `h × w` buffer using destination-sequential cache-blocked tiling, parallelized
+/// across disjoint destination row slabs for large images.
+fn rotate90_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w = w as usize;
+    let h = h as usize;
+    let total_pixels = w * h;
+    let mut dst = vec![0u8; total_pixels * N];
+    if total_pixels == 0 {
+        return dst;
+    }
+
+    let src_px = &src.as_chunks::<N>().0[..total_pixels];
+    let dst_px = &mut dst.as_chunks_mut::<N>().0[..total_pixels];
+    let workers = rotate_worker_count(total_pixels, w);
+
+    if workers == 1 {
+        rotate90_slab(src_px, dst_px, w, h, 0);
+    } else {
+        let tiles_per_worker = w.div_ceil(ROTATE_TILE_SIZE).div_ceil(workers);
+        let slab_rows = tiles_per_worker * ROTATE_TILE_SIZE;
+        std::thread::scope(|scope| {
+            for (slab_idx, dst_slab) in dst_px.chunks_mut(slab_rows * h).enumerate() {
+                let dst_y_start = slab_idx * slab_rows;
+                scope.spawn(move || {
+                    rotate90_slab(src_px, dst_slab, w, h, dst_y_start);
+                });
+            }
+        });
+    }
+
+    dst
+}
+
+/// Rotates a tightly packed `w × h` pixel buffer (with `N` bytes per pixel) 180°
+/// by reversing the pixel slice sequentially, parallelized across disjoint destination
+/// chunks for large images.
+fn rotate180_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let n = (w as usize) * (h as usize);
+    let mut dst = vec![0u8; n * N];
+    if n == 0 {
+        return dst;
+    }
+
+    let src_px = &src.as_chunks::<N>().0[..n];
+    let dst_px = &mut dst.as_chunks_mut::<N>().0[..n];
+    let workers = if n >= PARALLEL_ROTATE_MIN_PIXELS {
+        std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1)
+            .clamp(1, MAX_ROTATE_THREADS)
+    } else {
+        1
+    };
+
+    if workers == 1 {
+        for (d, s) in dst_px.iter_mut().zip(src_px.iter().rev()) {
+            *d = *s;
+        }
+    } else {
+        let chunk_len = n.div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (chunk_idx, dst_chunk) in dst_px.chunks_mut(chunk_len).enumerate() {
+                let start = chunk_idx * chunk_len;
+                let end = start + dst_chunk.len();
+                let src_slice = &src_px[n - end..n - start];
+                scope.spawn(move || {
+                    for (d, s) in dst_chunk.iter_mut().zip(src_slice.iter().rev()) {
+                        *d = *s;
+                    }
+                });
+            }
+        });
+    }
+
+    dst
+}
+
+/// Rotates a contiguous horizontal destination slab (`dst_y_start..dst_y_start + slab_rows`)
+/// of a 270° clockwise (90° counter-clockwise) rotation from `src_px` (`w × h`) into
+/// `dst_slab` (`slab_rows × h`), using destination-sequential outer-`tx`, inner-`ty` tiling.
+fn rotate270_slab<const N: usize>(
+    src_px: &[[u8; N]],
+    dst_slab: &mut [[u8; N]],
+    w: usize,
+    h: usize,
+    dst_y_start: usize,
+) {
+    let slab_rows = dst_slab.len() / h;
+    let mut tile = [[0u8; N]; ROTATE_TILE_SIZE * ROTATE_TILE_SIZE];
+
+    for local_row_start in (0..slab_rows).step_by(ROTATE_TILE_SIZE) {
+        let bw = (slab_rows - local_row_start).min(ROTATE_TILE_SIZE);
+        let tx = w - (dst_y_start + local_row_start + bw);
+
+        for ty in (0..h).step_by(ROTATE_TILE_SIZE) {
+            let bh = (h - ty).min(ROTATE_TILE_SIZE);
+
+            // Sequential row reads from src, transposed into L1-resident stack tile.
+            for ly in 0..bh {
+                let src_row_start = (ty + ly) * w + tx;
+                let src_row = &src_px[src_row_start..src_row_start + bw];
+                for (lx, &px) in src_row.iter().enumerate() {
+                    tile[(bw - 1 - lx) * ROTATE_TILE_SIZE + ly] = px;
+                }
+            }
+
+            // Sequential row writes from stack tile into destination slab.
+            for row in 0..bw {
+                let dst_row_start = (local_row_start + row) * h + ty;
+                dst_slab[dst_row_start..dst_row_start + bh]
+                    .copy_from_slice(&tile[row * ROTATE_TILE_SIZE..row * ROTATE_TILE_SIZE + bh]);
+            }
+        }
+    }
+}
+
+/// Rotates a tightly packed `w × h` pixel buffer (with `N` bytes per pixel) 270° clockwise
+/// (90° counter-clockwise) into a `h × w` buffer using destination-sequential cache-blocked
+/// tiling, parallelized across disjoint destination row slabs for large images.
+fn rotate270_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w = w as usize;
+    let h = h as usize;
+    let total_pixels = w * h;
+    let mut dst = vec![0u8; total_pixels * N];
+    if total_pixels == 0 {
+        return dst;
+    }
+
+    let src_px = &src.as_chunks::<N>().0[..total_pixels];
+    let dst_px = &mut dst.as_chunks_mut::<N>().0[..total_pixels];
+    let workers = rotate_worker_count(total_pixels, w);
+
+    if workers == 1 {
+        rotate270_slab(src_px, dst_px, w, h, 0);
+    } else {
+        let tiles_per_worker = w.div_ceil(ROTATE_TILE_SIZE).div_ceil(workers);
+        let slab_rows = tiles_per_worker * ROTATE_TILE_SIZE;
+        std::thread::scope(|scope| {
+            for (slab_idx, dst_slab) in dst_px.chunks_mut(slab_rows * h).enumerate() {
+                let dst_y_start = slab_idx * slab_rows;
+                scope.spawn(move || {
+                    rotate270_slab(src_px, dst_slab, w, h, dst_y_start);
+                });
+            }
+        });
+    }
+
+    dst
+}
+
+/// Rotates a `DynamicImage` 90° clockwise using cache-blocked tiling for `ImageRgb8`
+/// and `ImageRgba8`, falling back to `DynamicImage::rotate90()` for other pixel formats.
+pub fn rotate90_fast(img: &DynamicImage) -> DynamicImage {
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = rotate90_pixels::<3>(rgb.as_raw(), w, h);
+            DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(h, w, raw).expect("valid rotated RGB dimensions"),
+            )
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let (w, h) = (rgba.width(), rgba.height());
+            let raw = rotate90_pixels::<4>(rgba.as_raw(), w, h);
+            DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(h, w, raw).expect("valid rotated RGBA dimensions"),
+            )
+        }
+        other => other.rotate90(),
+    }
+}
+
+/// Rotates a `DynamicImage` 180° using sequential pixel reversal for `ImageRgb8`
+/// and `ImageRgba8`, falling back to `DynamicImage::rotate180()` for other pixel formats.
+pub fn rotate180_fast(img: &DynamicImage) -> DynamicImage {
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = rotate180_pixels::<3>(rgb.as_raw(), w, h);
+            DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(w, h, raw).expect("valid rotated RGB dimensions"),
+            )
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let (w, h) = (rgba.width(), rgba.height());
+            let raw = rotate180_pixels::<4>(rgba.as_raw(), w, h);
+            DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(w, h, raw).expect("valid rotated RGBA dimensions"),
+            )
+        }
+        other => other.rotate180(),
+    }
+}
+
+/// Rotates a `DynamicImage` 270° clockwise (90° counter-clockwise) using cache-blocked tiling
+/// for `ImageRgb8` and `ImageRgba8`, falling back to `DynamicImage::rotate270()` for other formats.
+pub fn rotate270_fast(img: &DynamicImage) -> DynamicImage {
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width(), rgb.height());
+            let raw = rotate270_pixels::<3>(rgb.as_raw(), w, h);
+            DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(h, w, raw).expect("valid rotated RGB dimensions"),
+            )
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            let (w, h) = (rgba.width(), rgba.height());
+            let raw = rotate270_pixels::<4>(rgba.as_raw(), w, h);
+            DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(h, w, raw).expect("valid rotated RGBA dimensions"),
+            )
+        }
+        other => other.rotate270(),
+    }
+}
+
+/// Applies an EXIF `Orientation` transform to a `DynamicImage`, using cache-blocked
+/// rotation helpers for 90°/270° transforms and zero-allocation in-place pixel reversal
+/// for 180° transforms on `ImageRgb8` and `ImageRgba8`.
+pub fn apply_orientation_fast(
+    mut img: DynamicImage,
+    orientation: image::metadata::Orientation,
+) -> DynamicImage {
+    use image::metadata::Orientation;
+    match orientation {
+        Orientation::NoTransforms => img,
+        Orientation::Rotate90 => rotate90_fast(&img),
+        Orientation::Rotate180 => {
+            match img {
+                DynamicImage::ImageRgb8(ref mut rgb) => {
+                    let n = (rgb.width() as usize) * (rgb.height() as usize);
+                    rgb.as_mut().as_chunks_mut::<3>().0[..n].reverse();
+                }
+                DynamicImage::ImageRgba8(ref mut rgba) => {
+                    let n = (rgba.width() as usize) * (rgba.height() as usize);
+                    rgba.as_mut().as_chunks_mut::<4>().0[..n].reverse();
+                }
+                _ => img.apply_orientation(Orientation::Rotate180),
+            }
+            img
+        }
+        Orientation::Rotate270 => rotate270_fast(&img),
+        Orientation::Rotate90FlipH => {
+            let mut rotated = rotate90_fast(&img);
+            rotated.apply_orientation(Orientation::FlipHorizontal);
+            rotated
+        }
+        Orientation::Rotate270FlipH => {
+            let mut rotated = rotate270_fast(&img);
+            rotated.apply_orientation(Orientation::FlipHorizontal);
+            rotated
+        }
+        Orientation::FlipHorizontal | Orientation::FlipVertical => {
+            img.apply_orientation(orientation);
+            img
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,5 +1420,210 @@ mod tests {
         luma_a.put_pixel(3, 3, image::LumaA([42, 128]));
         let norm_trans_la = normalize_decoded_image(DynamicImage::ImageLumaA8(luma_a));
         assert!(matches!(norm_trans_la, DynamicImage::ImageRgba8(_)));
+    }
+
+    #[test]
+    fn test_fast_rotations_bit_exact_equivalence() {
+        let dims = [
+            (0, 0),
+            (1, 1),
+            (1, 17),
+            (17, 1),
+            (31, 33),
+            (32, 32),
+            (64, 64),
+            (65, 129),
+            (137, 91),
+            // Exceeds PARALLEL_ROTATE_MIN_PIXELS with non-tile-multiple dimensions to exercise
+            // the multi-threaded slab partitioning path.
+            (1027, 1003),
+        ];
+
+        for &(w, h) in &dims {
+            // ImageRgb8
+            let rgb = image::RgbImage::from_fn(w, h, |x, y| {
+                image::Rgb([
+                    ((x * 13 + y * 7) % 256) as u8,
+                    ((x * 29 + y * 11 + 3) % 256) as u8,
+                    ((x * 43 + y * 19 + 17) % 256) as u8,
+                ])
+            });
+            let dyn_rgb = DynamicImage::ImageRgb8(rgb);
+
+            let r90_fast = rotate90_fast(&dyn_rgb);
+            let r90_ref = dyn_rgb.rotate90();
+            assert_eq!(
+                (r90_fast.width(), r90_fast.height()),
+                (r90_ref.width(), r90_ref.height()),
+                "RGB8 rotate90 dims mismatch for {w}x{h}"
+            );
+            assert_eq!(
+                r90_fast.as_bytes(),
+                r90_ref.as_bytes(),
+                "RGB8 rotate90 pixel mismatch for {w}x{h}"
+            );
+
+            let r180_fast = rotate180_fast(&dyn_rgb);
+            let r180_ref = dyn_rgb.rotate180();
+            assert_eq!(
+                (r180_fast.width(), r180_fast.height()),
+                (r180_ref.width(), r180_ref.height()),
+                "RGB8 rotate180 dims mismatch for {w}x{h}"
+            );
+            assert_eq!(
+                r180_fast.as_bytes(),
+                r180_ref.as_bytes(),
+                "RGB8 rotate180 pixel mismatch for {w}x{h}"
+            );
+
+            let r270_fast = rotate270_fast(&dyn_rgb);
+            let r270_ref = dyn_rgb.rotate270();
+            assert_eq!(
+                (r270_fast.width(), r270_fast.height()),
+                (r270_ref.width(), r270_ref.height()),
+                "RGB8 rotate270 dims mismatch for {w}x{h}"
+            );
+            assert_eq!(
+                r270_fast.as_bytes(),
+                r270_ref.as_bytes(),
+                "RGB8 rotate270 pixel mismatch for {w}x{h}"
+            );
+
+            // ImageRgba8
+            let rgba = image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([
+                    ((x * 17 + y * 5) % 256) as u8,
+                    ((x * 31 + y * 13 + 7) % 256) as u8,
+                    ((x * 47 + y * 23 + 11) % 256) as u8,
+                    ((x * 59 + y * 29 + 19) % 256) as u8,
+                ])
+            });
+            let dyn_rgba = DynamicImage::ImageRgba8(rgba);
+
+            let r90_fast = rotate90_fast(&dyn_rgba);
+            let r90_ref = dyn_rgba.rotate90();
+            assert_eq!(
+                (r90_fast.width(), r90_fast.height()),
+                (r90_ref.width(), r90_ref.height()),
+                "RGBA8 rotate90 dims mismatch for {w}x{h}"
+            );
+            assert_eq!(
+                r90_fast.as_bytes(),
+                r90_ref.as_bytes(),
+                "RGBA8 rotate90 pixel mismatch for {w}x{h}"
+            );
+
+            let r180_fast = rotate180_fast(&dyn_rgba);
+            let r180_ref = dyn_rgba.rotate180();
+            assert_eq!(
+                (r180_fast.width(), r180_fast.height()),
+                (r180_ref.width(), r180_ref.height()),
+                "RGBA8 rotate180 dims mismatch for {w}x{h}"
+            );
+            assert_eq!(
+                r180_fast.as_bytes(),
+                r180_ref.as_bytes(),
+                "RGBA8 rotate180 pixel mismatch for {w}x{h}"
+            );
+
+            let r270_fast = rotate270_fast(&dyn_rgba);
+            let r270_ref = dyn_rgba.rotate270();
+            assert_eq!(
+                (r270_fast.width(), r270_fast.height()),
+                (r270_ref.width(), r270_ref.height()),
+                "RGBA8 rotate270 dims mismatch for {w}x{h}"
+            );
+            assert_eq!(
+                r270_fast.as_bytes(),
+                r270_ref.as_bytes(),
+                "RGBA8 rotate270 pixel mismatch for {w}x{h}"
+            );
+
+            // Fallback variant: ImageLuma8
+            let luma = image::GrayImage::from_fn(w, h, |x, y| {
+                image::Luma([((x * 37 + y * 13 + 5) % 256) as u8])
+            });
+            let dyn_luma = DynamicImage::ImageLuma8(luma);
+            assert_eq!(
+                rotate90_fast(&dyn_luma).as_bytes(),
+                dyn_luma.rotate90().as_bytes()
+            );
+            assert_eq!(
+                rotate180_fast(&dyn_luma).as_bytes(),
+                dyn_luma.rotate180().as_bytes()
+            );
+            assert_eq!(
+                rotate270_fast(&dyn_luma).as_bytes(),
+                dyn_luma.rotate270().as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_orientation_fast_all_variants() {
+        use image::metadata::Orientation;
+
+        let orientations = [
+            Orientation::NoTransforms,
+            Orientation::Rotate90,
+            Orientation::Rotate180,
+            Orientation::Rotate270,
+            Orientation::FlipHorizontal,
+            Orientation::FlipVertical,
+            Orientation::Rotate90FlipH,
+            Orientation::Rotate270FlipH,
+        ];
+
+        let dims = [
+            (0, 0),
+            (1, 1),
+            (1, 17),
+            (17, 1),
+            (31, 33),
+            (32, 32),
+            (64, 64),
+            (65, 129),
+            (137, 91),
+        ];
+
+        for &(w, h) in &dims {
+            let rgb = DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                image::Rgb([
+                    ((x * 13 + y * 7) % 256) as u8,
+                    ((x * 29 + y * 11 + 3) % 256) as u8,
+                    ((x * 43 + y * 19 + 17) % 256) as u8,
+                ])
+            }));
+            let rgba = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([
+                    ((x * 17 + y * 5) % 256) as u8,
+                    ((x * 31 + y * 13 + 7) % 256) as u8,
+                    ((x * 47 + y * 23 + 11) % 256) as u8,
+                    ((x * 59 + y * 29 + 19) % 256) as u8,
+                ])
+            }));
+            let luma = DynamicImage::ImageLuma8(image::GrayImage::from_fn(w, h, |x, y| {
+                image::Luma([((x * 37 + y * 13 + 5) % 256) as u8])
+            }));
+
+            for &orient in &orientations {
+                for (label, base) in [("RGB8", &rgb), ("RGBA8", &rgba), ("Luma8", &luma)] {
+                    let fast = apply_orientation_fast(base.clone(), orient);
+                    let mut reference = base.clone();
+                    reference.apply_orientation(orient);
+
+                    assert_eq!(
+                        (fast.width(), fast.height()),
+                        (reference.width(), reference.height()),
+                        "{label} {orient:?} dims mismatch for {w}x{h}"
+                    );
+                    assert_eq!(
+                        fast.as_bytes(),
+                        reference.as_bytes(),
+                        "{label} {orient:?} pixel mismatch for {w}x{h}"
+                    );
+                }
+            }
+        }
     }
 }

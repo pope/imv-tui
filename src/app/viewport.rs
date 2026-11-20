@@ -4,7 +4,7 @@ use crate::app::palette::PaletteMode;
 use crate::app::{App, LoadPhase};
 use crate::imaging::{
     Brightness, CellDimensions, Contrast, CropBox, ImageIntersection, PanOffset, PixelDimensions,
-    ResizeRequest, Rotation, ScaleMode, ZoomFactor,
+    ResizeRequest, Rotation, ScaleMode, ZoomFactor, rotate90_fast, rotate270_fast,
 };
 use crate::ui::ThumbnailState;
 use ratatui_image::picker::ProtocolType;
@@ -598,9 +598,9 @@ impl App {
         }
         if let Some(img) = self.original_image.take() {
             let rotated = if clockwise {
-                img.rotate90()
+                rotate90_fast(&img)
             } else {
-                img.rotate270()
+                rotate270_fast(&img)
             };
             let rotated_arc = Arc::new(rotated);
 
@@ -615,9 +615,9 @@ impl App {
                 let rotated_thumb = if Arc::ptr_eq(&img, &thumb) {
                     Arc::clone(&rotated_arc)
                 } else if clockwise {
-                    Arc::new(thumb.rotate90())
+                    Arc::new(rotate90_fast(&thumb))
                 } else {
-                    Arc::new(thumb.rotate270())
+                    Arc::new(rotate270_fast(&thumb))
                 };
                 if let ThumbnailState::Loaded(ref mut t) = self.stats.thumbnail {
                     t.dimensions = (rotated_thumb.width(), rotated_thumb.height());

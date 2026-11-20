@@ -45,7 +45,9 @@ impl<T: FromStr> FromStr for Adjustment<T> {
     }
 }
 
-use crate::imaging::types::{Brightness, Contrast, Rotation};
+use crate::imaging::types::{
+    Brightness, Contrast, Rotation, rotate90_fast, rotate180_fast, rotate270_fast,
+};
 
 /// Individual image adjustments (brightness, contrast, rotation) that are preserved per-file.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -59,9 +61,9 @@ impl ImageAdjustments {
     /// Applies the rotation setting to the given DynamicImage. Returns None if no rotation is needed.
     pub fn rotate_image(&self, img: &DynamicImage) -> Option<DynamicImage> {
         match self.rotation {
-            Rotation::D90 => Some(img.rotate90()),
-            Rotation::D180 => Some(img.rotate180()),
-            Rotation::D270 => Some(img.rotate270()),
+            Rotation::D90 => Some(rotate90_fast(img)),
+            Rotation::D180 => Some(rotate180_fast(img)),
+            Rotation::D270 => Some(rotate270_fast(img)),
             _ => None,
         }
     }

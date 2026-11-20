@@ -525,7 +525,7 @@ fn decode_single_payload_cancellable(
                 if cancel.is_cancelled() {
                     return Err("Operation cancelled".to_string());
                 }
-                img.apply_orientation(orientation);
+                img = apply_orientation_fast(img, orientation);
             }
 
             let w = img.width();
@@ -578,7 +578,7 @@ fn decode_single_payload_cancellable(
         if cancel.is_cancelled() {
             return Err("Operation cancelled".to_string());
         }
-        img.apply_orientation(orientation);
+        img = apply_orientation_fast(img, orientation);
     }
 
     let img = normalize_decoded_image(img);
@@ -888,7 +888,7 @@ fn decode_thumbnail_and_dimensions_impl(
         } else {
             get_exif_orientation(bytes)
         };
-        thumb_img.apply_orientation(orientation);
+        thumb_img = apply_orientation_fast(thumb_img, orientation);
 
         if orientation_swaps_dimensions(orientation) {
             std::mem::swap(&mut raw_w, &mut raw_h);
@@ -913,7 +913,7 @@ fn decode_thumbnail_and_dimensions_impl(
     let mut thumb_img = decode_jpeg_thumbnail_bytes(&thumb_bytes)?;
 
     // Apply the exact same orientation transforms to the thumbnail
-    thumb_img.apply_orientation(orientation);
+    thumb_img = apply_orientation_fast(thumb_img, orientation);
 
     // Swap dimensions if orientation rotates the image 90 or 270 degrees
     if orientation_swaps_dimensions(orientation) {
