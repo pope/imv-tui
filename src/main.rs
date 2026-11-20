@@ -20,7 +20,10 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::{Backend, ClearType, CrosstermBackend},
+};
 use ratatui_image::picker::Picker;
 
 use crate::app::{App, ImageDisplayState};
@@ -82,6 +85,22 @@ impl<W: io::Write> Drop for SyncUpdateGuard<'_, W> {
             let _ = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
         }
     }
+}
+
+/// Clears the entire alternate screen and resets both ratatui buffers without
+/// querying the terminal cursor position (`\x1b[6n`).
+///
+/// Unlike `Terminal::clear()`, which calls `crossterm::cursor::position()` and
+/// can block or time out inside DEC Mode 2026 synchronized updates or while the
+/// terminal is decoding large graphics frames, this emits `\x1b[2J` directly
+/// and forces the next `Terminal::draw()` to repaint every cell.
+fn clear_fullscreen_without_query<W: io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+) -> io::Result<()> {
+    terminal.backend_mut().clear_region(ClearType::All)?;
+    terminal.current_buffer_mut().reset();
+    terminal.swap_buffers();
+    Ok(())
 }
 
 /// Runs a terminal clear/draw closure inside a DEC Mode 2026 synchronized update
@@ -282,7 +301,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             draw_needed = false;
             run_synchronized_update(&mut terminal, |terminal| {
                 if clear_before_draw {
-                    terminal.clear()?;
+                    clear_fullscreen_without_query(terminal)?;
                 }
                 terminal.draw(|f| {
                     let mut model = app.ui_model();
@@ -376,10 +395,11 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use ratatui::{TerminalOptions, Viewport, backend::Backend, layout::Rect, widgets::Paragraph};
+    use ratatui::{TerminalOptions, Viewport, layout::Rect, widgets::Paragraph};
 
     const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
     const END_SYNC: &[u8] = b"\x1b[?2026l";
+    const CURSOR_POS_QUERY: &[u8] = b"\x1b[6n";
 
     #[derive(Clone, Default)]
     struct CaptureWriter {
@@ -393,6 +413,12 @@ mod tests {
 
         fn flushes(&self) -> usize {
             self.inner.borrow().1
+        }
+
+        fn clear(&self) {
+            let mut inner = self.inner.borrow_mut();
+            inner.0.clear();
+            inner.1 = 0;
         }
     }
 
@@ -424,8 +450,18 @@ mod tests {
         let capture = CaptureWriter::default();
         let mut terminal = test_terminal(capture.clone());
 
+        // Populate ratatui's previous buffer with an initial frame so we can
+        // verify that `clear_fullscreen_without_query` forces unchanged cells
+        // to redraw on the next frame.
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new("hello"), f.area());
+            })
+            .expect("initial draw should succeed");
+        capture.clear();
+
         run_synchronized_update(&mut terminal, |terminal| {
-            terminal.backend_mut().clear()?;
+            clear_fullscreen_without_query(terminal)?;
             terminal.draw(|f| {
                 f.render_widget(Paragraph::new("hello"), f.area());
             })?;
@@ -448,6 +484,12 @@ mod tests {
             "expected output to end with EndSynchronizedUpdate, got: {:?}",
             String::from_utf8_lossy(&out)
         );
+        assert!(
+            !out.windows(CURSOR_POS_QUERY.len())
+                .any(|w| w == CURSOR_POS_QUERY),
+            "expected no cursor-position query (\\x1b[6n) during fullscreen clear, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
 
         let body = &out[BEGIN_SYNC.len()..out.len() - END_SYNC.len()];
         assert!(
@@ -457,7 +499,7 @@ mod tests {
         );
         assert!(
             body.windows(b"hello".len()).any(|w| w == b"hello"),
-            "expected rendered frame content between sync markers, got: {:?}",
+            "expected unchanged cells from prior frame to redraw after clear, got: {:?}",
             String::from_utf8_lossy(body)
         );
     }

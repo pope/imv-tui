@@ -1647,7 +1647,7 @@ fn test_should_clear_on_update_and_dismiss_needs_clear() {
     assert!(!app.should_clear_on_update());
 
     app.picker.set_protocol_type(ProtocolType::Iterm2);
-    assert!(!app.should_clear_on_update());
+    assert!(app.should_clear_on_update());
 
     app.picker.set_protocol_type(ProtocolType::Sixel);
     assert!(app.should_clear_on_update());

@@ -252,9 +252,14 @@ impl App {
         self.queue.adjustment(self.queue.current_index).contrast
     }
 
-    /// Returns true if the active terminal graphics protocol requires clearing the screen on updates.
+    /// Returns true if the active terminal graphics protocol requires clearing the screen on updates
+    /// (`ProtocolType::Sixel` and `ProtocolType::Iterm2`), so overlays redraw cleanly over updated
+    /// inline raster graphics and clear completely on dismissal.
     pub fn should_clear_on_update(&self) -> bool {
-        matches!(self.picker.protocol_type(), ProtocolType::Sixel)
+        matches!(
+            self.picker.protocol_type(),
+            ProtocolType::Sixel | ProtocolType::Iterm2
+        )
     }
 
     /// Zooms into the image by a fractional multiplier.
