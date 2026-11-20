@@ -34,9 +34,16 @@ use crate::imaging::{
     Picker, ResizeRequest, ScaleMode, ViewportProtocol, ZoomFactor,
 };
 
-/// Threshold below which navigation is considered fast scrolling (60ms).
-/// Background prefetching is suspended while navigating faster than this rate.
-pub const FAST_SCROLL_THRESHOLD: Duration = Duration::from_millis(60);
+/// Threshold below which consecutive navigations are treated as brisk scrolling (200ms).
+///
+/// Navigating again within this window enters `ScrollCadence::BriskScrolling`, suspending
+/// foreground full-resolution decoding (using fast thumbnails) and background prefetching
+/// until at least `BRISK_SCROLL_THRESHOLD` of quiet has elapsed.
+pub const BRISK_SCROLL_THRESHOLD: Duration = Duration::from_millis(200);
+
+/// Quiet period required after the most recent navigation before launching background
+/// neighbor prefetches (250ms).
+pub const PREFETCH_SETTLE_DELAY: Duration = Duration::from_millis(250);
 
 /// Tracks the background loader lifecycle for the currently selected image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -262,19 +269,45 @@ impl InitialLoadState {
     }
 }
 
-/// Tracks user navigation cadence to detect fast scrolling and suspend/resume background work.
+/// Action returned by `ScrollCadence::poll_settle_action` when a settle threshold elapses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CadenceAction {
+    /// No cadence threshold has been crossed yet.
+    None,
+    /// Brisk scrolling has paused (`>= BRISK_SCROLL_THRESHOLD`): promote the deferred
+    /// foreground thumbnail to full resolution while keeping neighbor prefetch deferred.
+    PromoteForeground,
+    /// Navigation has fully settled (`>= PREFETCH_SETTLE_DELAY`): resume background
+    /// neighbor prefetching.
+    ResumePrefetch,
+    /// Both thresholds elapsed in a single poll (`BriskScrolling` -> `Settled`):
+    /// promote the deferred foreground thumbnail and resume background neighbor prefetching.
+    PromoteAndPrefetch,
+}
+
+/// Tracks user navigation cadence to detect brisk scrolling and stagger foreground promotion
+/// and background neighbor prefetching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollCadence {
     /// No navigation has occurred yet.
     #[default]
     Idle,
-    /// Normal navigation cadence (or fast-scroll settle period has elapsed); prefetching is active.
-    Settled {
+    /// An isolated navigation occurred; foreground full-resolution decoding runs immediately,
+    /// while background neighbor prefetching is deferred until `PREFETCH_SETTLE_DELAY` elapses.
+    SingleStep {
         /// Timestamp of the most recent navigation event.
         last_nav: Instant,
     },
-    /// Rapid navigation detected within `FAST_SCROLL_THRESHOLD`; full decode and neighbor prefetch are suspended.
-    FastScrolling {
+    /// Consecutive navigations arrived within `BRISK_SCROLL_THRESHOLD`; both foreground
+    /// full-resolution decoding (thumbnail-only) and background neighbor prefetching are
+    /// suspended until `BRISK_SCROLL_THRESHOLD` of quiet elapses.
+    BriskScrolling {
+        /// Timestamp of the most recent navigation event.
+        last_nav: Instant,
+    },
+    /// Navigation has been quiet for at least `PREFETCH_SETTLE_DELAY`; background
+    /// neighbor prefetching is active.
+    Settled {
         /// Timestamp of the most recent navigation event.
         last_nav: Instant,
     },
@@ -285,45 +318,69 @@ impl ScrollCadence {
     pub fn last_nav_time(&self) -> Option<Instant> {
         match *self {
             Self::Idle => None,
-            Self::Settled { last_nav } | Self::FastScrolling { last_nav } => Some(last_nav),
+            Self::SingleStep { last_nav }
+            | Self::BriskScrolling { last_nav }
+            | Self::Settled { last_nav } => Some(last_nav),
         }
     }
 
-    /// Records a new navigation event, transitioning to `FastScrolling` if within `FAST_SCROLL_THRESHOLD`.
-    /// Returns `true` if fast scrolling was detected.
+    /// Records a new navigation event at `now`.
+    ///
+    /// Transitions to `BriskScrolling` if the previous navigation was within
+    /// `BRISK_SCROLL_THRESHOLD`, otherwise enters `SingleStep` (which loads the foreground
+    /// image at full resolution while deferring background neighbor prefetches until
+    /// `PREFETCH_SETTLE_DELAY` elapses). Returns `true` if brisk scrolling was detected.
     pub fn record_navigation(&mut self, now: Instant) -> bool {
-        let is_fast = self
+        let is_brisk = self
             .last_nav_time()
-            .is_some_and(|prev| now.duration_since(prev) < FAST_SCROLL_THRESHOLD);
-        *self = if is_fast {
-            Self::FastScrolling { last_nav: now }
+            .is_some_and(|prev| now.saturating_duration_since(prev) < BRISK_SCROLL_THRESHOLD);
+        *self = if is_brisk {
+            Self::BriskScrolling { last_nav: now }
         } else {
-            Self::Settled { last_nav: now }
+            Self::SingleStep { last_nav: now }
         };
-        is_fast
+        is_brisk
     }
 
-    /// Returns `true` if neighbor prefetching is currently suspended due to rapid navigation.
+    /// Returns `true` if background neighbor prefetching is currently suspended or deferred.
     pub fn is_prefetch_suspended(&self) -> bool {
-        matches!(self, Self::FastScrolling { .. })
+        matches!(self, Self::SingleStep { .. } | Self::BriskScrolling { .. })
     }
 
-    /// Returns `true` if navigation has settled (or no navigation has occurred).
+    /// Returns `true` if navigation has fully settled (or no navigation has occurred).
     pub fn is_settled(&self) -> bool {
-        self.last_nav_time()
-            .is_none_or(|t| t.elapsed() >= FAST_SCROLL_THRESHOLD)
+        matches!(self, Self::Idle | Self::Settled { .. })
     }
 
-    /// Transitions from `FastScrolling` to `Settled` if the elapsed time exceeds `FAST_SCROLL_THRESHOLD`.
-    /// Returns `true` if a transition from `FastScrolling` to `Settled` occurred.
-    pub fn poll_settled(&mut self) -> bool {
-        if let Self::FastScrolling { last_nav } = *self
-            && last_nav.elapsed() >= FAST_SCROLL_THRESHOLD
-        {
-            *self = Self::Settled { last_nav };
-            return true;
+    /// Polls for cadence settle transitions at `now` and returns any resulting `CadenceAction`.
+    ///
+    /// - `BriskScrolling` -> `Settled` (`PromoteAndPrefetch`) if `elapsed >= PREFETCH_SETTLE_DELAY`.
+    /// - `BriskScrolling` -> `SingleStep` (`PromoteForeground`) if `elapsed >= BRISK_SCROLL_THRESHOLD`.
+    /// - `SingleStep` -> `Settled` (`ResumePrefetch`) if `elapsed >= PREFETCH_SETTLE_DELAY`.
+    pub fn poll_settle_action(&mut self, now: Instant) -> CadenceAction {
+        match *self {
+            Self::Idle | Self::Settled { .. } => CadenceAction::None,
+            Self::BriskScrolling { last_nav } => {
+                let elapsed = now.saturating_duration_since(last_nav);
+                if elapsed >= PREFETCH_SETTLE_DELAY {
+                    *self = Self::Settled { last_nav };
+                    CadenceAction::PromoteAndPrefetch
+                } else if elapsed >= BRISK_SCROLL_THRESHOLD {
+                    *self = Self::SingleStep { last_nav };
+                    CadenceAction::PromoteForeground
+                } else {
+                    CadenceAction::None
+                }
+            }
+            Self::SingleStep { last_nav } => {
+                if now.saturating_duration_since(last_nav) >= PREFETCH_SETTLE_DELAY {
+                    *self = Self::Settled { last_nav };
+                    CadenceAction::ResumePrefetch
+                } else {
+                    CadenceAction::None
+                }
+            }
         }
-        false
     }
 }
 

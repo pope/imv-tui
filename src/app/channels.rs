@@ -2,7 +2,9 @@
 
 use crate::app::cache::{CachedFullImage, CachedThumbnail, VisibleWindow};
 use crate::app::palette::PaletteMode;
-use crate::app::{App, InitialLoadState, LoadPhase, ThumbnailState, ThumbnailTelemetry};
+use crate::app::{
+    App, CadenceAction, InitialLoadState, LoadPhase, ThumbnailState, ThumbnailTelemetry,
+};
 use crate::imaging::{LoaderMode, LoaderRequest, PanOffset, Rotation, ZoomFactor};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -125,11 +127,7 @@ impl App {
                 self.stats.format = Some(full.format);
                 self.stats.raw_dimensions = cached_img.raw_dimensions;
 
-                let is_fast_scroll = self.scroll_cadence.record_navigation(Instant::now());
-
-                if !is_fast_scroll {
-                    self.trigger_prefetch();
-                }
+                let _ = self.scroll_cadence.record_navigation(Instant::now());
                 return;
             } else if let ThumbnailState::Loaded(cached_thumb) = cached_img.thumbnail {
                 // If we only have a thumbnail, display it immediately as a fast placeholder,
@@ -189,9 +187,9 @@ impl App {
             self.resize_state.reset_idle();
         }
 
-        let is_fast_scroll = self.scroll_cadence.record_navigation(Instant::now());
+        let is_brisk_scroll = self.scroll_cadence.record_navigation(Instant::now());
 
-        let thumb_only = is_fast_scroll && !self.disable_thumbnail;
+        let thumb_only = is_brisk_scroll && !self.disable_thumbnail;
         if loaded_cached_thumb && thumb_only {
             self.load_phase = LoadPhase::FullDeferred;
         } else {
@@ -212,10 +210,6 @@ impl App {
                 mode,
                 sequence: self.current_sequence,
             });
-        }
-
-        if !is_fast_scroll {
-            self.trigger_prefetch();
         }
     }
 
@@ -383,26 +377,37 @@ impl App {
 
     /// Periodic background tick called from the main event loop.
     ///
-    /// Promotes deferred thumbnail placeholders to full-resolution images and resumes
-    /// suspended background prefetching once fast scrolling ceases and the elapsed time
-    /// exceeds `FAST_SCROLL_THRESHOLD`.
+    /// Promotes deferred thumbnail placeholders to full-resolution images once brisk
+    /// scrolling pauses (`BRISK_SCROLL_THRESHOLD`) and resumes suspended background
+    /// neighbor prefetching once navigation fully settles (`PREFETCH_SETTLE_DELAY`).
     pub fn tick(&mut self) {
-        if self.scroll_cadence.poll_settled() {
-            if self.load_phase.needs_promotion() && !self.queue.is_empty() {
-                self.load_phase = LoadPhase::FullInFlight;
-                let mode = if self.thumbnail_image.is_some() {
-                    LoaderMode::FullOnly
-                } else {
-                    LoaderMode::ThumbnailAndFull
-                };
-                let source = self.queue.images()[self.queue.current_index].clone();
-                let _ = self.loader_tx.send(LoaderRequest {
-                    idx: self.queue.current_index,
-                    source,
-                    mode,
-                    sequence: self.current_sequence,
-                });
-            }
+        let action = self.scroll_cadence.poll_settle_action(Instant::now());
+        let promote = matches!(
+            action,
+            CadenceAction::PromoteForeground | CadenceAction::PromoteAndPrefetch
+        );
+        let resume_prefetch = matches!(
+            action,
+            CadenceAction::ResumePrefetch | CadenceAction::PromoteAndPrefetch
+        );
+
+        if promote && self.load_phase.needs_promotion() && !self.queue.is_empty() {
+            self.load_phase = LoadPhase::FullInFlight;
+            let mode = if self.thumbnail_image.is_some() {
+                LoaderMode::FullOnly
+            } else {
+                LoaderMode::ThumbnailAndFull
+            };
+            let source = self.queue.images()[self.queue.current_index].clone();
+            let _ = self.loader_tx.send(LoaderRequest {
+                idx: self.queue.current_index,
+                source,
+                mode,
+                sequence: self.current_sequence,
+            });
+        }
+
+        if resume_prefetch {
             self.trigger_prefetch();
         }
     }

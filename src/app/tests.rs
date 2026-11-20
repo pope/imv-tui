@@ -787,11 +787,19 @@ fn test_start_load_image_channel_dispatch() {
         ImageSource::Local(PathBuf::from("img1.png"))
     );
 
-    // It also dispatches prefetch request for index 1 with sequence 1.
+    // Background prefetch is deferred until PREFETCH_SETTLE_DELAY elapses
+    assert!(channels.loader_rx.try_recv().is_err());
+
+    // Once PREFETCH_SETTLE_DELAY elapses, tick() dispatches prefetch for index 1 with sequence 1.
+    app.scroll_cadence = ScrollCadence::SingleStep {
+        last_nav: Instant::now() - PREFETCH_SETTLE_DELAY,
+    };
+    app.tick();
+
     let prefetch_req = channels
         .loader_rx
         .try_recv()
-        .expect("Expected prefetch LoaderRequest on loader_rx");
+        .expect("Expected prefetch LoaderRequest on loader_rx after settle");
     assert_eq!(prefetch_req.idx, 1);
     assert!(prefetch_req.mode.is_prefetch());
     assert_eq!(prefetch_req.sequence, 1);
@@ -1725,30 +1733,32 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
     // Drain initial requests from setup
     while channels.loader_rx.try_recv().is_ok() {}
 
-    // 1. Initial state
-    assert!(!app.is_prefetch_suspended());
+    // 1. Initial state after startup load: SingleStep (prefetch deferred until PREFETCH_SETTLE_DELAY)
+    assert!(app.is_prefetch_suspended());
+    assert!(!app.scroll_cadence.is_settled());
     assert_eq!(
         app.active_sequence.load(Ordering::Acquire),
         app.current_sequence as usize
     );
 
-    // 2. Trigger first navigation (isolated after threshold)
+    // 2. Trigger first isolated navigation (well after BRISK_SCROLL_THRESHOLD)
     app.scroll_cadence = ScrollCadence::Settled {
-        last_nav: Instant::now() - Duration::from_millis(100),
+        last_nav: Instant::now() - Duration::from_millis(300),
     };
     app.next_image();
-    assert!(!app.is_prefetch_suspended());
+    // SingleStep loads foreground full-res immediately, while deferring neighbor prefetch
+    assert!(app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::FullInFlight);
     assert!(!app.load_phase.needs_promotion());
-    // Drain requests
     let mut reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         reqs.push(r);
     }
-    let non_prefetch = reqs.iter().find(|r| !r.mode.is_prefetch()).unwrap();
-    assert_eq!(non_prefetch.mode, LoaderMode::ThumbnailAndFull);
+    assert_eq!(reqs.len(), 1);
+    assert!(!reqs[0].mode.is_prefetch());
+    assert_eq!(reqs[0].mode, LoaderMode::ThumbnailAndFull);
 
-    // 3. Trigger rapid successive navigation (within FAST_SCROLL_THRESHOLD)
+    // 3. Trigger rapid successive navigation (within BRISK_SCROLL_THRESHOLD) -> enters BriskScrolling
     app.next_image();
     assert!(app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::ThumbnailInFlightDeferred);
@@ -1758,50 +1768,61 @@ fn test_fast_scroll_prefetch_throttling_and_tick() {
         app.current_sequence as usize
     );
 
-    // In fast scroll, active load is sent with ThumbnailOnly, and prefetch requests are skipped
+    // In brisk scroll, active load is sent with ThumbnailOnly, and prefetch requests are skipped
     let mut rapid_reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
         rapid_reqs.push(r);
     }
-    // Active load was sent
     assert_eq!(rapid_reqs.len(), 1);
     assert!(!rapid_reqs[0].mode.is_prefetch());
     assert_eq!(rapid_reqs[0].mode, LoaderMode::ThumbnailOnly);
 
-    // 4. Tick before threshold does not resume prefetch
+    // 4. Tick before BRISK_SCROLL_THRESHOLD does not promote or resume prefetch
     app.tick();
     assert!(app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::ThumbnailInFlightDeferred);
     assert!(channels.loader_rx.try_recv().is_err());
 
-    // 5. Once elapsed time exceeds threshold, tick resumes prefetch and dispatches full-resolution promotion
-    app.scroll_cadence = ScrollCadence::FastScrolling {
-        last_nav: Instant::now() - Duration::from_millis(70),
+    // 5. After BRISK_SCROLL_THRESHOLD (210ms) but before PREFETCH_SETTLE_DELAY (250ms):
+    // tick promotes foreground to full-res, while STILL deferring neighbor prefetches!
+    app.scroll_cadence = ScrollCadence::BriskScrolling {
+        last_nav: Instant::now() - Duration::from_millis(210),
     };
     app.tick();
-    assert!(!app.is_prefetch_suspended());
+    assert!(app.is_prefetch_suspended());
     assert_eq!(app.load_phase, LoadPhase::FullInFlight);
     assert!(!app.load_phase.needs_promotion());
 
-    // Requests dispatched by tick: promotion request + prefetch requests
-    let mut resumed_reqs = Vec::new();
+    let mut promo_reqs = Vec::new();
     while let Ok(r) = channels.loader_rx.try_recv() {
-        resumed_reqs.push(r);
+        promo_reqs.push(r);
     }
-    let promo_req = resumed_reqs
-        .iter()
-        .find(|r| !r.mode.is_prefetch())
-        .expect("Expected full-resolution promotion request");
-    assert_eq!(promo_req.idx, app.queue.current_index);
+    assert_eq!(promo_reqs.len(), 1);
+    assert!(!promo_reqs[0].mode.is_prefetch());
+    assert_eq!(promo_reqs[0].idx, app.queue.current_index);
     assert_eq!(
-        promo_req.mode,
+        promo_reqs[0].mode,
         if app.thumbnail_image.is_some() {
             LoaderMode::FullOnly
         } else {
             LoaderMode::ThumbnailAndFull
         }
     );
-    assert!(resumed_reqs.iter().any(|r| r.mode.is_prefetch()));
+
+    // 6. After PREFETCH_SETTLE_DELAY (260ms): tick transitions SingleStep -> Settled and triggers prefetches
+    app.scroll_cadence = ScrollCadence::SingleStep {
+        last_nav: Instant::now() - Duration::from_millis(260),
+    };
+    app.tick();
+    assert!(!app.is_prefetch_suspended());
+    assert!(app.scroll_cadence.is_settled());
+
+    let mut prefetch_reqs = Vec::new();
+    while let Ok(r) = channels.loader_rx.try_recv() {
+        prefetch_reqs.push(r);
+    }
+    assert!(!prefetch_reqs.is_empty());
+    assert!(prefetch_reqs.iter().all(|r| r.mode.is_prefetch()));
 }
 
 #[test]
@@ -1827,7 +1848,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
 
     // 2. Navigate to image 1 (which is NOT in prefetch cache)
     app.scroll_cadence = ScrollCadence::Settled {
-        last_nav: Instant::now() - Duration::from_millis(100),
+        last_nav: Instant::now() - Duration::from_millis(300),
     };
     app.next_image();
 
@@ -1863,7 +1884,7 @@ fn test_stale_thumbnail_reset_on_navigation_and_pending_work() {
         },
     );
     app.scroll_cadence = ScrollCadence::Settled {
-        last_nav: Instant::now() - Duration::from_millis(100),
+        last_nav: Instant::now() - Duration::from_millis(300),
     };
     app.prev_image(); // Navigates back to image 0 (which has cached thumbnail)
     assert!(app.thumbnail_image.is_some());
@@ -2193,28 +2214,75 @@ fn test_app_state_machine_invariants() {
     let old_load = InitialLoadState::start_at(Instant::now() - Duration::from_millis(200));
     assert!(old_load.should_show_spinner(Duration::from_millis(150)));
 
-    // 4. ScrollCadence
+    // 4. ScrollCadence: Idle -> SingleStep -> BriskScrolling -> staged settle -> Settled
     let mut cad = ScrollCadence::default();
     assert_eq!(cad.last_nav_time(), None);
     assert!(cad.is_settled());
     assert!(!cad.is_prefetch_suspended());
 
-    let now = Instant::now();
-    assert!(!cad.record_navigation(now));
-    assert_eq!(cad.last_nav_time(), Some(now));
-    assert!(!cad.is_prefetch_suspended());
-
-    let fast_now = now + Duration::from_millis(20);
-    assert!(cad.record_navigation(fast_now));
+    // First isolated step enters SingleStep (foreground full-res, prefetch deferred)
+    let t0 = Instant::now();
+    assert!(!cad.record_navigation(t0));
+    assert_eq!(cad, ScrollCadence::SingleStep { last_nav: t0 });
+    assert_eq!(cad.last_nav_time(), Some(t0));
     assert!(cad.is_prefetch_suspended());
     assert!(!cad.is_settled());
-    assert!(!cad.poll_settled());
+    assert_eq!(
+        cad.poll_settle_action(t0 + Duration::from_millis(150)),
+        CadenceAction::None
+    );
 
-    cad = ScrollCadence::FastScrolling {
-        last_nav: Instant::now() - Duration::from_millis(70),
-    };
+    // Settling after PREFETCH_SETTLE_DELAY resumes prefetch
+    assert_eq!(
+        cad.poll_settle_action(t0 + PREFETCH_SETTLE_DELAY),
+        CadenceAction::ResumePrefetch
+    );
+    assert_eq!(cad, ScrollCadence::Settled { last_nav: t0 });
     assert!(cad.is_settled());
-    assert!(cad.poll_settled());
+    assert!(!cad.is_prefetch_suspended());
+
+    // Brisk scrolling streak: consecutive taps at 120ms (< BRISK_SCROLL_THRESHOLD) stay in BriskScrolling
+    let t1 = t0 + Duration::from_millis(500);
+    assert!(!cad.record_navigation(t1)); // isolated -> SingleStep
+    let t2 = t1 + Duration::from_millis(120);
+    assert!(cad.record_navigation(t2)); // brisk -> BriskScrolling
+    assert_eq!(cad, ScrollCadence::BriskScrolling { last_nav: t2 });
+    assert!(cad.is_prefetch_suspended());
+    assert!(!cad.is_settled());
+
+    // Fast -> slow (150ms gap) -> fast (40ms gap): stays in BriskScrolling without triggering prefetch
+    let t3 = t2 + Duration::from_millis(150);
+    assert_eq!(cad.poll_settle_action(t3), CadenceAction::None);
+    assert!(cad.record_navigation(t3));
+    let t4 = t3 + Duration::from_millis(40);
+    assert!(cad.record_navigation(t4));
+    assert_eq!(cad, ScrollCadence::BriskScrolling { last_nav: t4 });
+
+    // Staged settle progression: 200ms -> PromoteForeground (SingleStep), 250ms -> ResumePrefetch (Settled)
+    assert_eq!(
+        cad.poll_settle_action(t4 + BRISK_SCROLL_THRESHOLD),
+        CadenceAction::PromoteForeground
+    );
+    assert_eq!(cad, ScrollCadence::SingleStep { last_nav: t4 });
+    assert!(cad.is_prefetch_suspended());
+    assert_eq!(
+        cad.poll_settle_action(t4 + PREFETCH_SETTLE_DELAY),
+        CadenceAction::ResumePrefetch
+    );
+    assert_eq!(cad, ScrollCadence::Settled { last_nav: t4 });
+    assert!(!cad.is_prefetch_suspended());
+    assert_eq!(
+        cad.poll_settle_action(t4 + Duration::from_millis(400)),
+        CadenceAction::None
+    );
+
+    // Direct jump when elapsed >= PREFETCH_SETTLE_DELAY: BriskScrolling -> PromoteAndPrefetch (Settled)
+    cad = ScrollCadence::BriskScrolling { last_nav: t4 };
+    assert_eq!(
+        cad.poll_settle_action(t4 + PREFETCH_SETTLE_DELAY),
+        CadenceAction::PromoteAndPrefetch
+    );
+    assert_eq!(cad, ScrollCadence::Settled { last_nav: t4 });
     assert!(!cad.is_prefetch_suspended());
 }
 

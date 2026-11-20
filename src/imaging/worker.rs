@@ -125,8 +125,13 @@ pub fn spawn_resize_worker(
     });
 }
 
-/// Maximum number of concurrent full-image decode worker threads in the loader pool.
+/// Maximum number of concurrent base full-image decode worker threads in the loader pool.
 pub const MAX_DECODE_WORKERS: usize = 5;
+
+/// Additional dedicated burst worker threads spawned above `decode_worker_count()` so foreground
+/// decodes can start immediately even when cancelled decodes are still draining on base workers.
+/// Background prefetch jobs are never allowed to spill into these burst slots.
+pub const FOREGROUND_BURST_WORKERS: usize = 2;
 
 /// Maximum capacity for the non-blocking background thumbnail writer queue.
 pub const MAX_THUMB_WRITE_QUEUE: usize = 8;
@@ -166,11 +171,18 @@ fn enqueue_thumb_write_job(queue: &mut ThumbWriteQueue, job: ThumbWriteJob, max_
     queue.pending.push_back(job);
 }
 
-/// Returns the number of parallel full-image decode worker threads to spawn (`2..=5`).
+/// Returns the number of parallel base full-image decode worker threads (`2..=5`).
 pub fn decode_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, MAX_DECODE_WORKERS))
         .unwrap_or(2)
+}
+
+/// Returns the maximum number of concurrent background prefetch workers allowed for a given
+/// `base_workers` count (`(base_workers / 2).max(1)`).
+#[inline]
+pub fn max_prefetch_workers(base_workers: usize) -> usize {
+    (base_workers / 2).max(1)
 }
 
 /// Internal pending decode job enqueued for parallel decode workers.
@@ -203,10 +215,13 @@ struct DecodeQueueState {
 
 /// Predicate checking if the next job in `pending` can be popped by an idle worker.
 ///
-/// Ensures only 1 foreground decode executes at any given time so intermediate scroll steps
-/// coalesce in `pending` in 0ns, while reserving at least 1 idle worker for foreground execution
-/// by limiting active prefetch threads to `max_workers.saturating_sub(1).max(1)`.
-fn can_pop_job(state: &DecodeQueueState, max_workers: usize) -> bool {
+/// Ensures only 1 non-cancelled foreground decode executes at any given time so intermediate
+/// scroll steps coalesce in `pending` in 0ns. Foreground jobs can always be popped by any idle
+/// worker (including the `FOREGROUND_BURST_WORKERS` headroom threads) even while cancelled
+/// decodes are still draining. Background prefetch jobs are capped at
+/// `max_prefetch_workers(base_workers)` and may never spill into the burst headroom slots
+/// (`total_in_flight < base_workers`).
+fn can_pop_job(state: &DecodeQueueState, base_workers: usize) -> bool {
     let Some(front) = state.pending.front() else {
         return false;
     };
@@ -221,18 +236,61 @@ fn can_pop_job(state: &DecodeQueueState, max_workers: usize) -> bool {
     if !front.mode.is_prefetch() {
         true
     } else {
+        let total_in_flight = state.in_flight.iter().flatten().count();
+        if total_in_flight >= base_workers {
+            return false;
+        }
         let active_prefetches = state
             .in_flight
             .iter()
             .flatten()
             .filter(|slot| slot.mode.is_prefetch())
             .count();
-        active_prefetches < max_workers.saturating_sub(1).max(1)
+        active_prefetches < max_prefetch_workers(base_workers)
+    }
+}
+
+/// Reconciles active in-flight decode slots against the latest batch of requests.
+///
+/// During a fast-scroll (`ThumbnailOnly`) batch, any non-cancelled in-flight slot whose `idx`
+/// matches a request in `current_requests` is preserved (updating its sequence to `highest_seq`
+/// and promoting prefetch slots to `LoaderMode::FullOnly`) so already-running decode work is
+/// not discarded while the worker thread remains occupied. All non-matching slots are cancelled.
+fn reconcile_in_flight_slots(
+    in_flight: &mut [Option<InFlightSlot>],
+    current_requests: &VecDeque<LoaderRequest>,
+    highest_seq: u64,
+    is_fast_scroll_batch: bool,
+) {
+    for slot in in_flight.iter_mut().flatten() {
+        if is_fast_scroll_batch {
+            if !slot.cancel_flag.load(Ordering::Acquire)
+                && current_requests.iter().any(|r| r.idx == slot.idx)
+            {
+                slot.sequence.swap(highest_seq, Ordering::AcqRel);
+                if slot.mode.is_prefetch() {
+                    slot.mode = LoaderMode::FullOnly;
+                }
+            } else {
+                slot.cancel_flag.store(true, Ordering::Release);
+            }
+        } else if !slot.cancel_flag.load(Ordering::Acquire)
+            && let Some(matching_req) = current_requests.iter().find(|r| r.idx == slot.idx)
+        {
+            let prev_seq = slot.sequence.swap(highest_seq, Ordering::AcqRel);
+            if prev_seq < highest_seq || !matching_req.mode.is_prefetch() {
+                slot.mode = matching_req.mode;
+            }
+        } else if slot.sequence.load(Ordering::Acquire) < highest_seq {
+            slot.cancel_flag.store(true, Ordering::Release);
+        }
     }
 }
 
 /// Spawns the 2-stage image loader pool: 1 fast-thumbnail coordinator thread and
-/// `decode_worker_count()` parallel full-resolution decode worker threads.
+/// `decode_worker_count() + FOREGROUND_BURST_WORKERS` parallel full-resolution decode worker
+/// threads (with background prefetches capped to `max_prefetch_workers(base_workers)` and
+/// restricted to base worker slots).
 pub fn spawn_loader_pool(
     loader_rx: Receiver<LoaderRequest>,
     response_tx: Sender<LoaderResponse>,
@@ -240,11 +298,12 @@ pub fn spawn_loader_pool(
     disable_thumbnail: bool,
     thumb_cache_root: Option<PathBuf>,
 ) {
-    let num_workers = decode_worker_count();
+    let base_workers = decode_worker_count();
+    let total_workers = base_workers + FOREGROUND_BURST_WORKERS;
     let queue_state = Arc::new((
         Mutex::new(DecodeQueueState {
             pending: VecDeque::new(),
-            in_flight: (0..num_workers).map(|_| None).collect(),
+            in_flight: (0..total_workers).map(|_| None).collect(),
             shutdown: false,
         }),
         Condvar::new(),
@@ -297,7 +356,7 @@ pub fn spawn_loader_pool(
         };
 
     // Spawn Stage 2 parallel decode workers
-    for worker_id in 0..num_workers {
+    for worker_id in 0..total_workers {
         let queue_pair = Arc::clone(&queue_state);
         let response_tx = response_tx.clone();
         let active_seq = Arc::clone(&active_seq);
@@ -308,7 +367,7 @@ pub fn spawn_loader_pool(
                 let (job, cancel_flag, slot_seq) = {
                     let (lock, cvar) = &*queue_pair;
                     let mut state = lock.lock().unwrap();
-                    while !can_pop_job(&state, num_workers) && !state.shutdown {
+                    while !can_pop_job(&state, base_workers) && !state.shutdown {
                         state = cvar.wait(state).unwrap();
                     }
                     if state.shutdown {
@@ -339,7 +398,7 @@ pub fn spawn_loader_pool(
                     let (lock, cvar) = &*queue_pair;
                     let mut state = lock.lock().unwrap();
                     state.in_flight[worker_id] = None;
-                    if !state.pending.is_empty() && can_pop_job(&state, num_workers) {
+                    if !state.pending.is_empty() && can_pop_job(&state, base_workers) {
                         cvar.notify_all();
                     }
                     continue;
@@ -380,7 +439,7 @@ pub fn spawn_loader_pool(
                         .as_ref()
                         .map(|s| s.has_thumbnail)
                         .unwrap_or(job.has_thumbnail);
-                    if !state.pending.is_empty() && can_pop_job(&state, num_workers) {
+                    if !state.pending.is_empty() && can_pop_job(&state, base_workers) {
                         cvar.notify_all();
                     }
                     (final_seq, final_mode, has_thumb)
@@ -502,21 +561,12 @@ pub fn spawn_loader_pool(
                 let is_fast_scroll_batch =
                     current_requests.iter().any(|r| r.mode.is_thumbnail_only());
 
-                for slot in state.in_flight.iter_mut().flatten() {
-                    if is_fast_scroll_batch {
-                        slot.cancel_flag.store(true, Ordering::Release);
-                    } else if !slot.cancel_flag.load(Ordering::Acquire)
-                        && let Some(matching_req) =
-                            current_requests.iter().find(|r| r.idx == slot.idx)
-                    {
-                        let prev_seq = slot.sequence.swap(highest_seq, Ordering::AcqRel);
-                        if prev_seq < highest_seq || !matching_req.mode.is_prefetch() {
-                            slot.mode = matching_req.mode;
-                        }
-                    } else if slot.sequence.load(Ordering::Acquire) < highest_seq {
-                        slot.cancel_flag.store(true, Ordering::Release);
-                    }
-                }
+                reconcile_in_flight_slots(
+                    &mut state.in_flight,
+                    &current_requests,
+                    highest_seq,
+                    is_fast_scroll_batch,
+                );
 
                 if !is_fast_scroll_batch
                     && current_requests.iter().any(|r| !r.mode.is_prefetch())
@@ -524,7 +574,7 @@ pub fn spawn_loader_pool(
                         !slot.mode.is_prefetch() && !slot.cancel_flag.load(Ordering::Acquire)
                     })
                 {
-                    let max_prefetch = num_workers.saturating_sub(1).max(1);
+                    let max_prefetch = max_prefetch_workers(base_workers);
                     let mut active_prefetches = state
                         .in_flight
                         .iter()
@@ -583,7 +633,7 @@ pub fn spawn_loader_pool(
                     state.pending.extend(prefetch);
                 }
 
-                if can_pop_job(&state, num_workers) {
+                if can_pop_job(&state, base_workers) {
                     cvar.notify_all();
                 }
             }
@@ -808,7 +858,7 @@ pub fn spawn_loader_pool(
                         cvar.notify_one();
                     } else {
                         state.pending.push_back(job);
-                        if can_pop_job(&state, num_workers) {
+                        if can_pop_job(&state, base_workers) {
                             cvar.notify_all();
                         }
                     }
@@ -2941,16 +2991,14 @@ mod tests {
             .push_back(make_job(1, 1, LoaderMode::Prefetch));
         assert!(can_pop_job(&state, max_workers));
 
-        // 5. If prefetch workers saturate reserved slots (4 out of 5), cannot pop more prefetch
-        for i in 0..3 {
-            state
-                .in_flight
-                .push(Some(make_slot(i, 1, LoaderMode::Prefetch)));
-        }
+        // 5. If prefetch workers saturate max_prefetch_workers(5) == 2, cannot pop more prefetch
+        state
+            .in_flight
+            .push(Some(make_slot(0, 1, LoaderMode::Prefetch)));
         assert!(can_pop_job(&state, max_workers));
         state
             .in_flight
-            .push(Some(make_slot(3, 1, LoaderMode::Prefetch)));
+            .push(Some(make_slot(1, 1, LoaderMode::Prefetch)));
         assert!(!can_pop_job(&state, max_workers));
 
         // 6. Test pending demotion on sequence advancement
@@ -2985,6 +3033,138 @@ mod tests {
 
         assert_eq!(state.pending[0].mode, LoaderMode::Prefetch);
         assert_eq!(state.pending[0].sequence, 2);
+    }
+
+    #[test]
+    fn test_max_prefetch_workers_bounds() {
+        assert_eq!(max_prefetch_workers(1), 1);
+        assert_eq!(max_prefetch_workers(2), 1);
+        assert_eq!(max_prefetch_workers(3), 1);
+        assert_eq!(max_prefetch_workers(4), 2);
+        assert_eq!(max_prefetch_workers(5), 2);
+        assert_eq!(max_prefetch_workers(6), 3);
+    }
+
+    #[test]
+    fn test_can_pop_job_foreground_burst_headroom_and_prefetch_isolation() {
+        let base_workers = 5;
+        let mut state = DecodeQueueState {
+            pending: VecDeque::new(),
+            in_flight: Vec::new(),
+            shutdown: false,
+        };
+
+        let make_job = |idx: usize, sequence: u64, mode: LoaderMode| DecodeJob {
+            idx,
+            source: ImageSource::Local(std::path::PathBuf::from("dummy.png")),
+            mode,
+            sequence,
+            bytes_opt: None,
+            raw_header_opt: None,
+            local_path: None,
+            has_thumbnail: false,
+        };
+
+        let make_slot =
+            |idx: usize, sequence: u64, mode: LoaderMode, cancelled: bool| InFlightSlot {
+                idx,
+                sequence: Arc::new(AtomicU64::new(sequence)),
+                cancel_flag: Arc::new(AtomicBool::new(cancelled)),
+                mode,
+                has_thumbnail: false,
+            };
+
+        // Occupy all 5 base workers: 1 active prefetch + 4 draining cancelled foreground decodes
+        state
+            .in_flight
+            .push(Some(make_slot(10, 1, LoaderMode::Prefetch, false)));
+        for i in 0..4 {
+            state
+                .in_flight
+                .push(Some(make_slot(i, 1, LoaderMode::ThumbnailAndFull, true)));
+        }
+        assert_eq!(state.in_flight.iter().flatten().count(), base_workers);
+
+        // Even though active_prefetches (1) < max_prefetch_workers(5) (2), total_in_flight == base_workers,
+        // so another prefetch MUST NOT spill into FOREGROUND_BURST_WORKERS headroom slots.
+        state
+            .pending
+            .push_back(make_job(11, 2, LoaderMode::Prefetch));
+        assert!(!can_pop_job(&state, base_workers));
+
+        // A new foreground job CAN immediately pop using the burst worker headroom!
+        state
+            .pending
+            .push_front(make_job(12, 2, LoaderMode::ThumbnailAndFull));
+        assert!(can_pop_job(&state, base_workers));
+
+        // Once one cancelled foreground drains (total_in_flight == 4 < base_workers) and front is Prefetch,
+        // prefetch can pop again (active_prefetches == 1 < 2).
+        state.pending.pop_front();
+        state.in_flight.pop();
+        assert!(can_pop_job(&state, base_workers));
+    }
+
+    #[test]
+    fn test_reconcile_in_flight_slots_fast_scroll_preserves_matching_slot() {
+        let make_slot = |idx: usize, sequence: u64, mode: LoaderMode, cancelled: bool| {
+            Some(InFlightSlot {
+                idx,
+                sequence: Arc::new(AtomicU64::new(sequence)),
+                cancel_flag: Arc::new(AtomicBool::new(cancelled)),
+                mode,
+                has_thumbnail: false,
+            })
+        };
+
+        let mut in_flight = vec![
+            // Matching prefetch slot -> must be preserved, bumped to seq 5, and promoted to FullOnly
+            make_slot(2, 3, LoaderMode::Prefetch, false),
+            // Matching foreground slot -> must be preserved and bumped to seq 5
+            make_slot(3, 4, LoaderMode::ThumbnailAndFull, false),
+            // Non-matching foreground slot -> must be cancelled
+            make_slot(1, 4, LoaderMode::ThumbnailAndFull, false),
+            // Non-matching prefetch slot -> must be cancelled
+            make_slot(4, 3, LoaderMode::Prefetch, false),
+            // Already-cancelled slot with matching idx -> must stay cancelled
+            make_slot(2, 2, LoaderMode::ThumbnailAndFull, true),
+        ];
+
+        let mut current_requests = VecDeque::new();
+        current_requests.push_back(LoaderRequest {
+            idx: 2,
+            source: ImageSource::Local(std::path::PathBuf::from("img2.png")),
+            mode: LoaderMode::ThumbnailOnly,
+            sequence: 5,
+        });
+        current_requests.push_back(LoaderRequest {
+            idx: 3,
+            source: ImageSource::Local(std::path::PathBuf::from("img3.png")),
+            mode: LoaderMode::ThumbnailOnly,
+            sequence: 5,
+        });
+
+        reconcile_in_flight_slots(&mut in_flight, &current_requests, 5, true);
+
+        let slot0 = in_flight[0].as_ref().unwrap();
+        assert!(!slot0.cancel_flag.load(Ordering::Acquire));
+        assert_eq!(slot0.sequence.load(Ordering::Acquire), 5);
+        assert_eq!(slot0.mode, LoaderMode::FullOnly);
+
+        let slot1 = in_flight[1].as_ref().unwrap();
+        assert!(!slot1.cancel_flag.load(Ordering::Acquire));
+        assert_eq!(slot1.sequence.load(Ordering::Acquire), 5);
+        assert_eq!(slot1.mode, LoaderMode::ThumbnailAndFull);
+
+        let slot2 = in_flight[2].as_ref().unwrap();
+        assert!(slot2.cancel_flag.load(Ordering::Acquire));
+
+        let slot3 = in_flight[3].as_ref().unwrap();
+        assert!(slot3.cancel_flag.load(Ordering::Acquire));
+
+        let slot4 = in_flight[4].as_ref().unwrap();
+        assert!(slot4.cancel_flag.load(Ordering::Acquire));
+        assert_eq!(slot4.sequence.load(Ordering::Acquire), 2);
     }
 
     #[test]
