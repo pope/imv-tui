@@ -14,8 +14,11 @@ use std::time::Duration;
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    execute, queue,
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_image::picker::Picker;
@@ -40,8 +43,60 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         crate::imaging::cleanup_all_kitty_shm_segments();
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            EndSynchronizedUpdate,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
     }
+}
+
+/// RAII guard for DEC Mode 2026 Synchronized Output (`?2026h` / `?2026l`).
+///
+/// Ensures `EndSynchronizedUpdate` is always emitted and flushed even if
+/// clearing or drawing fails partway through a frame.
+struct SyncUpdateGuard<'a, W: io::Write> {
+    terminal: &'a mut Terminal<CrosstermBackend<W>>,
+    active: bool,
+}
+
+impl<'a, W: io::Write> SyncUpdateGuard<'a, W> {
+    fn begin(terminal: &'a mut Terminal<CrosstermBackend<W>>) -> io::Result<Self> {
+        queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        Ok(Self {
+            terminal,
+            active: true,
+        })
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.active = false;
+        execute!(self.terminal.backend_mut(), EndSynchronizedUpdate)
+    }
+}
+
+impl<W: io::Write> Drop for SyncUpdateGuard<'_, W> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
+        }
+    }
+}
+
+/// Runs a terminal clear/draw closure inside a DEC Mode 2026 synchronized update
+/// block so the terminal presents the complete frame atomically.
+fn run_synchronized_update<W, F>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    f: F,
+) -> io::Result<()>
+where
+    W: io::Write,
+    F: FnOnce(&mut Terminal<CrosstermBackend<W>>) -> io::Result<()>,
+{
+    let guard = SyncUpdateGuard::begin(terminal)?;
+    f(guard.terminal)?;
+    guard.finish()
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -210,11 +265,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             draw_needed = true;
         }
 
+        let mut clear_before_draw = false;
         if app.needs_clear() {
             app.screen_clear.take_pending();
-            if app.should_clear_on_update() {
-                terminal.clear()?;
-            }
+            clear_before_draw = app.should_clear_on_update();
             draw_needed = true;
         }
 
@@ -226,9 +280,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         if draw_needed {
             draw_needed = false;
-            terminal.draw(|f| {
-                let mut model = app.ui_model();
-                ui(f, &mut model);
+            run_synchronized_update(&mut terminal, |terminal| {
+                if clear_before_draw {
+                    terminal.clear()?;
+                }
+                terminal.draw(|f| {
+                    let mut model = app.ui_model();
+                    ui(f, &mut model);
+                })?;
+                Ok(())
             })?;
         }
 
@@ -290,7 +350,12 @@ fn main() {
     // before displaying panic details on console stderr.
     std::panic::set_hook(Box::new(|panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            EndSynchronizedUpdate,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         eprintln!("Application Panicked:\n{}", panic_info);
     }));
 
@@ -302,5 +367,129 @@ fn main() {
             eprintln!("Error: {}", err_str);
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use ratatui::{TerminalOptions, Viewport, backend::Backend, layout::Rect, widgets::Paragraph};
+
+    const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
+    const END_SYNC: &[u8] = b"\x1b[?2026l";
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter {
+        inner: Rc<RefCell<(Vec<u8>, usize)>>,
+    }
+
+    impl CaptureWriter {
+        fn bytes(&self) -> Vec<u8> {
+            self.inner.borrow().0.clone()
+        }
+
+        fn flushes(&self) -> usize {
+            self.inner.borrow().1
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.borrow_mut().0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.borrow_mut().1 += 1;
+            Ok(())
+        }
+    }
+
+    fn test_terminal(writer: CaptureWriter) -> Terminal<CrosstermBackend<CaptureWriter>> {
+        let backend = CrosstermBackend::new(writer);
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .expect("fixed-viewport terminal creation should not fail")
+    }
+
+    #[test]
+    fn synchronized_update_wraps_clear_and_draw_output() {
+        let capture = CaptureWriter::default();
+        let mut terminal = test_terminal(capture.clone());
+
+        run_synchronized_update(&mut terminal, |terminal| {
+            terminal.backend_mut().clear()?;
+            terminal.draw(|f| {
+                f.render_widget(Paragraph::new("hello"), f.area());
+            })?;
+            Ok(())
+        })
+        .expect("synchronized update should succeed");
+
+        let out = capture.bytes();
+        assert!(
+            capture.flushes() > 0,
+            "expected writer to be flushed after synchronized update"
+        );
+        assert!(
+            out.starts_with(BEGIN_SYNC),
+            "expected output to start with BeginSynchronizedUpdate, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.ends_with(END_SYNC),
+            "expected output to end with EndSynchronizedUpdate, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let body = &out[BEGIN_SYNC.len()..out.len() - END_SYNC.len()];
+        assert!(
+            body.windows(b"\x1b[2J".len()).any(|w| w == b"\x1b[2J"),
+            "expected clear escape sequence between sync markers, got: {:?}",
+            String::from_utf8_lossy(body)
+        );
+        assert!(
+            body.windows(b"hello".len()).any(|w| w == b"hello"),
+            "expected rendered frame content between sync markers, got: {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    #[test]
+    fn synchronized_update_emits_end_marker_on_error() {
+        let capture = CaptureWriter::default();
+        let mut terminal = test_terminal(capture.clone());
+
+        let err = run_synchronized_update(&mut terminal, |terminal| {
+            terminal.backend_mut().clear()?;
+            Err(io::Error::other("simulated draw failure"))
+        })
+        .expect_err("expected simulated error to propagate");
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "simulated draw failure");
+
+        let out = capture.bytes();
+        assert!(
+            capture.flushes() > 0,
+            "expected writer to be flushed when EndSynchronizedUpdate runs on error"
+        );
+        assert!(
+            out.starts_with(BEGIN_SYNC),
+            "expected BeginSynchronizedUpdate before failure, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.ends_with(END_SYNC),
+            "expected EndSynchronizedUpdate to be written on error via Drop, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }
