@@ -199,6 +199,7 @@ pub fn collect_sources(paths: &[PathBuf], check_magic: bool) -> Result<Vec<Image
 
 /// Filters candidate file paths down to valid image files, using scoped worker threads
 /// when `check_magic` is enabled on large candidate sets (`>= 64` files).
+#[cfg(test)]
 pub fn filter_image_candidates(candidates: Vec<PathBuf>, check_magic: bool) -> Vec<PathBuf> {
     if !check_magic || candidates.len() < 64 {
         return candidates
@@ -235,6 +236,143 @@ pub fn filter_image_candidates(candidates: Vec<PathBuf>, check_magic: bool) -> V
     })
 }
 
+/// Canonical path provenance for a scanned file entry, avoiding per-file `canonicalize()` syscalls.
+enum CanonicalSource {
+    /// Regular non-symlink file inside `canonical_dirs[idx]`.
+    Dir(usize),
+    /// Symlink whose resolved canonical path was computed during deduplication (if available).
+    Symlink(Option<PathBuf>),
+    /// Fallback when directory canonicalization failed.
+    Unknown,
+}
+
+/// A candidate file discovered during directory scanning together with its canonical provenance.
+struct ScannedEntry {
+    path: PathBuf,
+    canonical: CanonicalSource,
+}
+
+/// Mutable accumulator used while traversing directories in [`scan_directory`].
+struct ScanState {
+    canonical_dirs: Vec<PathBuf>,
+    regular_entries: Vec<ScannedEntry>,
+    symlink_entries: Vec<PathBuf>,
+    stack: Vec<(PathBuf, usize)>,
+}
+
+impl ScanState {
+    fn new() -> Self {
+        Self {
+            canonical_dirs: Vec::new(),
+            regular_entries: Vec::new(),
+            symlink_entries: Vec::new(),
+            stack: Vec::new(),
+        }
+    }
+
+    fn scan_dir_entries(
+        &mut self,
+        current_dir: &Path,
+        dir_idx: Option<usize>,
+        check_magic: bool,
+        recursive: bool,
+        depth: usize,
+    ) {
+        let Ok(entries) = fs::read_dir(current_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                let path = entry.path();
+                if let Ok(meta) = fs::metadata(&path) {
+                    if meta.is_dir() {
+                        if recursive {
+                            self.stack.push((path, depth + 1));
+                        }
+                    } else if meta.is_file() {
+                        if !check_magic && !is_supported_image_ext(&path) {
+                            continue;
+                        }
+                        self.symlink_entries.push(path);
+                    }
+                }
+                continue;
+            };
+
+            if ft.is_dir() {
+                if recursive {
+                    self.stack.push((entry.path(), depth + 1));
+                }
+            } else if ft.is_file() {
+                let file_name = entry.file_name();
+                if !check_magic && !is_supported_image_ext(Path::new(&file_name)) {
+                    continue;
+                }
+                let path = current_dir.join(file_name);
+                let canonical = match dir_idx {
+                    Some(idx) => CanonicalSource::Dir(idx),
+                    None => CanonicalSource::Unknown,
+                };
+                self.regular_entries.push(ScannedEntry { path, canonical });
+            } else if ft.is_symlink() {
+                let path = entry.path();
+                if let Ok(meta) = fs::metadata(&path) {
+                    if meta.is_dir() {
+                        if recursive {
+                            self.stack.push((path, depth + 1));
+                        }
+                    } else if meta.is_file() {
+                        if !check_magic && !is_supported_image_ext(&path) {
+                            continue;
+                        }
+                        self.symlink_entries.push(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Filters already-verified regular file entries by magic bytes, using scoped worker threads
+/// on large candidate sets (`>= 64` files) without cloning paths or re-statting entries.
+fn filter_scanned_magic(entries: Vec<ScannedEntry>) -> Vec<ScannedEntry> {
+    if entries.len() < 64 {
+        return entries
+            .into_iter()
+            .filter(|e| matches!(guess_file_type(&e.path), Some(GuessType::Image)))
+            .collect();
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4);
+    let chunk_size = entries.len().div_ceil(workers);
+
+    let keep_flags: Vec<Vec<bool>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for chunk in entries.chunks(chunk_size) {
+            handles.push(s.spawn(move || {
+                chunk
+                    .iter()
+                    .map(|e| matches!(guess_file_type(&e.path), Some(GuessType::Image)))
+                    .collect::<Vec<bool>>()
+            }));
+        }
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    });
+
+    entries
+        .into_iter()
+        .zip(keep_flags.into_iter().flatten())
+        .filter_map(|(entry, keep)| keep.then_some(entry))
+        .collect()
+}
+
 /// Scans the directory surrounding the initial path, returns sorted paths of
 /// supported images along with the index pointing to the initial file.
 pub fn scan_directory(
@@ -242,97 +380,150 @@ pub fn scan_directory(
     check_magic: bool,
     recursive: bool,
 ) -> Result<(Vec<PathBuf>, usize), String> {
-    let (dir, file_name) = if initial_path.is_file() {
-        let parent = initial_path.parent().unwrap_or_else(|| Path::new("."));
-        let name = initial_path.file_name().map(|n| n.to_os_string());
-        (parent.to_path_buf(), name)
-    } else if initial_path.is_dir() {
-        (initial_path.to_path_buf(), None)
-    } else {
-        let parent = Path::new(".");
-        if parent.join(initial_path).is_file() {
-            (
-                parent.to_path_buf(),
-                Some(initial_path.as_os_str().to_os_string()),
-            )
-        } else {
-            return Err(format!("Path does not exist: {}", initial_path.display()));
+    let (dir, file_name) = match fs::metadata(initial_path) {
+        Ok(meta) if meta.is_file() => {
+            let parent = initial_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = initial_path.file_name().map(|n| n.to_os_string());
+            (parent.to_path_buf(), name)
+        }
+        Ok(meta) if meta.is_dir() => (initial_path.to_path_buf(), None),
+        _ => {
+            let parent = Path::new(".");
+            if parent.join(initial_path).is_file() {
+                (
+                    parent.to_path_buf(),
+                    Some(initial_path.as_os_str().to_os_string()),
+                )
+            } else {
+                return Err(format!("Path does not exist: {}", initial_path.display()));
+            }
         }
     };
 
-    let mut candidates = Vec::new();
-    let mut visited_files = std::collections::HashSet::new();
+    let mut state = ScanState::new();
 
     if recursive {
-        let mut visited = std::collections::HashSet::new();
-        let mut stack = vec![(dir.clone(), 0)]; // Store path and current depth
+        let mut visited_dirs = std::collections::HashSet::new();
+        state.stack.push((dir, 0));
         let max_depth = 32;
 
-        while let Some((current_dir, depth)) = stack.pop() {
+        while let Some((current_dir, depth)) = state.stack.pop() {
             if depth > max_depth {
                 continue;
             }
-            if let Ok(canonical) = current_dir.canonicalize() {
-                if !visited.insert(canonical) {
-                    continue; // Skip circular symlink
-                }
-            } else {
+            let Ok(canonical) = current_dir.canonicalize() else {
                 continue;
+            };
+            if !visited_dirs.insert(canonical.clone()) {
+                continue; // Skip circular symlink
             }
+            let dir_idx = state.canonical_dirs.len();
+            state.canonical_dirs.push(canonical);
 
-            if let Ok(entries) = fs::read_dir(&current_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack.push((path, depth + 1));
-                    } else if let Ok(canonical) = path.canonicalize() {
-                        if visited_files.insert(canonical) {
-                            candidates.push(path);
-                        }
-                    } else {
-                        candidates.push(path);
+            state.scan_dir_entries(&current_dir, Some(dir_idx), check_magic, true, depth);
+        }
+    } else {
+        let dir_idx = if let Ok(canonical) = dir.canonicalize() {
+            state.canonical_dirs.push(canonical);
+            Some(0)
+        } else {
+            None
+        };
+        state.scan_dir_entries(&dir, dir_idx, check_magic, false, 0);
+    }
+
+    if !state.symlink_entries.is_empty() {
+        let mut visited_files = std::collections::HashSet::with_capacity(
+            state.regular_entries.len() + state.symlink_entries.len(),
+        );
+        for entry in &state.regular_entries {
+            match entry.canonical {
+                CanonicalSource::Dir(idx) => {
+                    if let Some(name) = entry.path.file_name() {
+                        visited_files.insert(state.canonical_dirs[idx].join(name));
                     }
                 }
+                CanonicalSource::Unknown => {
+                    if let Ok(canon) = entry.path.canonicalize() {
+                        visited_files.insert(canon);
+                    }
+                }
+                CanonicalSource::Symlink(_) => {}
             }
         }
-    } else if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                if let Ok(canonical) = path.canonicalize() {
-                    if visited_files.insert(canonical) {
-                        candidates.push(path);
-                    }
-                } else {
-                    candidates.push(path);
+
+        for sym_path in state.symlink_entries {
+            if let Ok(canon) = sym_path.canonicalize() {
+                if visited_files.insert(canon.clone()) {
+                    state.regular_entries.push(ScannedEntry {
+                        path: sym_path,
+                        canonical: CanonicalSource::Symlink(Some(canon)),
+                    });
                 }
+            } else {
+                state.regular_entries.push(ScannedEntry {
+                    path: sym_path,
+                    canonical: CanonicalSource::Symlink(None),
+                });
             }
         }
     }
 
-    let mut images = filter_image_candidates(candidates, check_magic);
-    images.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-    let index = if let Some(ref target_name) = file_name {
-        images
-            .iter()
-            .position(|path| {
-                if let (Ok(c1), Ok(c2)) = (path.canonicalize(), initial_path.canonicalize()) {
-                    c1 == c2
-                } else {
-                    path.file_name().map(|n| n == target_name).unwrap_or(false)
-                }
-            })
-            .unwrap_or_else(|| {
-                if initial_path.exists() {
-                    images.push(initial_path.to_path_buf());
-                    images.len() - 1
-                } else {
-                    0
-                }
-            })
+    let mut entries = if check_magic {
+        filter_scanned_magic(state.regular_entries)
     } else {
-        0
+        state.regular_entries
+    };
+    entries.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
+
+    let found = if let Some(ref target_name) = file_name {
+        let target_canonical = initial_path.canonicalize().ok();
+        let target_canon_parent = target_canonical.as_deref().and_then(Path::parent);
+        let target_canon_name = target_canonical.as_deref().and_then(Path::file_name);
+
+        Some(entries.iter().position(|entry| {
+            if let Some(ref target_canon) = target_canonical {
+                match &entry.canonical {
+                    CanonicalSource::Dir(idx) => {
+                        target_canon_name == entry.path.file_name()
+                            && target_canon_parent == Some(state.canonical_dirs[*idx].as_path())
+                    }
+                    CanonicalSource::Symlink(Some(canon)) => canon == target_canon,
+                    CanonicalSource::Symlink(None) | CanonicalSource::Unknown => {
+                        if let Ok(c1) = entry.path.canonicalize() {
+                            c1 == *target_canon
+                        } else {
+                            entry
+                                .path
+                                .file_name()
+                                .map(|n| n == target_name)
+                                .unwrap_or(false)
+                        }
+                    }
+                }
+            } else {
+                entry
+                    .path
+                    .file_name()
+                    .map(|n| n == target_name)
+                    .unwrap_or(false)
+            }
+        }))
+    } else {
+        None
+    };
+
+    let mut images: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
+    let index = match found {
+        Some(Some(idx)) => idx,
+        Some(None) if initial_path.exists() => {
+            images.push(initial_path.to_path_buf());
+            images.len() - 1
+        }
+        Some(None) | None => 0,
     };
 
     Ok((images, index))
@@ -2234,5 +2425,234 @@ mod tests {
         let thumb_trans =
             decode_jpeg_thumbnail_bytes(&trans_png_bytes).expect("fallback transparent decode");
         assert!(matches!(thumb_trans, DynamicImage::ImageRgba8(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_directory_symlink_deduplication_both_orders() {
+        let test_dir = PathBuf::from("target/tmp/scan_symlink_dedup_test");
+        let external_dir = PathBuf::from("target/tmp/scan_symlink_dedup_ext");
+        let _ = fs::remove_dir_all(&test_dir);
+        let _ = fs::remove_dir_all(&external_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let png_hdr = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+        // Case 1: real.png + link_z.png -> real.png AND link_a.png -> real.png
+        let real = test_dir.join("real.png");
+        fs::write(&real, png_hdr).unwrap();
+        std::os::unix::fs::symlink(real.canonicalize().unwrap(), test_dir.join("link_a.png"))
+            .unwrap();
+        std::os::unix::fs::symlink(real.canonicalize().unwrap(), test_dir.join("link_z.png"))
+            .unwrap();
+
+        // Case 2: broken symlink should be ignored without failing
+        std::os::unix::fs::symlink(
+            test_dir.join("does_not_exist.png"),
+            test_dir.join("broken.png"),
+        )
+        .unwrap();
+
+        // Case 3: symlink without image extension pointing to real.png
+        std::os::unix::fs::symlink(real.canonicalize().unwrap(), test_dir.join("alias_no_ext"))
+            .unwrap();
+
+        // Case 4: two symlinks pointing to the same external image
+        let ext_img = external_dir.join("external.png");
+        fs::write(&ext_img, png_hdr).unwrap();
+        std::os::unix::fs::symlink(
+            ext_img.canonicalize().unwrap(),
+            test_dir.join("ext_link_1.png"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            ext_img.canonicalize().unwrap(),
+            test_dir.join("ext_link_2.png"),
+        )
+        .unwrap();
+
+        // Extension mode: should yield 2 unique images (real.png + one of ext_link_{1,2}.png)
+        let (ext_imgs, idx) = scan_directory(&test_dir, false, false).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(ext_imgs.len(), 2);
+
+        // Magic mode: should also yield 2 unique images (all symlinks to real.png deduplicated,
+        // including alias_no_ext, and ext_link_{1,2}.png deduplicated to 1)
+        let (magic_imgs, idx) = scan_directory(&test_dir, true, false).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(magic_imgs.len(), 2);
+
+        // Passing symlink to real.png as initial_path must resolve to real.png's index without duplicating
+        let link_target = test_dir.join("link_a.png");
+        let (imgs_via_link, link_idx) = scan_directory(&link_target, false, false).unwrap();
+        assert_eq!(imgs_via_link.len(), 2);
+        assert_eq!(
+            imgs_via_link[link_idx].canonicalize().unwrap(),
+            real.canonicalize().unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&test_dir);
+        let _ = fs::remove_dir_all(&external_dir);
+    }
+
+    #[test]
+    fn test_scan_directory_initial_path_positions_and_forms() {
+        let test_dir = PathBuf::from("target/tmp/scan_initial_path_test");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+
+        let png_hdr = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        for i in 0..10 {
+            let p = test_dir.join(format!("img_{:02}.png", i));
+            fs::write(&p, png_hdr).unwrap();
+        }
+        let non_img = test_dir.join("readme.txt");
+        fs::write(&non_img, b"just text").unwrap();
+
+        // Relative path to first file
+        let first_rel = test_dir.join("img_00.png");
+        let (imgs, idx) = scan_directory(&first_rel, false, false).unwrap();
+        assert_eq!(imgs.len(), 10);
+        assert_eq!(idx, 0);
+        assert_eq!(imgs[idx].file_name().unwrap(), "img_00.png");
+
+        // Relative path to last file
+        let last_rel = test_dir.join("img_09.png");
+        let (imgs, idx) = scan_directory(&last_rel, false, false).unwrap();
+        assert_eq!(imgs.len(), 10);
+        assert_eq!(idx, 9);
+        assert_eq!(imgs[idx].file_name().unwrap(), "img_09.png");
+
+        // Canonical (absolute) path to last file
+        let last_canon = last_rel.canonicalize().unwrap();
+        let (imgs, idx) = scan_directory(&last_canon, false, false).unwrap();
+        assert_eq!(imgs.len(), 10);
+        assert_eq!(idx, 9);
+        assert_eq!(imgs[idx].file_name().unwrap(), "img_09.png");
+
+        // Relative path with redundant `./` segment
+        let dot_rel = test_dir.join(".").join("img_05.png");
+        let (imgs, idx) = scan_directory(&dot_rel, false, false).unwrap();
+        assert_eq!(imgs.len(), 10);
+        assert_eq!(idx, 5);
+        assert_eq!(imgs[idx].file_name().unwrap(), "img_05.png");
+
+        // Non-image initial_path is appended at the end and selected
+        let (imgs, idx) = scan_directory(&non_img, false, false).unwrap();
+        assert_eq!(imgs.len(), 11);
+        assert_eq!(idx, 10);
+        assert_eq!(imgs[idx], non_img);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_directory_recursive_circular_and_cross_subdir_symlinks() {
+        let test_dir = PathBuf::from("target/tmp/scan_recursive_symlinks_test");
+        let _ = fs::remove_dir_all(&test_dir);
+        let sub_a = test_dir.join("sub_a");
+        let sub_b = test_dir.join("sub_b");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+
+        let png_hdr = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let root_img = test_dir.join("01_root.png");
+        let sub_a_img = sub_a.join("02_sub_a.png");
+        let sub_b_img = sub_b.join("03_sub_b.png");
+        fs::write(&root_img, png_hdr).unwrap();
+        fs::write(&sub_a_img, png_hdr).unwrap();
+        fs::write(&sub_b_img, png_hdr).unwrap();
+
+        // Circular directory symlinks: sub_a/loop_root -> test_dir, sub_b/loop_a -> sub_a
+        std::os::unix::fs::symlink(test_dir.canonicalize().unwrap(), sub_a.join("loop_root"))
+            .unwrap();
+        std::os::unix::fs::symlink(sub_a.canonicalize().unwrap(), sub_b.join("loop_a")).unwrap();
+
+        // Cross-subdir duplicate file symlinks
+        std::os::unix::fs::symlink(
+            sub_b_img.canonicalize().unwrap(),
+            test_dir.join("dup_from_sub_b.png"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root_img.canonicalize().unwrap(),
+            sub_b.join("dup_from_root.png"),
+        )
+        .unwrap();
+
+        let (imgs, idx) = scan_directory(&test_dir, false, true).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(imgs.len(), 3);
+        let names: Vec<_> = imgs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["01_root.png", "02_sub_a.png", "03_sub_b.png"]);
+
+        // Starting from symlink in root pointing to sub_b/03_sub_b.png resolves to index 2
+        let (imgs, idx) =
+            scan_directory(&test_dir.join("dup_from_sub_b.png"), false, true).unwrap();
+        assert_eq!(imgs.len(), 3);
+        assert_eq!(idx, 2);
+        assert_eq!(
+            imgs[idx].canonicalize().unwrap(),
+            sub_b_img.canonicalize().unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_scan_directory_mixed_images_and_non_images_ext_and_magic() {
+        let test_dir = PathBuf::from("target/tmp/scan_mixed_ext_magic_test");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+
+        let png_hdr = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+        // 50 real PNGs with .png extension
+        for i in 0..50 {
+            fs::write(test_dir.join(format!("real_{:03}.png", i)), png_hdr).unwrap();
+        }
+        // 30 plain text files with .txt extension (pushes total >= 64 to exercise parallel magic filter)
+        for i in 0..30 {
+            fs::write(test_dir.join(format!("note_{:03}.txt", i)), b"plain text").unwrap();
+        }
+        // 1 fake .png (text content with .png extension)
+        fs::write(test_dir.join("fake.png"), b"not really a png").unwrap();
+        // 1 real PNG with .dat extension (only detected in --magic mode)
+        fs::write(test_dir.join("hidden.dat"), png_hdr).unwrap();
+
+        // Extension mode: 50 real .png + 1 fake.png = 51
+        let (ext_imgs, _) = scan_directory(&test_dir, false, false).unwrap();
+        assert_eq!(ext_imgs.len(), 51);
+        assert!(
+            ext_imgs
+                .iter()
+                .any(|p| p.file_name().unwrap() == "fake.png")
+        );
+        assert!(
+            !ext_imgs
+                .iter()
+                .any(|p| p.file_name().unwrap() == "hidden.dat")
+        );
+
+        // Magic mode: 50 real .png + 1 hidden.dat = 51 (fake.png rejected, note_*.txt rejected)
+        let (magic_imgs, _) = scan_directory(&test_dir, true, false).unwrap();
+        assert_eq!(magic_imgs.len(), 51);
+        assert!(
+            !magic_imgs
+                .iter()
+                .any(|p| p.file_name().unwrap() == "fake.png")
+        );
+        assert!(
+            magic_imgs
+                .iter()
+                .any(|p| p.file_name().unwrap() == "hidden.dat")
+        );
+
+        let _ = fs::remove_dir_all(&test_dir);
     }
 }
