@@ -14,6 +14,7 @@ use super::decoder::{
     CancellationToken, decode_image_bytes_with_header_cancellable,
     decode_thumbnail_and_dimensions_for_mode,
 };
+use super::halfblocks::HalfblocksProtocol;
 use super::iterm2::Iterm2Protocol;
 use super::kitty_direct::KittyDirectProtocol;
 use super::kitty_shm::KittyShmProtocol;
@@ -1150,6 +1151,19 @@ pub fn process_resize(
                 ViewportProtocol::Standard(p)
             }
         }
+    } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks {
+        match HalfblocksProtocol::new(&canvas, target_size, resizer) {
+            Ok(hb_proto) => ViewportProtocol::Halfblocks(hb_proto),
+            Err(_) => {
+                let mut p = req.picker.new_resize_protocol(canvas);
+                ratatui_image::ResizeEncodeRender::resize_encode(
+                    &mut p,
+                    &ratatui_image::Resize::Crop(None),
+                    target_size,
+                );
+                ViewportProtocol::Standard(p)
+            }
+        }
     } else {
         let mut p = req.picker.new_resize_protocol(canvas);
         ratatui_image::ResizeEncodeRender::resize_encode(
@@ -1579,8 +1593,30 @@ mod tests {
         let mut resizer = fir::Resizer::new();
         let src = Arc::new(make_test_image(80, 80));
 
-        // 1. Non-kitty picker with use_kitty_shm = true falls back to ViewportProtocol::Standard
+        // 1. Halfblocks picker with use_kitty_shm = true produces ViewportProtocol::Halfblocks
         let picker_halfblocks = Picker::halfblocks();
+        let req_halfblocks = ResizeRequest {
+            img: Arc::clone(&src),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_halfblocks.clone(),
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 1,
+            use_kitty_shm: true,
+            use_kitty_compression: false,
+            use_iterm2_jpeg: false,
+        };
+        let (proto_halfblocks, _, _) = process_resize(req_halfblocks, &mut resizer);
+        assert!(matches!(proto_halfblocks, ViewportProtocol::Halfblocks(_)));
+
+        // 1b. Zero rendered_size_cells triggers HalfblocksProtocol::new error and falls back to Standard
         let req_fallback = ResizeRequest {
             img: Arc::clone(&src),
             original_size: (80, 80),
@@ -1593,9 +1629,9 @@ mod tests {
             picker: picker_halfblocks,
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
-            rendered_size_cells: (10, 10),
-            sequence: 1,
-            use_kitty_shm: true,
+            rendered_size_cells: (0, 10),
+            sequence: 10,
+            use_kitty_shm: false,
             use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };

@@ -23,6 +23,8 @@ pub mod kitty_direct;
 pub mod protocol;
 pub use protocol::*;
 
+pub mod halfblocks;
+
 pub mod iterm2;
 
 pub mod sixel;
