@@ -2,7 +2,7 @@
 //!
 //! Replaces `ratatui-image`'s default PNG encoder (`CompressionType::Default` + `Adaptive`)
 //! with `PNG Fast + Paeth` (lossless) and optional `JPEG q90` (opaque compressed mode for SSH),
-//! paired with a safe parallel `rayon` Base64 encoder.
+//! paired with a safe parallel `rayon` + SIMD (`base64-simd`) Base64 encoder.
 
 use std::borrow::Cow;
 use std::num::NonZeroU16;
@@ -24,9 +24,6 @@ const PARALLEL_B64_CHUNK_TRIPLETS: usize = 16_384;
 
 /// JPEG quality factor used for opaque images when compressed transfer mode is active.
 const ITERM2_JPEG_QUALITY: u8 = 90;
-
-/// Standard RFC 4648 Base64 encoding alphabet.
-const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Fast iTerm2 inline image protocol (`OSC 1337`) state ready for direct `ratatui` buffer rendering.
 pub struct Iterm2Protocol {
@@ -242,25 +239,8 @@ fn write_clear_area(out: &mut Vec<u8>, escape: &str, width: u16, height: u16) {
     }
 }
 
-/// Encodes complete 3-byte input triplets into 4-byte Base64 ASCII output quads.
-#[inline]
-fn encode_base64_triplets(src: &[u8], dst: &mut [u8]) {
-    for (s, d) in src
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-    {
-        let v = (u32::from(s[0]) << 16) | (u32::from(s[1]) << 8) | u32::from(s[2]);
-        d[0] = BASE64_TABLE[((v >> 18) & 0x3F) as usize];
-        d[1] = BASE64_TABLE[((v >> 12) & 0x3F) as usize];
-        d[2] = BASE64_TABLE[((v >> 6) & 0x3F) as usize];
-        d[3] = BASE64_TABLE[(v & 0x3F) as usize];
-    }
-}
-
 /// Appends RFC 4648 standard Base64 encoding of `input` directly into `out`,
-/// parallelizing across `rayon` workers when `input.len() >= PARALLEL_B64_THRESHOLD`.
+/// parallelizing SIMD encoding across `rayon` workers when `input.len() >= PARALLEL_B64_THRESHOLD`.
 fn encode_base64_into(input: &[u8], out: &mut Vec<u8>) {
     encode_base64_into_with_threshold(input, out, PARALLEL_B64_THRESHOLD);
 }
@@ -276,37 +256,26 @@ fn encode_base64_into_with_threshold(input: &[u8], out: &mut Vec<u8>, parallel_t
     out.resize(start_len + b64_len, 0);
     let dst = &mut out[start_len..];
 
-    let full_triplets = input.len() / 3;
-    let full_in = &input[..full_triplets * 3];
-    let full_out = &mut dst[..full_triplets * 4];
-
     if input.len() >= parallel_threshold {
+        let full_triplets = input.len() / 3;
+        let full_in = &input[..full_triplets * 3];
+        let full_out = &mut dst[..full_triplets * 4];
+
         full_in
             .par_chunks(PARALLEL_B64_CHUNK_TRIPLETS * 3)
             .zip(full_out.par_chunks_mut(PARALLEL_B64_CHUNK_TRIPLETS * 4))
-            .for_each(|(src_chunk, dst_chunk)| encode_base64_triplets(src_chunk, dst_chunk));
-    } else {
-        encode_base64_triplets(full_in, full_out);
-    }
+            .for_each(|(src_slab, dst_slab)| {
+                let _ =
+                    base64_simd::STANDARD.encode(src_slab, base64_simd::Out::from_slice(dst_slab));
+            });
 
-    let rem = &input[full_triplets * 3..];
-    let rem_out = &mut dst[full_triplets * 4..];
-    match rem {
-        [b0] => {
-            let v = u32::from(*b0);
-            rem_out[0] = BASE64_TABLE[(v >> 2) as usize];
-            rem_out[1] = BASE64_TABLE[((v & 0x03) << 4) as usize];
-            rem_out[2] = b'=';
-            rem_out[3] = b'=';
+        let rem = &input[full_triplets * 3..];
+        if !rem.is_empty() {
+            let rem_dst = &mut dst[full_triplets * 4..];
+            let _ = base64_simd::STANDARD.encode(rem, base64_simd::Out::from_slice(rem_dst));
         }
-        [b0, b1] => {
-            let v = (u32::from(*b0) << 8) | u32::from(*b1);
-            rem_out[0] = BASE64_TABLE[((v >> 10) & 0x3F) as usize];
-            rem_out[1] = BASE64_TABLE[((v >> 4) & 0x3F) as usize];
-            rem_out[2] = BASE64_TABLE[((v & 0x0F) << 2) as usize];
-            rem_out[3] = b'=';
-        }
-        _ => {}
+    } else {
+        let _ = base64_simd::STANDARD.encode(input, base64_simd::Out::from_slice(dst));
     }
 }
 

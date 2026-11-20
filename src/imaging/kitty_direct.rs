@@ -4,7 +4,7 @@
 //! - Automatic `f=24` (RGB8) selection for opaque images (25% smaller payload and Base64)
 //!   and `f=32` (RGBA8) for images with transparency.
 //! - Optional fast zlib compression (`o=z`) for remote SSH sessions.
-//! - Zero-intermediate-allocation parallel `rayon` 4096-character Base64 chunk formatting.
+//! - Zero-intermediate-allocation parallel `rayon` + SIMD (`base64-simd`) 4096-character Base64 chunk formatting.
 //! - Shared Kitty Unicode placeholder (`U+10EEEE`) rendering via [`super::kitty_shm::render_kitty_placeholders`].
 
 use std::borrow::Cow;
@@ -29,9 +29,6 @@ const FULL_CHUNK_B64_LEN: usize = (CHUNK_SIZE / 3) * 4;
 
 /// Minimum chunk count before Base64 chunk formatting uses `rayon` parallelism.
 const PARALLEL_CHUNK_THRESHOLD: usize = 16;
-
-/// Standard RFC 4648 Base64 encoding alphabet.
-const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Parallel `rayon`-accelerated inline Kitty graphics protocol (`t=d` / `o=z,t=d`) state.
 pub struct KittyDirectProtocol {
@@ -151,35 +148,15 @@ impl KittyDirectProtocol {
     }
 }
 
-/// Encodes `src` into RFC 4648 standard Base64 directly into `dst`.
+/// Encodes `src` into RFC 4648 standard Base64 directly into `dst` using runtime-dispatched SIMD.
 ///
 /// Caller must ensure `dst.len() == src.len().div_ceil(3) * 4`.
 #[inline]
 fn encode_base64_slice(src: &[u8], dst: &mut [u8]) {
-    let (triplets, rem) = src.as_chunks::<3>();
-    let (quads, _) = dst.as_chunks_mut::<4>();
-
-    for (s, d) in triplets.iter().zip(quads.iter_mut()) {
-        let v = (u32::from(s[0]) << 16) | (u32::from(s[1]) << 8) | u32::from(s[2]);
-        d[0] = BASE64_TABLE[((v >> 18) & 0x3F) as usize];
-        d[1] = BASE64_TABLE[((v >> 12) & 0x3F) as usize];
-        d[2] = BASE64_TABLE[((v >> 6) & 0x3F) as usize];
-        d[3] = BASE64_TABLE[(v & 0x3F) as usize];
+    if src.is_empty() {
+        return;
     }
-
-    if !rem.is_empty() {
-        let d = &mut quads[triplets.len()];
-        let b0 = rem[0];
-        let b1 = rem.get(1).copied().unwrap_or(0);
-        d[0] = BASE64_TABLE[(b0 >> 2) as usize];
-        d[1] = BASE64_TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
-        if rem.len() > 1 {
-            d[2] = BASE64_TABLE[((b1 & 0x0F) << 2) as usize];
-        } else {
-            d[2] = b'=';
-        }
-        d[3] = b'=';
-    }
+    let _ = base64_simd::STANDARD.encode(src, base64_simd::Out::from_slice(dst));
 }
 
 /// Writes a single formatted Kitty direct chunk (`header + base64(src) + trailer`) into `dst`.
