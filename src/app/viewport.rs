@@ -4,10 +4,9 @@ use crate::app::palette::PaletteMode;
 use crate::app::{App, LoadPhase};
 use crate::imaging::{
     Brightness, CellDimensions, Contrast, CropBox, ImageIntersection, PanOffset, PixelDimensions,
-    ResizeRequest, Rotation, ScaleMode, ZoomFactor, rotate90_fast, rotate270_fast,
+    ProtocolType, ResizeRequest, Rotation, ScaleMode, ZoomFactor, rotate90_fast, rotate270_fast,
 };
 use crate::ui::ThumbnailState;
-use ratatui_image::picker::ProtocolType;
 use std::sync::Arc;
 
 impl App {

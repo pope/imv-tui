@@ -46,13 +46,13 @@ impl KittyDirectProtocol {
     /// Creates a new `KittyDirectProtocol` from a canvas image and target terminal cell dimensions.
     ///
     /// If `canvas` dimensions already match `size * font_size`, avoids any intermediate resize;
-    /// otherwise crops/pads via `ratatui_image::Resize::Crop(None)`.
+    /// otherwise crops/pads via [`super::protocol::normalize_canvas_to_cells`].
     ///
     /// Uses `f=24` (RGB8) for opaque images and `f=32` (RGBA8) for transparent images.
     /// When `compress` is `true`, compresses pixel bytes with fast zlib (`o=z`) before Base64 chunking.
     pub fn new(
         canvas: &DynamicImage,
-        font_size: ratatui_image::FontSize,
+        font_size: super::picker::FontSize,
         size: Size,
         is_tmux: bool,
         compress: bool,
@@ -60,16 +60,9 @@ impl KittyDirectProtocol {
         if size.width == 0 || size.height == 0 {
             return Err("Target size has zero width or height".to_string());
         }
-        let target_px_w = u32::from(size.width) * u32::from(font_size.width);
-        let target_px_h = u32::from(size.height) * u32::from(font_size.height);
 
-        let normalized;
-        let source = if canvas.width() == target_px_w && canvas.height() == target_px_h {
-            canvas
-        } else {
-            normalized = ratatui_image::Resize::Crop(None).resize(canvas, font_size, size, None);
-            &normalized
-        };
+        let source = super::protocol::normalize_canvas_to_cells(canvas, font_size, size);
+        let source = source.as_ref();
 
         let width = source.width();
         let height = source.height();
@@ -214,8 +207,7 @@ fn format_kitty_direct_chunks(
     compress: bool,
     parallel_threshold: usize,
 ) -> String {
-    let (start, escape, end) =
-        ratatui_image::picker::cap_parser::Parser::tmux_start_escape_end(is_tmux);
+    let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
     let compression = if compress { "o=z," } else { "" };
     let trailer = format!("{escape}\\{end}");
     let trailer_bytes = trailer.as_bytes();
@@ -294,10 +286,10 @@ fn format_kitty_direct_chunks(
 
 #[cfg(test)]
 mod tests {
+    use super::super::picker::{FontSize, tmux_start_escape_end};
     use super::*;
     use flate2::read::ZlibDecoder;
     use image::{GrayImage, RgbImage, RgbaImage};
-    use ratatui_image::FontSize;
     use std::io::Read;
 
     /// Decodes standard RFC 4648 Base64 ASCII into raw bytes for test verification.
@@ -334,8 +326,7 @@ mod tests {
     /// Parses Kitty APC chunks from `transmit_str` (for `is_tmux = false` or `true`),
     /// returning `(header_params, b64_payload)` pairs.
     fn parse_kitty_chunks(transmit_str: &str, is_tmux: bool) -> Vec<(String, String)> {
-        let (start, escape, end) =
-            ratatui_image::picker::cap_parser::Parser::tmux_start_escape_end(is_tmux);
+        let (start, escape, end) = tmux_start_escape_end(is_tmux);
         let prefix = format!("{start}{escape}_G");
         let suffix = format!("{escape}\\{end}");
         let mut rest = transmit_str;

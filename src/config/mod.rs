@@ -264,7 +264,7 @@ impl ProtocolConfig {
     /// Parses protocol configuration from CLI arguments, validating that protocol-specific options
     /// like `--compress` (Kitty/iTerm2/Sixel) and `--no-kitty-shm` (Kitty only) match the selected protocol.
     pub fn from_cli(
-        protocol: Option<ratatui_image::picker::ProtocolType>,
+        protocol: Option<crate::imaging::ProtocolType>,
         explicit_compress: Option<CompressionPolicy>,
         disable_kitty_shm: bool,
     ) -> Result<Self, String> {
@@ -272,9 +272,9 @@ impl ProtocolConfig {
             && protocol.is_some_and(|p| {
                 !matches!(
                     p,
-                    ratatui_image::picker::ProtocolType::Kitty
-                        | ratatui_image::picker::ProtocolType::Iterm2
-                        | ratatui_image::picker::ProtocolType::Sixel
+                    crate::imaging::ProtocolType::Kitty
+                        | crate::imaging::ProtocolType::Iterm2
+                        | crate::imaging::ProtocolType::Sixel
                 )
             })
         {
@@ -283,9 +283,7 @@ impl ProtocolConfig {
                     .to_string(),
             );
         }
-        if disable_kitty_shm
-            && protocol.is_some_and(|p| p != ratatui_image::picker::ProtocolType::Kitty)
-        {
+        if disable_kitty_shm && protocol.is_some_and(|p| p != crate::imaging::ProtocolType::Kitty) {
             return Err(
                 "Error: Option --no-kitty-shm can only be used with the kitty protocol".to_string(),
             );
@@ -295,17 +293,17 @@ impl ProtocolConfig {
                 explicit_compress,
                 disable_kitty_shm,
             }),
-            Some(ratatui_image::picker::ProtocolType::Kitty) => Ok(Self::Kitty {
+            Some(crate::imaging::ProtocolType::Kitty) => Ok(Self::Kitty {
                 compression: explicit_compress.unwrap_or(CompressionPolicy::Auto),
                 disable_kitty_shm,
             }),
-            Some(ratatui_image::picker::ProtocolType::Iterm2) => Ok(Self::Iterm2 {
+            Some(crate::imaging::ProtocolType::Iterm2) => Ok(Self::Iterm2 {
                 compression: explicit_compress.unwrap_or(CompressionPolicy::Auto),
             }),
-            Some(ratatui_image::picker::ProtocolType::Sixel) => Ok(Self::Sixel {
+            Some(crate::imaging::ProtocolType::Sixel) => Ok(Self::Sixel {
                 compression: explicit_compress.unwrap_or(CompressionPolicy::Auto),
             }),
-            Some(ratatui_image::picker::ProtocolType::Halfblocks) => Ok(Self::Halfblocks),
+            Some(crate::imaging::ProtocolType::Halfblocks) => Ok(Self::Halfblocks),
         }
     }
 
@@ -321,6 +319,35 @@ impl ProtocolConfig {
                 .unwrap_or(CompressionPolicy::Auto)
                 .should_compress(),
             Self::Halfblocks => false,
+        }
+    }
+
+    /// Evaluates whether payload compression should be enabled for `effective_protocol`,
+    /// taking into account whether the terminal confirmed Kitty `o=z` zlib support.
+    ///
+    /// For Kitty under [`CompressionPolicy::Auto`] (whether `--protocol kitty` was forced or
+    /// auto-detected), compression is gated on `supports_kitty_compression` so terminals that
+    /// reject `o=z` are not sent compressed payloads. Explicit [`CompressionPolicy::Always`]
+    /// always honors `true`, and [`CompressionPolicy::Never`] always returns `false`.
+    pub fn effective_compression(
+        self,
+        effective_protocol: crate::imaging::ProtocolType,
+        supports_kitty_compression: bool,
+    ) -> bool {
+        let compression_enabled = self.should_enable_compression();
+        let is_auto = match self {
+            Self::Kitty { compression, .. }
+            | Self::Iterm2 { compression }
+            | Self::Sixel { compression } => compression == CompressionPolicy::Auto,
+            Self::Auto {
+                explicit_compress, ..
+            } => explicit_compress.unwrap_or(CompressionPolicy::Auto) == CompressionPolicy::Auto,
+            Self::Halfblocks => false,
+        };
+        if effective_protocol == crate::imaging::ProtocolType::Kitty && is_auto {
+            compression_enabled && supports_kitty_compression
+        } else {
+            compression_enabled
         }
     }
 
@@ -352,20 +379,20 @@ impl ProtocolConfig {
     }
 
     /// Returns the forced `ProtocolType` if explicitly configured on the CLI.
-    pub fn forced_protocol_type(self) -> Option<ratatui_image::picker::ProtocolType> {
+    pub fn forced_protocol_type(self) -> Option<crate::imaging::ProtocolType> {
         match self {
             Self::Auto { .. } => None,
-            Self::Kitty { .. } => Some(ratatui_image::picker::ProtocolType::Kitty),
-            Self::Sixel { .. } => Some(ratatui_image::picker::ProtocolType::Sixel),
-            Self::Iterm2 { .. } => Some(ratatui_image::picker::ProtocolType::Iterm2),
-            Self::Halfblocks => Some(ratatui_image::picker::ProtocolType::Halfblocks),
+            Self::Kitty { .. } => Some(crate::imaging::ProtocolType::Kitty),
+            Self::Sixel { .. } => Some(crate::imaging::ProtocolType::Sixel),
+            Self::Iterm2 { .. } => Some(crate::imaging::ProtocolType::Iterm2),
+            Self::Halfblocks => Some(crate::imaging::ProtocolType::Halfblocks),
         }
     }
 
     /// Resolves the final `ActiveProtocol` based on the detected terminal protocol and compression state.
     pub fn resolve_active_protocol(
         self,
-        detected: ratatui_image::picker::ProtocolType,
+        detected: crate::imaging::ProtocolType,
         compressed: bool,
     ) -> Result<ActiveProtocol, String> {
         match self {
@@ -376,9 +403,9 @@ impl ProtocolConfig {
                 if explicit_compress.is_some()
                     && !matches!(
                         detected,
-                        ratatui_image::picker::ProtocolType::Kitty
-                            | ratatui_image::picker::ProtocolType::Iterm2
-                            | ratatui_image::picker::ProtocolType::Sixel
+                        crate::imaging::ProtocolType::Kitty
+                            | crate::imaging::ProtocolType::Iterm2
+                            | crate::imaging::ProtocolType::Sixel
                     )
                 {
                     return Err(format!(
@@ -386,14 +413,14 @@ impl ProtocolConfig {
                         detected
                     ));
                 }
-                if disable_kitty_shm && detected != ratatui_image::picker::ProtocolType::Kitty {
+                if disable_kitty_shm && detected != crate::imaging::ProtocolType::Kitty {
                     return Err(format!(
                         "Error: Option --no-kitty-shm was specified, but detected terminal protocol is {:?} (not Kitty)",
                         detected
                     ));
                 }
                 match detected {
-                    ratatui_image::picker::ProtocolType::Kitty => {
+                    crate::imaging::ProtocolType::Kitty => {
                         let mode = if compressed {
                             KittyTransferMode::Compressed
                         } else {
@@ -401,7 +428,7 @@ impl ProtocolConfig {
                         };
                         Ok(ActiveProtocol::Kitty(mode))
                     }
-                    ratatui_image::picker::ProtocolType::Iterm2 => {
+                    crate::imaging::ProtocolType::Iterm2 => {
                         let mode = if compressed {
                             Iterm2TransferMode::Jpeg
                         } else {
@@ -409,7 +436,7 @@ impl ProtocolConfig {
                         };
                         Ok(ActiveProtocol::Iterm2(mode))
                     }
-                    ratatui_image::picker::ProtocolType::Sixel => {
+                    crate::imaging::ProtocolType::Sixel => {
                         let mode = if compressed {
                             SixelTransferMode::Compressed
                         } else {
@@ -417,9 +444,7 @@ impl ProtocolConfig {
                         };
                         Ok(ActiveProtocol::Sixel(mode))
                     }
-                    ratatui_image::picker::ProtocolType::Halfblocks => {
-                        Ok(ActiveProtocol::Halfblocks)
-                    }
+                    crate::imaging::ProtocolType::Halfblocks => Ok(ActiveProtocol::Halfblocks),
                 }
             }
             Self::Kitty { .. } => {
@@ -448,5 +473,61 @@ impl ProtocolConfig {
             }
             Self::Halfblocks => Ok(ActiveProtocol::Halfblocks),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imaging::ProtocolType;
+
+    #[test]
+    fn test_effective_compression_kitty_policy_gating() {
+        // Explicit Always honors true regardless of Kitty probe result.
+        let forced_always = ProtocolConfig::Kitty {
+            compression: CompressionPolicy::Always,
+            disable_kitty_shm: false,
+        };
+        assert!(forced_always.effective_compression(ProtocolType::Kitty, false));
+        assert!(forced_always.effective_compression(ProtocolType::Kitty, true));
+
+        let auto_always = ProtocolConfig::Auto {
+            explicit_compress: Some(CompressionPolicy::Always),
+            disable_kitty_shm: false,
+        };
+        assert!(auto_always.effective_compression(ProtocolType::Kitty, false));
+        assert!(auto_always.effective_compression(ProtocolType::Kitty, true));
+
+        // Explicit Never honors false regardless of Kitty probe result.
+        let forced_never = ProtocolConfig::Kitty {
+            compression: CompressionPolicy::Never,
+            disable_kitty_shm: false,
+        };
+        assert!(!forced_never.effective_compression(ProtocolType::Kitty, true));
+        assert!(!forced_never.effective_compression(ProtocolType::Kitty, false));
+
+        // Auto policy gates Kitty on supports_kitty_compression (both forced and auto protocol).
+        let forced_auto = ProtocolConfig::Kitty {
+            compression: CompressionPolicy::Auto,
+            disable_kitty_shm: false,
+        };
+        assert!(!forced_auto.effective_compression(ProtocolType::Kitty, false));
+        assert_eq!(
+            forced_auto.effective_compression(ProtocolType::Kitty, true),
+            CompressionPolicy::Auto.should_compress()
+        );
+
+        let auto_proto_auto = ProtocolConfig::Auto {
+            explicit_compress: None,
+            disable_kitty_shm: false,
+        };
+        assert!(!auto_proto_auto.effective_compression(ProtocolType::Kitty, false));
+        assert_eq!(
+            auto_proto_auto.effective_compression(ProtocolType::Kitty, true),
+            CompressionPolicy::Auto.should_compress()
+        );
+
+        // Halfblocks always disables compression.
+        assert!(!ProtocolConfig::Halfblocks.effective_compression(ProtocolType::Halfblocks, true));
     }
 }

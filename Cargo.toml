@@ -7,7 +7,6 @@ edition = "2024"
 crossterm = "0.29.0"
 image = "0.25.10"
 ratatui = "0.30.2"
-ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 libc = "0.2"
 fast_image_resize = { version = "6.1.0", features = ["image", "rayon"] }
 rayon = "1.12.0"

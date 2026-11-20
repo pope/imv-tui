@@ -22,7 +22,6 @@ pub use palette::{PaletteMode, PromptType};
 pub use queue::ImageQueue;
 
 use image::DynamicImage;
-use ratatui_image::picker::Picker;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -32,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::commands::{Command, get_commands};
 use crate::imaging::{
     Brightness, Contrast, FilterType, ImageSource, LoaderRequest, LoaderResponse, PanOffset,
-    ResizeRequest, ScaleMode, ViewportProtocol, ZoomFactor,
+    Picker, ResizeRequest, ScaleMode, ViewportProtocol, ZoomFactor,
 };
 
 /// Threshold below which navigation is considered fast scrolling (60ms).

@@ -1,19 +1,52 @@
 //! Unified viewport graphics protocol abstraction.
 //!
-//! Dispatches rendering across standard `ratatui-image` stateful protocols,
-//! zero-copy POSIX shared memory Kitty (`t=s`), parallel `rayon` inline Kitty (`t=d` / `o=z,t=d`),
-//! parallel `rayon` Sixel, fast PNG/JPEG iTerm2 (`OSC 1337`), and SIMD Unicode halfblocks.
+//! Dispatches rendering across zero-copy POSIX shared memory Kitty (`t=s`),
+//! parallel `rayon` inline Kitty (`t=d` / `o=z,t=d`), parallel `rayon` Sixel,
+//! fast PNG/JPEG iTerm2 (`OSC 1337`), and SIMD Unicode halfblocks.
 
+use std::borrow::Cow;
+
+use image::{DynamicImage, RgbaImage, imageops};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
-use ratatui_image::ResizeEncodeRender;
-use ratatui_image::protocol::StatefulProtocol;
 
 use super::halfblocks::HalfblocksProtocol;
 use super::iterm2::Iterm2Protocol;
 use super::kitty_direct::KittyDirectProtocol;
 use super::kitty_shm::KittyShmProtocol;
+use super::picker::FontSize;
 use super::sixel::SixelProtocol;
+
+/// Normalizes a rendered pixel canvas to the exact pixel dimensions of `size * font_size`.
+///
+/// - If `canvas` already matches `target_px_w x target_px_h`, returns `Cow::Borrowed(canvas)`
+///   with zero allocation or copy.
+/// - If `canvas` is at least as large on both axes, crops the top-left `target_px_w x target_px_h`
+///   region without re-encoding or changing color format.
+/// - If `canvas` is smaller on either axis, crops top-left to `min(w, target_px_w) x min(h, target_px_h)`
+///   and pads onto a transparent `target_px_w x target_px_h` RGBA8 canvas so terminal cell-grid
+///   protocols (such as Kitty Unicode placeholders) never distort aspect ratio.
+pub fn normalize_canvas_to_cells<'a>(
+    canvas: &'a DynamicImage,
+    font_size: FontSize,
+    size: Size,
+) -> Cow<'a, DynamicImage> {
+    let target_px_w = u32::from(size.width) * u32::from(font_size.width);
+    let target_px_h = u32::from(size.height) * u32::from(font_size.height);
+
+    if canvas.width() == target_px_w && canvas.height() == target_px_h {
+        return Cow::Borrowed(canvas);
+    }
+
+    let cropped = canvas.crop_imm(0, 0, target_px_w, target_px_h);
+    if cropped.width() == target_px_w && cropped.height() == target_px_h {
+        return Cow::Owned(cropped);
+    }
+
+    let mut padded = RgbaImage::new(target_px_w, target_px_h);
+    imageops::replace(&mut padded, &cropped, 0, 0);
+    Cow::Owned(DynamicImage::ImageRgba8(padded))
+}
 
 /// Transmission mode for the Kitty graphics protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,33 +97,30 @@ pub enum ActiveProtocol {
 impl ActiveProtocol {
     #[cfg(test)]
     /// Constructs an `ActiveProtocol` from a `ProtocolType` and a compression state.
-    pub fn from_protocol_type(
-        proto: ratatui_image::picker::ProtocolType,
-        compressed: bool,
-    ) -> Self {
+    pub fn from_protocol_type(proto: super::picker::ProtocolType, compressed: bool) -> Self {
         match proto {
-            ratatui_image::picker::ProtocolType::Kitty => {
+            super::picker::ProtocolType::Kitty => {
                 if compressed {
                     Self::Kitty(KittyTransferMode::Compressed)
                 } else {
                     Self::Kitty(KittyTransferMode::Direct)
                 }
             }
-            ratatui_image::picker::ProtocolType::Sixel => {
+            super::picker::ProtocolType::Sixel => {
                 if compressed {
                     Self::Sixel(SixelTransferMode::Compressed)
                 } else {
                     Self::Sixel(SixelTransferMode::Full)
                 }
             }
-            ratatui_image::picker::ProtocolType::Iterm2 => {
+            super::picker::ProtocolType::Iterm2 => {
                 if compressed {
                     Self::Iterm2(Iterm2TransferMode::Jpeg)
                 } else {
                     Self::Iterm2(Iterm2TransferMode::Png)
                 }
             }
-            ratatui_image::picker::ProtocolType::Halfblocks => Self::Halfblocks,
+            super::picker::ProtocolType::Halfblocks => Self::Halfblocks,
         }
     }
 
@@ -125,13 +155,12 @@ impl ActiveProtocol {
     }
 }
 
-/// Unified viewport image protocol supporting standard `ratatui-image` protocols,
-/// the zero-copy POSIX shared memory (`t=s`) Kitty protocol, the parallel inline (`t=d` / `o=z,t=d`)
-/// Kitty protocol, the parallel Sixel protocol, the fast PNG/JPEG iTerm2 (`OSC 1337`) protocol,
-/// and the SIMD Unicode halfblocks protocol.
+/// Unified viewport image protocol supporting zero-copy POSIX shared memory (`t=s`) Kitty,
+/// parallel inline (`t=d` / `o=z,t=d`) Kitty, parallel Sixel, fast PNG/JPEG iTerm2 (`OSC 1337`),
+/// SIMD Unicode halfblocks, and a no-op empty fallback for zero-size or failed encodes.
 pub enum ViewportProtocol {
-    /// Standard `ratatui-image` stateful fallback protocol.
-    Standard(StatefulProtocol),
+    /// No-op fallback used when target dimensions are zero or protocol encoding fails.
+    Empty,
     /// Zero-copy POSIX shared memory Kitty protocol (`t=s`).
     KittyShm(KittyShmProtocol),
     /// Parallel `rayon`-accelerated inline Kitty protocol (`t=d` / `o=z,t=d`).
@@ -144,21 +173,11 @@ pub enum ViewportProtocol {
     Halfblocks(HalfblocksProtocol),
 }
 
-impl ResizeEncodeRender for ViewportProtocol {
-    fn resize_encode(&mut self, resize: &ratatui_image::Resize, size: Size) {
+impl ViewportProtocol {
+    /// Renders the encoded viewport image into `buf` within `area`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
         match self {
-            Self::Standard(proto) => proto.resize_encode(resize, size),
-            Self::KittyShm(_)
-            | Self::KittyDirect(_)
-            | Self::Sixel(_)
-            | Self::Iterm2(_)
-            | Self::Halfblocks(_) => {}
-        }
-    }
-
-    fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        match self {
-            Self::Standard(proto) => proto.render(area, buf),
+            Self::Empty => {}
             Self::KittyShm(proto) => proto.render(area, buf),
             Self::KittyDirect(proto) => proto.render(area, buf),
             Self::Sixel(proto) => proto.render(area, buf),
@@ -166,15 +185,90 @@ impl ResizeEncodeRender for ViewportProtocol {
             Self::Halfblocks(proto) => proto.render(area, buf),
         }
     }
+}
 
-    fn needs_resize(&self, resize: &ratatui_image::Resize, size: Size) -> Option<Size> {
-        match self {
-            Self::Standard(proto) => proto.needs_resize(resize, size),
-            Self::KittyShm(_)
-            | Self::KittyDirect(_)
-            | Self::Sixel(_)
-            | Self::Iterm2(_)
-            | Self::Halfblocks(_) => None,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage, Rgba};
+
+    #[test]
+    fn test_normalize_canvas_exact_borrows() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 32, Rgb([10, 20, 30])));
+        let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(2, 2));
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!((out.width(), out.height()), (16, 32));
+    }
+
+    #[test]
+    fn test_normalize_canvas_larger_crops_top_left() {
+        let mut rgb = RgbImage::from_pixel(20, 40, Rgb([1, 2, 3]));
+        rgb.put_pixel(0, 0, Rgb([200, 100, 50]));
+        rgb.put_pixel(15, 31, Rgb([40, 50, 60]));
+        let img = DynamicImage::ImageRgb8(rgb);
+
+        let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(2, 2));
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!((out.width(), out.height()), (16, 32));
+        let cropped = out.as_rgb8().expect("crop preserves RGB8 format");
+        assert_eq!(*cropped.get_pixel(0, 0), Rgb([200, 100, 50]));
+        assert_eq!(*cropped.get_pixel(15, 31), Rgb([40, 50, 60]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_smaller_pads_transparent() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 12, Rgb([12, 34, 56])));
+        let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(2, 2));
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!((out.width(), out.height()), (16, 32));
+        let rgba = out.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!(*rgba.get_pixel(0, 0), Rgba([12, 34, 56, 255]));
+        assert_eq!(*rgba.get_pixel(9, 11), Rgba([12, 34, 56, 255]));
+        assert_eq!(*rgba.get_pixel(10, 11), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_mixed_crop_and_pad() {
+        // Wider than target (20 > 16) and shorter than target (10 < 32).
+        let mut rgb = RgbImage::from_pixel(20, 10, Rgb([5, 10, 15]));
+        rgb.put_pixel(15, 9, Rgb([200, 150, 100]));
+        rgb.put_pixel(19, 9, Rgb([255, 0, 0])); // Outside target width; must be cropped away.
+        let img = DynamicImage::ImageRgb8(rgb);
+
+        let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(2, 2));
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!((out.width(), out.height()), (16, 32));
+        let rgba = out.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!(*rgba.get_pixel(0, 0), Rgba([5, 10, 15, 255]));
+        assert_eq!(*rgba.get_pixel(15, 9), Rgba([200, 150, 100, 255]));
+        assert_eq!(*rgba.get_pixel(0, 10), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_preserves_semitransparent_pixels_exactly() {
+        let mut rgba_in = RgbaImage::new(6, 6);
+        let semi_a = Rgba([123, 45, 67, 128]);
+        let semi_b = Rgba([255, 1, 200, 1]);
+        rgba_in.put_pixel(0, 0, semi_a);
+        rgba_in.put_pixel(5, 5, semi_b);
+        let img = DynamicImage::ImageRgba8(rgba_in);
+
+        let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(1, 1));
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!((out.width(), out.height()), (8, 16));
+        let rgba_out = out.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!(*rgba_out.get_pixel(0, 0), semi_a);
+        assert_eq!(*rgba_out.get_pixel(5, 5), semi_b);
+        assert_eq!(*rgba_out.get_pixel(6, 5), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba_out.get_pixel(7, 15), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_empty_protocol_render_is_noop() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        ViewportProtocol::Empty.render(Rect::new(0, 0, 4, 2), &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), " ");
     }
 }

@@ -12,6 +12,13 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::app::{App, ImageDisplayState};
+use crate::config::cli::{parse_cli_args, read_piped_stdin, reopen_tty_stdin};
+use crate::imaging::{
+    ImageSource, Picker, QueryStdioOptions, collect_sources, is_cbz_or_zip, list_cbz_pages,
+    scan_directory,
+};
+use crate::ui::ui;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture},
     execute, queue,
@@ -24,12 +31,6 @@ use ratatui::{
     Terminal,
     backend::{Backend, ClearType, CrosstermBackend},
 };
-use ratatui_image::picker::Picker;
-
-use crate::app::{App, ImageDisplayState};
-use crate::config::cli::{parse_cli_args, read_piped_stdin, reopen_tty_stdin};
-use crate::imaging::{ImageSource, collect_sources, is_cbz_or_zip, list_cbz_pages, scan_directory};
-use crate::ui::ui;
 
 struct TerminalGuard;
 
@@ -188,19 +189,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Query terminal protocol before raw mode
-    let compression_enabled = options.protocol.should_enable_compression();
-    let query_options = ratatui_image::picker::cap_parser::QueryStdioOptions {
+    let query_options = QueryStdioOptions {
         kitty_compression: options.protocol.should_enable_kitty_compression(),
-        ..Default::default()
     };
     let mut picker = Picker::from_query_stdio_with_options(query_options)
         .unwrap_or_else(|_| Picker::halfblocks());
     if let Some(proto) = options.protocol.forced_protocol_type() {
         picker.set_protocol_type(proto);
     }
+    let effective_compression = options
+        .protocol
+        .effective_compression(picker.protocol_type(), picker.supports_kitty_compression());
     let active_protocol = options
         .protocol
-        .resolve_active_protocol(picker.protocol_type(), compression_enabled)?;
+        .resolve_active_protocol(picker.protocol_type(), effective_compression)?;
 
     // Setup terminal using RAII guard
     let _guard = TerminalGuard::new()?;

@@ -1,11 +1,21 @@
+use crate::imaging::ViewportProtocol;
 use crate::ui::model::{ImageDisplayState, ViewportModel};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Rect},
     style::{Color, Style},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget},
 };
-use ratatui_image::StatefulImage;
+
+/// Stateless widget adapter that renders a pre-encoded [`ViewportProtocol`] into a ratatui buffer.
+struct ViewportImageWidget<'a>(&'a ViewportProtocol);
+
+impl Widget for ViewportImageWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.0.render(area, buf);
+    }
+}
 
 /// Renders the main image viewport, handling loading spinners, error details, and empty states.
 pub fn draw(frame: &mut Frame, model: &mut ViewportModel<'_>, area: Rect) {
@@ -17,7 +27,7 @@ pub fn draw(frame: &mut Frame, model: &mut ViewportModel<'_>, area: Rect) {
             frame.render_widget(loading_paragraph, area);
         }
         ImageDisplayState::Ready => {
-            if let Some(ref mut protocol) = model.image_protocol {
+            if let Some(protocol) = model.image_protocol.as_deref() {
                 // Calculate the centered Rect inside area
                 let (rect_w, rect_h) = model.rendered_size_cells;
                 let rect_w = rect_w.min(area.width);
@@ -26,9 +36,7 @@ pub fn draw(frame: &mut Frame, model: &mut ViewportModel<'_>, area: Rect) {
                 let y = area.y + (area.height.saturating_sub(rect_h)) / 2;
                 let centered_rect = Rect::new(x, y, rect_w, rect_h);
 
-                let image_widget =
-                    StatefulImage::default().resize(ratatui_image::Resize::Crop(None));
-                frame.render_stateful_widget(image_widget, centered_rect, *protocol);
+                frame.render_widget(ViewportImageWidget(protocol), centered_rect);
             }
         }
         ImageDisplayState::Error(err) => {

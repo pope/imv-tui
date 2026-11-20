@@ -1,8 +1,8 @@
 //! CPU-bound image scaling, panning, and resizing worker pools.
 
+use super::picker::Picker;
 use fast_image_resize as fir;
 use image::DynamicImage;
-use ratatui_image::picker::Picker;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1079,25 +1079,16 @@ pub fn process_resize(
 
     let start_protocol = std::time::Instant::now();
     let target_size = ratatui::layout::Size::new(rendered_cells.0, rendered_cells.1);
-    let fallback_standard = |canvas: DynamicImage| {
-        let mut p = req.picker.new_resize_protocol(canvas);
-        ratatui_image::ResizeEncodeRender::resize_encode(
-            &mut p,
-            &ratatui_image::Resize::Crop(None),
-            target_size,
-        );
-        ViewportProtocol::Standard(p)
-    };
-    let make_kitty_direct_or_standard =
-        |canvas: DynamicImage, compressed: bool| match KittyDirectProtocol::new(
-            &canvas,
+    let make_kitty_direct_or_empty =
+        |canvas: &DynamicImage, compressed: bool| match KittyDirectProtocol::new(
+            canvas,
             req.picker.font_size(),
             target_size,
             req.picker.tmux_detected(),
             compressed,
         ) {
             Ok(direct_proto) => ViewportProtocol::KittyDirect(direct_proto),
-            Err(_) => fallback_standard(canvas),
+            Err(_) => ViewportProtocol::Empty,
         };
 
     let protocol = match req.protocol {
@@ -1108,13 +1099,13 @@ pub fn process_resize(
             req.picker.tmux_detected(),
         ) {
             Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
-            Err(_) => make_kitty_direct_or_standard(canvas, false),
+            Err(_) => make_kitty_direct_or_empty(&canvas, false),
         },
         ActiveProtocol::Kitty(KittyTransferMode::Direct) => {
-            make_kitty_direct_or_standard(canvas, false)
+            make_kitty_direct_or_empty(&canvas, false)
         }
         ActiveProtocol::Kitty(KittyTransferMode::Compressed) => {
-            make_kitty_direct_or_standard(canvas, true)
+            make_kitty_direct_or_empty(&canvas, true)
         }
         ActiveProtocol::Sixel(mode) => match SixelProtocol::new(
             &canvas,
@@ -1124,7 +1115,7 @@ pub fn process_resize(
             matches!(mode, SixelTransferMode::Compressed),
         ) {
             Ok(sixel_proto) => ViewportProtocol::Sixel(sixel_proto),
-            Err(_) => fallback_standard(canvas),
+            Err(_) => ViewportProtocol::Empty,
         },
         ActiveProtocol::Iterm2(mode) => match Iterm2Protocol::new(
             &canvas,
@@ -1134,12 +1125,12 @@ pub fn process_resize(
             matches!(mode, Iterm2TransferMode::Jpeg),
         ) {
             Ok(iterm2_proto) => ViewportProtocol::Iterm2(iterm2_proto),
-            Err(_) => fallback_standard(canvas),
+            Err(_) => ViewportProtocol::Empty,
         },
         ActiveProtocol::Halfblocks => {
             match HalfblocksProtocol::new(&canvas, target_size, resizer) {
                 Ok(hb_proto) => ViewportProtocol::Halfblocks(hb_proto),
-                Err(_) => fallback_standard(canvas),
+                Err(_) => ViewportProtocol::Empty,
             }
         }
     };
@@ -1449,9 +1440,9 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::super::kitty_shm::cleanup_all_kitty_shm_segments;
+    use super::super::picker::{Picker, ProtocolType};
     use super::*;
     use image::{Rgba, RgbaImage};
-    use ratatui_image::picker::Picker;
     use std::sync::Arc;
 
     fn make_test_image(width: u32, height: u32) -> DynamicImage {
@@ -1544,14 +1535,8 @@ mod tests {
         let (proto, proc_dur, proto_dur) = process_resize(req, &mut resizer);
         assert!(proc_dur.as_nanos() > 0 || proc_dur.as_secs() == 0);
         assert!(proto_dur.as_nanos() > 0 || proto_dur.as_secs() == 0);
-        let target_size = ratatui::layout::Size::new(5, 3);
         assert!(
-            ratatui_image::ResizeEncodeRender::needs_resize(
-                &proto,
-                &ratatui_image::Resize::Crop(None),
-                target_size
-            )
-            .is_none(),
+            matches!(proto, ViewportProtocol::Halfblocks(_)),
             "Expected protocol to be pre-encoded for rendered_size_cells"
         );
     }
@@ -1582,7 +1567,7 @@ mod tests {
         let (proto_halfblocks, _, _) = process_resize(req_halfblocks, &mut resizer);
         assert!(matches!(proto_halfblocks, ViewportProtocol::Halfblocks(_)));
 
-        // 1b. Zero rendered_size_cells triggers HalfblocksProtocol::new error and falls back to Standard
+        // 1b. Zero rendered_size_cells triggers HalfblocksProtocol::new error and falls back to Empty
         let req_fallback = ResizeRequest {
             img: Arc::clone(&src),
             original_size: (80, 80),
@@ -1600,11 +1585,11 @@ mod tests {
             protocol: ActiveProtocol::Halfblocks,
         };
         let (proto_fallback, _, _) = process_resize(req_fallback, &mut resizer);
-        assert!(matches!(proto_fallback, ViewportProtocol::Standard(_)));
+        assert!(matches!(proto_fallback, ViewportProtocol::Empty));
 
         // 2. Kitty SharedMemory produces ViewportProtocol::KittyShm
         let mut picker_kitty = Picker::halfblocks();
-        picker_kitty.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        picker_kitty.set_protocol_type(ProtocolType::Kitty);
         let req_shm = ResizeRequest {
             img: src,
             original_size: (80, 80),
@@ -1627,7 +1612,7 @@ mod tests {
         // 2b. Kitty Direct and Compressed produce ViewportProtocol::KittyDirect
         // (both uncompressed t=d and compressed o=z,t=d)
         let mut picker_kitty_direct = Picker::halfblocks();
-        picker_kitty_direct.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        picker_kitty_direct.set_protocol_type(ProtocolType::Kitty);
         let req_direct = ResizeRequest {
             img: Arc::new(make_test_image(80, 80)),
             original_size: (80, 80),
@@ -1679,7 +1664,7 @@ mod tests {
 
         // 3. Sixel produces ViewportProtocol::Sixel (Full and Compressed modes)
         let mut picker_sixel = Picker::halfblocks();
-        picker_sixel.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        picker_sixel.set_protocol_type(ProtocolType::Sixel);
         let req_sixel = ResizeRequest {
             img: Arc::new(make_test_image(80, 80)),
             original_size: (80, 80),
@@ -1720,7 +1705,7 @@ mod tests {
 
         // 4. iTerm2 produces ViewportProtocol::Iterm2 (PNG and JPEG modes)
         let mut picker_iterm2 = Picker::halfblocks();
-        picker_iterm2.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+        picker_iterm2.set_protocol_type(ProtocolType::Iterm2);
         let req_iterm2_png = ResizeRequest {
             img: Arc::new(make_test_image(80, 80)),
             original_size: (80, 80),

@@ -20,6 +20,9 @@ pub use kitty_shm::*;
 
 pub mod kitty_direct;
 
+pub mod picker;
+pub use picker::*;
+
 pub mod protocol;
 pub use protocol::*;
 

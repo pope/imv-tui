@@ -1,7 +1,6 @@
 pub use super::{CompressionPolicy, ProtocolConfig};
 use crate::config::{InfoBarPosition, SlideshowState};
-use crate::imaging::{FilterType, ScaleMode};
-use ratatui_image::picker::ProtocolType;
+use crate::imaging::{FilterType, ProtocolType, ScaleMode};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
