@@ -1107,43 +1107,46 @@ pub fn process_resize(
 }
 
 /// Applies brightness adjustment to RGBA pixel buffer in-place while strictly preserving the Alpha channel.
+///
+/// Processes 32-byte (8 RGBA pixels) contiguous SIMD chunks (`vpaddusb`/`vpsubusb` on AVX2,
+/// `paddusb`/`psubusb` on SSE2) using an opaque 4-byte pixel mask so LLVM preserves contiguous
+/// vector loads/stores instead of constant-folding the zeroed Alpha lane into strided scatter stores.
 pub fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
     if value == 0 {
         return;
     }
+    let delta = value.unsigned_abs().min(255) as u8;
+    // Keeping the 4-byte RGBA mask opaque via `black_box` on a scalar `u32` prevents LLVM from
+    // constant-folding the zeroed Alpha lane into strided 3-of-4 stores while avoiding taking
+    // the address of a stack array (which would otherwise inhibit loop-invariant hoisting).
+    let [b0, b1, b2, b3] =
+        std::hint::black_box(u32::from_ne_bytes([delta, delta, delta, 0])).to_ne_bytes();
+    let mask = [
+        b0, b1, b2, b3, b0, b1, b2, b3, b0, b1, b2, b3, b0, b1, b2, b3, b0, b1, b2, b3, b0, b1, b2,
+        b3, b0, b1, b2, b3, b0, b1, b2, b3,
+    ];
+    let (chunks32, tail) = pixels.as_chunks_mut::<32>();
     if value > 0 {
-        let delta = value.min(255) as u8;
-        let mask: [u8; 16] = [
-            delta, delta, delta, 0, delta, delta, delta, 0, delta, delta, delta, 0, delta, delta,
-            delta, 0,
-        ];
-        let (chunks16, tail) = pixels.as_chunks_mut::<16>();
-        for chunk in chunks16 {
-            for i in 0..16 {
+        for chunk in chunks32 {
+            for i in 0..32 {
                 chunk[i] = chunk[i].saturating_add(mask[i]);
             }
         }
         for chunk in tail.as_chunks_mut::<4>().0 {
-            chunk[0] = chunk[0].saturating_add(delta);
-            chunk[1] = chunk[1].saturating_add(delta);
-            chunk[2] = chunk[2].saturating_add(delta);
+            for i in 0..4 {
+                chunk[i] = chunk[i].saturating_add(mask[i]);
+            }
         }
     } else {
-        let delta = (-value).min(255) as u8;
-        let mask: [u8; 16] = [
-            delta, delta, delta, 0, delta, delta, delta, 0, delta, delta, delta, 0, delta, delta,
-            delta, 0,
-        ];
-        let (chunks16, tail) = pixels.as_chunks_mut::<16>();
-        for chunk in chunks16 {
-            for i in 0..16 {
+        for chunk in chunks32 {
+            for i in 0..32 {
                 chunk[i] = chunk[i].saturating_sub(mask[i]);
             }
         }
         for chunk in tail.as_chunks_mut::<4>().0 {
-            chunk[0] = chunk[0].saturating_sub(delta);
-            chunk[1] = chunk[1].saturating_sub(delta);
-            chunk[2] = chunk[2].saturating_sub(delta);
+            for i in 0..4 {
+                chunk[i] = chunk[i].saturating_sub(mask[i]);
+            }
         }
     }
 }
@@ -1788,6 +1791,57 @@ mod tests {
         assert_eq!(pixels[3], 0);
         assert_eq!(pixels[7], 128);
         assert_eq!(pixels[11], 255);
+    }
+
+    #[test]
+    fn test_apply_brightness_simd_boundaries_and_extremes() {
+        let deltas = [0, 1, 30, 255, 500, -1, -30, -255, -500, i32::MIN, i32::MAX];
+        let pixel_counts = [0, 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 67];
+
+        for &num_pixels in &pixel_counts {
+            let mut base = Vec::with_capacity(num_pixels * 4);
+            for i in 0..num_pixels {
+                let r = ((i * 53) % 256) as u8;
+                let g = ((i * 97 + 127) % 256) as u8;
+                let b = ((i * 193 + 255) % 256) as u8;
+                let a = ((i * 37 + 13) % 256) as u8;
+                base.extend_from_slice(&[r, g, b, a]);
+            }
+
+            for &delta in &deltas {
+                let mut actual = base.clone();
+                apply_brightness_simd(&mut actual, delta);
+
+                let mag = delta.unsigned_abs().min(255) as u8;
+                let mut expected = base.clone();
+                for px in expected.as_chunks_mut::<4>().0 {
+                    if delta > 0 {
+                        px[0] = px[0].saturating_add(mag);
+                        px[1] = px[1].saturating_add(mag);
+                        px[2] = px[2].saturating_add(mag);
+                    } else if delta < 0 {
+                        px[0] = px[0].saturating_sub(mag);
+                        px[1] = px[1].saturating_sub(mag);
+                        px[2] = px[2].saturating_sub(mag);
+                    }
+                }
+
+                assert_eq!(
+                    actual, expected,
+                    "mismatch for num_pixels={num_pixels}, delta={delta}"
+                );
+            }
+        }
+
+        // Verify exact saturation at 0 and 255 with alpha preserved
+        let mut extreme = vec![0, 1, 254, 42, 255, 128, 0, 0, 10, 20, 30, 255];
+        apply_brightness_simd(&mut extreme, i32::MAX);
+        assert_eq!(
+            extreme,
+            vec![255, 255, 255, 42, 255, 255, 255, 0, 255, 255, 255, 255]
+        );
+        apply_brightness_simd(&mut extreme, i32::MIN);
+        assert_eq!(extreme, vec![0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 255]);
     }
 
     #[test]
