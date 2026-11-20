@@ -16,40 +16,6 @@ use image::DynamicImage;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Rect, Size};
 use ratatui::style::Color;
-use ratatui_image::ResizeEncodeRender;
-use ratatui_image::protocol::StatefulProtocol;
-
-/// Unified viewport image protocol supporting both standard `ratatui-image` protocols
-/// and the zero-copy POSIX shared memory (`t=s`) Kitty protocol.
-pub enum ViewportProtocol {
-    /// Standard `ratatui-image` stateful protocol (`Sixel`, `iTerm2`, `Halfblocks`, or `Kitty` `t=d`).
-    Standard(StatefulProtocol),
-    /// Zero-copy POSIX shared memory Kitty protocol (`t=s`).
-    KittyShm(KittyShmProtocol),
-}
-
-impl ResizeEncodeRender for ViewportProtocol {
-    fn resize_encode(&mut self, resize: &ratatui_image::Resize, size: Size) {
-        match self {
-            Self::Standard(proto) => proto.resize_encode(resize, size),
-            Self::KittyShm(_) => {}
-        }
-    }
-
-    fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        match self {
-            Self::Standard(proto) => proto.render(area, buf),
-            Self::KittyShm(proto) => proto.render(area, buf),
-        }
-    }
-
-    fn needs_resize(&self, resize: &ratatui_image::Resize, size: Size) -> Option<Size> {
-        match self {
-            Self::Standard(proto) => proto.needs_resize(resize, size),
-            Self::KittyShm(_) => None,
-        }
-    }
-}
 
 /// Standard RFC 4648 Base64 encoding for ASCII byte sequences.
 pub fn encode_base64_ascii(bytes: &[u8]) -> String {

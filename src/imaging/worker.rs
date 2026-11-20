@@ -14,11 +14,13 @@ use super::decoder::{
     CancellationToken, decode_image_bytes_with_header_cancellable,
     decode_thumbnail_and_dimensions_for_mode,
 };
-use super::kitty_shm::{KittyShmProtocol, ViewportProtocol};
+use super::kitty_shm::KittyShmProtocol;
+use super::protocol::ViewportProtocol;
 use super::raw::{
     RAW_EXIF_PROBE_LIMIT, probe_raw_header, read_source_bytes_limited,
     read_source_bytes_with_header,
 };
+use super::sixel::SixelProtocol;
 #[cfg(test)]
 use super::thumbcache::cache_key_for_path;
 use super::thumbcache::{
@@ -1092,6 +1094,24 @@ pub fn process_resize(
                 ViewportProtocol::Standard(p)
             }
         }
+    } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Sixel {
+        match SixelProtocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+        ) {
+            Ok(sixel_proto) => ViewportProtocol::Sixel(sixel_proto),
+            Err(_) => {
+                let mut p = req.picker.new_resize_protocol(canvas);
+                ratatui_image::ResizeEncodeRender::resize_encode(
+                    &mut p,
+                    &ratatui_image::Resize::Crop(None),
+                    target_size,
+                );
+                ViewportProtocol::Standard(p)
+            }
+        }
     } else {
         let mut p = req.picker.new_resize_protocol(canvas);
         ratatui_image::ResizeEncodeRender::resize_encode(
@@ -1561,6 +1581,28 @@ mod tests {
         };
         let (proto_shm, _, _) = process_resize(req_shm, &mut resizer);
         assert!(matches!(proto_shm, ViewportProtocol::KittyShm(_)));
+
+        // 3. Sixel picker produces ViewportProtocol::Sixel
+        let mut picker_sixel = Picker::halfblocks();
+        picker_sixel.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        let req_sixel = ResizeRequest {
+            img: Arc::new(make_test_image(80, 80)),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_sixel,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 3,
+            use_kitty_shm: false,
+        };
+        let (proto_sixel, _, _) = process_resize(req_sixel, &mut resizer);
+        assert!(matches!(proto_sixel, ViewportProtocol::Sixel(_)));
 
         cleanup_all_kitty_shm_segments();
     }

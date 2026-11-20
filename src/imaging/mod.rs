@@ -18,6 +18,11 @@ pub mod thumbcache;
 pub mod kitty_shm;
 pub use kitty_shm::*;
 
+pub mod protocol;
+pub use protocol::*;
+
+pub mod sixel;
+
 #[cfg(test)]
 mod tests {
     use super::*;
