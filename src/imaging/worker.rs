@@ -1287,52 +1287,116 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
         return;
     }
 
-    // Pre-tabulate 1D horizontal source bounds for each destination x coordinate
-    let mut x_bounds = Vec::with_capacity(dst_w as usize);
-    for x in 0..dst_w {
+    let src_w_usize = src_w as usize;
+    let src_h_usize = src_h as usize;
+    let dst_w_usize = dst_w as usize;
+
+    // Pre-tabulate relative horizontal source indices for each destination column
+    // and track the active source column window `[x_min..=x_max]`.
+    let mut rel_x0: Vec<u32> = Vec::with_capacity(dst_w_usize);
+    let mut x_min = usize::MAX;
+    let mut x_max = 0usize;
+    for x in 0..dst_w_usize {
         let src_x_f = crop_left + (x as f64 + 0.5) * scale_x - 0.5;
         let x0 = (src_x_f.floor() as i64).clamp(0, src_w as i64 - 1) as usize;
-        let x1 = (x0 + 1).min(src_w as usize - 1);
-        x_bounds.push((x0, x1));
+        x_min = x_min.min(x0);
+        x_max = x_max.max(x0);
+        rel_x0.push(x0 as u32);
+    }
+    let x_min_u32 = x_min as u32;
+    for idx in &mut rel_x0 {
+        *idx -= x_min_u32;
     }
 
-    let src_w_usize = src_w as usize;
+    // Separable 2x2 neighborhood scratch buffers covering only the active source slice.
+    // Allocating one extra pixel slot at the end of `v_min`/`v_max` guarantees `i + N`
+    // is always in-bounds during the horizontal SIMD pass even when `x_max == src_w - 1`.
+    let active_w = x_max - x_min + 1;
+    let src_end_incl = (x_max + 1).min(src_w_usize - 1);
+    let src_slice_len = src_end_incl - x_min + 1;
+    let v_len = (active_w + 1) * N;
+    let mut v_min = vec![0u8; v_len];
+    let mut v_max = vec![0u8; v_len];
+    let mut h_min = vec![[0u8; N]; active_w];
+    let mut h_max = vec![[0u8; N]; active_w];
+
+    // Expanded per-row RGBA bounds reused across consecutive destination rows sharing `y0`.
+    // Storing `[min_r, min_g, min_b, 0]` and `[max_r, max_g, max_b, 255]` preserves Alpha
+    // identically while keeping the hot clamping loop a contiguous branchless byte SIMD pass.
+    let mut row_min = vec![[0u8; 4]; dst_w_usize];
+    let mut row_max = vec![[255u8; 4]; dst_w_usize];
+    let mut prev_y0 = usize::MAX;
     let dst_pixels = dst.as_mut().as_chunks_mut::<4>().0;
 
-    // Process rows with horizontal span caching
-    for (y, dst_row) in dst_pixels.chunks_exact_mut(dst_w as usize).enumerate() {
+    for (y, dst_row) in dst_pixels.chunks_exact_mut(dst_w_usize).enumerate() {
         let src_y_f = crop_top + (y as f64 + 0.5) * scale_y - 0.5;
         let y0 = (src_y_f.floor() as i64).clamp(0, src_h as i64 - 1) as usize;
-        let y1 = (y0 + 1).min(src_h as usize - 1);
 
-        let row0 = &src_pixels[y0 * src_w_usize..(y0 + 1) * src_w_usize];
-        let row1 = &src_pixels[y1 * src_w_usize..(y1 + 1) * src_w_usize];
+        if y0 != prev_y0 {
+            prev_y0 = y0;
+            let y1 = (y0 + 1).min(src_h_usize - 1);
+            let row0 =
+                &src_pixels[y0 * src_w_usize + x_min..y0 * src_w_usize + x_min + src_slice_len];
+            let row1 =
+                &src_pixels[y1 * src_w_usize + x_min..y1 * src_w_usize + x_min + src_slice_len];
 
-        let mut prev_x0 = usize::MAX;
-        let mut min_rgb = [0u8; 3];
-        let mut max_rgb = [0u8; 3];
-
-        for (dst_pixel, &(x0, x1)) in dst_row.iter_mut().zip(&x_bounds) {
-            if x0 != prev_x0 {
-                prev_x0 = x0;
-                let p00 = row0[x0];
-                let p10 = row0[x1];
-                let p01 = row1[x0];
-                let p11 = row1[x1];
-
-                min_rgb[0] = p00[0].min(p10[0]).min(p01[0]).min(p11[0]);
-                max_rgb[0] = p00[0].max(p10[0]).max(p01[0]).max(p11[0]);
-
-                min_rgb[1] = p00[1].min(p10[1]).min(p01[1]).min(p11[1]);
-                max_rgb[1] = p00[1].max(p10[1]).max(p01[1]).max(p11[1]);
-
-                min_rgb[2] = p00[2].min(p10[2]).min(p01[2]).min(p11[2]);
-                max_rgb[2] = p00[2].max(p10[2]).max(p01[2]).max(p11[2]);
+            // 1. Vertical 2-row min/max pass over contiguous flat source bytes (SIMD).
+            let r0 = row0.as_flattened();
+            let r1 = row1.as_flattened();
+            let v_bytes = src_slice_len * N;
+            for (((vm, vx), &a), &b) in v_min[..v_bytes]
+                .iter_mut()
+                .zip(&mut v_max[..v_bytes])
+                .zip(r0)
+                .zip(r1)
+            {
+                *vm = a.min(b);
+                *vx = a.max(b);
+            }
+            if src_slice_len == active_w {
+                // Duplicate rightmost source column so `x1 = x0` at the image right edge.
+                let last = (active_w - 1) * N;
+                for c in 0..N {
+                    v_min[last + N + c] = v_min[last + c];
+                    v_max[last + N + c] = v_max[last + c];
+                }
             }
 
-            dst_pixel[0] = dst_pixel[0].clamp(min_rgb[0], max_rgb[0]);
-            dst_pixel[1] = dst_pixel[1].clamp(min_rgb[1], max_rgb[1]);
-            dst_pixel[2] = dst_pixel[2].clamp(min_rgb[2], max_rgb[2]);
+            // 2. Horizontal 2-column min/max pass over contiguous flat bytes (SIMD).
+            let h_bytes = active_w * N;
+            for ((hm, &a), &b) in h_min
+                .as_flattened_mut()
+                .iter_mut()
+                .zip(&v_min[..h_bytes])
+                .zip(&v_min[N..N + h_bytes])
+            {
+                *hm = a.min(b);
+            }
+            for ((hx, &a), &b) in h_max
+                .as_flattened_mut()
+                .iter_mut()
+                .zip(&v_max[..h_bytes])
+                .zip(&v_max[N..N + h_bytes])
+            {
+                *hx = a.max(b);
+            }
+
+            // 3. Gather 2x2 RGB bounds into destination-width RGBA row buffers.
+            for ((rmn, rmx), &idx) in row_min.iter_mut().zip(&mut row_max).zip(&rel_x0) {
+                let idx = idx as usize;
+                let mn = h_min[idx];
+                let mx = h_max[idx];
+                *rmn = [mn[0], mn[1], mn[2], 0];
+                *rmx = [mx[0], mx[1], mx[2], 255];
+            }
+        }
+
+        // Branchless contiguous byte clamp (`pmaxub` / `pminub`) across the entire row.
+        let dst_bytes = dst_row.as_flattened_mut();
+        let min_bytes = row_min.as_flattened();
+        let max_bytes = row_max.as_flattened();
+        for ((d, &mn), &mx) in dst_bytes.iter_mut().zip(min_bytes).zip(max_bytes) {
+            *d = (*d).max(mn).min(mx);
         }
     }
 }
@@ -1968,6 +2032,188 @@ mod tests {
         clamp_anti_ringing_rgba(&mut dst_rgba_crop, &src_rgba_span, crop);
         clamp_anti_ringing_rgb(&mut dst_rgb_crop, &src_rgb_span, crop);
         assert_eq!(dst_rgba_crop, dst_rgb_crop);
+    }
+
+    #[test]
+    fn test_anti_ringing_clamp_matches_naive_scalar_reference() {
+        fn naive_reference<const N: usize>(
+            dst: &mut image::RgbaImage,
+            src_pixels: &[[u8; N]],
+            src_w: u32,
+            src_h: u32,
+            crop_rect: Option<(f64, f64, f64, f64)>,
+        ) {
+            let dst_w = dst.width();
+            let dst_h = dst.height();
+            if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+                return;
+            }
+            let (crop_left, crop_top, crop_w, crop_h) =
+                crop_rect.unwrap_or((0.0, 0.0, src_w as f64, src_h as f64));
+            let scale_x = crop_w / dst_w as f64;
+            let scale_y = crop_h / dst_h as f64;
+            if scale_x > 1.0 || scale_y > 1.0 {
+                return;
+            }
+            for y in 0..dst_h {
+                let src_y_f = crop_top + (y as f64 + 0.5) * scale_y - 0.5;
+                let y0 = (src_y_f.floor() as i64).clamp(0, src_h as i64 - 1) as usize;
+                let y1 = (y0 + 1).min(src_h as usize - 1);
+                for x in 0..dst_w {
+                    let src_x_f = crop_left + (x as f64 + 0.5) * scale_x - 0.5;
+                    let x0 = (src_x_f.floor() as i64).clamp(0, src_w as i64 - 1) as usize;
+                    let x1 = (x0 + 1).min(src_w as usize - 1);
+
+                    let p00 = src_pixels[y0 * src_w as usize + x0];
+                    let p10 = src_pixels[y0 * src_w as usize + x1];
+                    let p01 = src_pixels[y1 * src_w as usize + x0];
+                    let p11 = src_pixels[y1 * src_w as usize + x1];
+
+                    let px = dst.get_pixel_mut(x, y);
+                    for c in 0..3 {
+                        let mn = p00[c].min(p10[c]).min(p01[c]).min(p11[c]);
+                        let mx = p00[c].max(p10[c]).max(p01[c]).max(p11[c]);
+                        px[c] = px[c].clamp(mn, mx);
+                    }
+                }
+            }
+        }
+
+        fn make_pattern_sources(w: u32, h: u32) -> (image::RgbImage, image::RgbaImage) {
+            let mut rgb = image::RgbImage::new(w, h);
+            let mut rgba = image::RgbaImage::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let r = ((x.wrapping_mul(53) ^ y.wrapping_mul(97)) % 256) as u8;
+                    let g = ((x.wrapping_mul(17).wrapping_add(y.wrapping_mul(41))) % 256) as u8;
+                    let b = ((x.wrapping_mul(29).wrapping_add(y.wrapping_mul(73))) % 256) as u8;
+                    let a = ((x.wrapping_mul(11).wrapping_add(y.wrapping_mul(13))) % 256) as u8;
+                    rgb.put_pixel(x, y, image::Rgb([r, g, b]));
+                    rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
+                }
+            }
+            (rgb, rgba)
+        }
+
+        fn make_ringing_dst(w: u32, h: u32) -> image::RgbaImage {
+            let mut dst = image::RgbaImage::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let r = ((x.wrapping_mul(131).wrapping_add(y.wrapping_mul(37))) % 256) as u8;
+                    let g = ((x.wrapping_mul(67) ^ y.wrapping_mul(193)) % 256) as u8;
+                    let b = ((x.wrapping_mul(19).wrapping_add(y.wrapping_mul(211))) % 256) as u8;
+                    let a = ((x.wrapping_mul(7).wrapping_add(y.wrapping_mul(23))) % 256) as u8;
+                    dst.put_pixel(x, y, image::Rgba([r, g, b, a]));
+                }
+            }
+            dst
+        }
+
+        type ClampCase = (
+            &'static str,
+            u32,
+            u32,
+            u32,
+            u32,
+            Option<(f64, f64, f64, f64)>,
+        );
+        let cases: &[ClampCase] = &[
+            ("1.0x full", 32, 24, 32, 24, None),
+            ("1.5x full", 20, 16, 30, 24, None),
+            ("3.2x full", 25, 15, 80, 48, None),
+            ("8.0x full", 10, 8, 80, 64, None),
+            (
+                "3.2x fractional interior crop",
+                40,
+                30,
+                64,
+                48,
+                Some((5.35, 3.75, 20.0, 15.0)),
+            ),
+            (
+                "1.5x crop touching right/bottom edge",
+                23,
+                19,
+                27,
+                21,
+                Some((5.0, 5.0, 18.0, 14.0)),
+            ),
+            (
+                "8.0x fractional edge crop",
+                17,
+                13,
+                55,
+                41,
+                Some((10.25, 7.6, 6.75, 5.125)),
+            ),
+            (
+                "negative crop offset clamped",
+                15,
+                11,
+                33,
+                25,
+                Some((-2.5, -1.75, 10.0, 8.0)),
+            ),
+            ("odd dims 1.0x", 17, 13, 17, 13, None),
+            ("odd dims 3.2x", 17, 13, 55, 41, None),
+            ("1x1 to 1x1", 1, 1, 1, 1, None),
+            ("1x1 to 9x7", 1, 1, 9, 7, None),
+            ("downscale X no-op", 20, 20, 10, 40, None),
+            ("downscale Y no-op", 20, 20, 40, 10, None),
+            ("empty dst", 10, 10, 0, 0, None),
+            ("empty src", 0, 0, 10, 10, None),
+        ];
+
+        for &(label, src_w, src_h, dst_w, dst_h, crop) in cases {
+            let (src_rgb, src_rgba) = make_pattern_sources(src_w, src_h);
+            let dst_orig = make_ringing_dst(dst_w, dst_h);
+
+            // RGB path vs reference
+            let mut dst_rgb_actual = dst_orig.clone();
+            let mut dst_rgb_expected = dst_orig.clone();
+            clamp_anti_ringing_rgb(&mut dst_rgb_actual, &src_rgb, crop);
+            naive_reference::<3>(
+                &mut dst_rgb_expected,
+                src_rgb.as_raw().as_chunks::<3>().0,
+                src_w,
+                src_h,
+                crop,
+            );
+            assert_eq!(
+                dst_rgb_actual.as_raw(),
+                dst_rgb_expected.as_raw(),
+                "RGB mismatch on case: {label}"
+            );
+
+            // RGBA path vs reference
+            let mut dst_rgba_actual = dst_orig.clone();
+            let mut dst_rgba_expected = dst_orig.clone();
+            clamp_anti_ringing_rgba(&mut dst_rgba_actual, &src_rgba, crop);
+            naive_reference::<4>(
+                &mut dst_rgba_expected,
+                src_rgba.as_raw().as_chunks::<4>().0,
+                src_w,
+                src_h,
+                crop,
+            );
+            assert_eq!(
+                dst_rgba_actual.as_raw(),
+                dst_rgba_expected.as_raw(),
+                "RGBA mismatch on case: {label}"
+            );
+
+            // Alpha channel must be preserved byte-for-byte
+            for (orig_px, (rgb_px, rgba_px)) in dst_orig
+                .pixels()
+                .zip(dst_rgb_actual.pixels().zip(dst_rgba_actual.pixels()))
+            {
+                assert_eq!(rgb_px[3], orig_px[3], "RGB alpha altered on case: {label}");
+                assert_eq!(
+                    rgba_px[3], orig_px[3],
+                    "RGBA alpha altered on case: {label}"
+                );
+            }
+        }
     }
 
     #[test]
