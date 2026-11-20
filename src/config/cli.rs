@@ -311,7 +311,7 @@ where
                     "      --no-thumbnail         Disable low-res EXIF thumbnail placeholder loading"
                 );
                 println!(
-                    "      --compress <mode>      Payload compression mode (Kitty zlib / iTerm2 JPEG): auto, always, never (defaults to auto)"
+                    "      --compress <mode>      Payload compression mode (Kitty zlib / iTerm2 JPEG / Sixel 128-color): auto, always, never (defaults to auto)"
                 );
                 println!(
                     "      --no-kitty-shm         Disable Kitty POSIX shared memory (t=s) image transmission"
@@ -380,7 +380,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ActiveProtocol, Iterm2TransferMode, KittyTransferMode};
+    use crate::config::{ActiveProtocol, Iterm2TransferMode, KittyTransferMode, SixelTransferMode};
 
     #[test]
     fn test_sync_exclusion() {
@@ -616,7 +616,7 @@ mod tests {
         assert!(err.contains("Unknown compress mode 'invalid'"));
 
         // 4. Incompatible protocol combinations fail regardless of argument order
-        for (proto, mode) in [("sixel", "never"), ("halfblocks", "auto")] {
+        for (proto, mode) in [("halfblocks", "auto"), ("halfblocks", "always")] {
             let args1 = vec![
                 "imv-tui".to_string(),
                 "--protocol".to_string(),
@@ -627,7 +627,7 @@ mod tests {
             let err1 = parse_cli_args_from(args1).err().unwrap();
             assert_eq!(
                 err1,
-                "Error: Option --compress can only be used with the kitty or iterm2 protocol"
+                "Error: Option --compress can only be used with the kitty, iterm2, or sixel protocol"
             );
 
             let args2 = vec![
@@ -640,11 +640,11 @@ mod tests {
             let err2 = parse_cli_args_from(args2).err().unwrap();
             assert_eq!(
                 err2,
-                "Error: Option --compress can only be used with the kitty or iterm2 protocol"
+                "Error: Option --compress can only be used with the kitty, iterm2, or sixel protocol"
             );
         }
 
-        // 5. Compatible protocol combinations with Kitty and iTerm2
+        // 5. Compatible protocol combinations with Kitty, iTerm2, and Sixel
         let kitty_args = vec![
             "imv-tui".to_string(),
             "--protocol".to_string(),
@@ -694,22 +694,50 @@ mod tests {
             }
         );
 
+        let sixel_args = vec![
+            "imv-tui".to_string(),
+            "--protocol".to_string(),
+            "sixel".to_string(),
+            "--compress".to_string(),
+            "always".to_string(),
+        ];
+        let sixel_opts = parse_cli_args_from(sixel_args).unwrap();
+        assert_eq!(
+            sixel_opts.protocol,
+            ProtocolConfig::Sixel {
+                compression: CompressionPolicy::Always,
+            }
+        );
+        assert!(sixel_opts.protocol.should_enable_compression());
+        assert!(!sixel_opts.protocol.should_enable_kitty_compression());
+
+        // Default Sixel without --compress uses CompressionPolicy::Auto
+        let sixel_default_args = vec![
+            "imv-tui".to_string(),
+            "--protocol".to_string(),
+            "sixel".to_string(),
+        ];
+        let sixel_default_opts = parse_cli_args_from(sixel_default_args).unwrap();
+        assert_eq!(
+            sixel_default_opts.protocol,
+            ProtocolConfig::Sixel {
+                compression: CompressionPolicy::Auto,
+            }
+        );
+
         // 6. resolve_active_protocol enforcement
         let auto_explicit = ProtocolConfig::Auto {
             explicit_compress: Some(CompressionPolicy::Always),
             disable_kitty_shm: false,
         };
-        let err = auto_explicit
-            .resolve_active_protocol(ProtocolType::Sixel, true)
-            .err()
-            .unwrap();
-        assert!(err.contains("detected terminal protocol is Sixel (not Kitty or Iterm2)"));
-
         let err_hb = auto_explicit
             .resolve_active_protocol(ProtocolType::Halfblocks, true)
             .err()
             .unwrap();
-        assert!(err_hb.contains("detected terminal protocol is Halfblocks (not Kitty or Iterm2)"));
+        assert!(
+            err_hb
+                .contains("detected terminal protocol is Halfblocks (not Kitty, Iterm2, or Sixel)")
+        );
 
         assert_eq!(
             auto_explicit
@@ -723,6 +751,18 @@ mod tests {
                 .unwrap(),
             ActiveProtocol::Iterm2(Iterm2TransferMode::Png)
         );
+        assert_eq!(
+            auto_explicit
+                .resolve_active_protocol(ProtocolType::Sixel, true)
+                .unwrap(),
+            ActiveProtocol::Sixel(SixelTransferMode::Compressed)
+        );
+        assert_eq!(
+            auto_explicit
+                .resolve_active_protocol(ProtocolType::Sixel, false)
+                .unwrap(),
+            ActiveProtocol::Sixel(SixelTransferMode::Full)
+        );
 
         let auto_default = ProtocolConfig::Auto {
             explicit_compress: None,
@@ -732,7 +772,13 @@ mod tests {
             auto_default
                 .resolve_active_protocol(ProtocolType::Sixel, false)
                 .unwrap(),
-            ActiveProtocol::Sixel
+            ActiveProtocol::Sixel(SixelTransferMode::Full)
+        );
+        assert_eq!(
+            auto_default
+                .resolve_active_protocol(ProtocolType::Sixel, true)
+                .unwrap(),
+            ActiveProtocol::Sixel(SixelTransferMode::Compressed)
         );
         assert_eq!(
             auto_default
@@ -764,6 +810,23 @@ mod tests {
             ActiveProtocol::Iterm2(Iterm2TransferMode::Png)
         );
 
+        // Forced Sixel resolution
+        let forced_sixel = ProtocolConfig::Sixel {
+            compression: CompressionPolicy::Always,
+        };
+        assert_eq!(
+            forced_sixel
+                .resolve_active_protocol(ProtocolType::Sixel, true)
+                .unwrap(),
+            ActiveProtocol::Sixel(SixelTransferMode::Compressed)
+        );
+        assert_eq!(
+            forced_sixel
+                .resolve_active_protocol(ProtocolType::Sixel, false)
+                .unwrap(),
+            ActiveProtocol::Sixel(SixelTransferMode::Full)
+        );
+
         // 7. ActiveProtocol helpers
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Kitty, true),
@@ -776,6 +839,14 @@ mod tests {
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Iterm2, true),
             ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg)
+        );
+        assert_eq!(
+            ActiveProtocol::from_protocol_type(ProtocolType::Sixel, false),
+            ActiveProtocol::Sixel(SixelTransferMode::Full)
+        );
+        assert_eq!(
+            ActiveProtocol::from_protocol_type(ProtocolType::Sixel, true),
+            ActiveProtocol::Sixel(SixelTransferMode::Compressed)
         );
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Halfblocks, false),
@@ -876,35 +947,43 @@ mod tests {
     fn test_active_protocol_display_label_and_mode_helpers() {
         let proto = ActiveProtocol::Kitty(KittyTransferMode::SharedMemory);
         assert_eq!(proto.display_label(), "Kitty (SHM)");
-        assert!(proto.uses_kitty_shm());
-        assert!(!proto.uses_kitty_compression());
-        assert!(!proto.uses_iterm2_jpeg());
 
         let proto_off = proto.with_kitty_shm(false);
+        assert_eq!(proto_off, ActiveProtocol::Kitty(KittyTransferMode::Direct));
         assert_eq!(proto_off.display_label(), "Kitty");
-        assert!(!proto_off.uses_kitty_shm());
-        assert!(!proto_off.uses_kitty_compression());
+
+        let proto_on = proto_off.with_kitty_shm(true);
+        assert_eq!(
+            proto_on,
+            ActiveProtocol::Kitty(KittyTransferMode::SharedMemory)
+        );
 
         let proto_comp = ActiveProtocol::Kitty(KittyTransferMode::Compressed);
         assert_eq!(proto_comp.display_label(), "Kitty (Compressed)");
-        assert!(!proto_comp.uses_kitty_shm());
-        assert!(proto_comp.uses_kitty_compression());
 
-        // with_kitty_shm does not enable shm when compression is true
+        // with_kitty_shm does not enable shm when compression is active
         let proto_comp_attempt = proto_comp.with_kitty_shm(true);
+        assert_eq!(
+            proto_comp_attempt,
+            ActiveProtocol::Kitty(KittyTransferMode::Compressed)
+        );
         assert_eq!(proto_comp_attempt.display_label(), "Kitty (Compressed)");
-        assert!(!proto_comp_attempt.uses_kitty_shm());
-        assert!(proto_comp_attempt.uses_kitty_compression());
 
         // iTerm2 PNG vs JPEG transfer modes
         let iterm2_png = ActiveProtocol::Iterm2(Iterm2TransferMode::Png);
         assert_eq!(iterm2_png.display_label(), "Iterm2");
-        assert!(!iterm2_png.uses_iterm2_jpeg());
-        assert!(!iterm2_png.uses_kitty_shm());
 
         let iterm2_jpeg = ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg);
         assert_eq!(iterm2_jpeg.display_label(), "Iterm2 (JPEG)");
-        assert!(iterm2_jpeg.uses_iterm2_jpeg());
-        assert!(!iterm2_jpeg.uses_kitty_shm());
+
+        // Sixel Full vs Compressed transfer modes
+        let sixel_full = ActiveProtocol::Sixel(SixelTransferMode::Full);
+        assert_eq!(sixel_full.display_label(), "Sixel");
+
+        let sixel_comp = ActiveProtocol::Sixel(SixelTransferMode::Compressed);
+        assert_eq!(sixel_comp.display_label(), "Sixel (Compressed)");
+
+        // Halfblocks
+        assert_eq!(ActiveProtocol::Halfblocks.display_label(), "Halfblocks");
     }
 }

@@ -122,18 +122,16 @@ fn test_cli_invalid_flags() {
         assert!(stderr.contains("Unknown compress mode 'invalid_mode'"));
     }
 
-    // Incompatible --compress with non-kitty/non-iterm2 protocol
+    // Incompatible --compress with halfblocks protocol
     let output = Command::new(env!("CARGO_BIN_EXE_imv-tui"))
-        .args(["--protocol", "sixel", "--compress", "always"])
+        .args(["--protocol", "halfblocks", "--compress", "always"])
         .output()
         .expect("Failed to execute process");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "Error: Option --compress can only be used with the kitty or iterm2 protocol"
-        )
-    );
+    assert!(stderr.contains(
+        "Error: Option --compress can only be used with the kitty, iterm2, or sixel protocol"
+    ));
 }
 
 #[test]

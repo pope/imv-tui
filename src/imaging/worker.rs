@@ -18,7 +18,9 @@ use super::halfblocks::HalfblocksProtocol;
 use super::iterm2::Iterm2Protocol;
 use super::kitty_direct::KittyDirectProtocol;
 use super::kitty_shm::KittyShmProtocol;
-use super::protocol::ViewportProtocol;
+use super::protocol::{
+    ActiveProtocol, Iterm2TransferMode, KittyTransferMode, SixelTransferMode, ViewportProtocol,
+};
 use super::raw::{
     RAW_EXIF_PROBE_LIMIT, probe_raw_header, read_source_bytes_limited,
     read_source_bytes_with_header,
@@ -61,12 +63,8 @@ pub struct ResizeRequest {
     pub rendered_size_cells: (u16, u16),
     /// Sequence identifier to filter out stale requests.
     pub sequence: u64,
-    /// Whether POSIX shared memory (`t=s`) should be used for Kitty protocol rendering.
-    pub use_kitty_shm: bool,
-    /// Whether zlib compression (`o=z`) should be used for Kitty direct (`t=d`) rendering.
-    pub use_kitty_compression: bool,
-    /// Whether quality-90 JPEG encoding should be used for opaque iTerm2 protocol images.
-    pub use_iterm2_jpeg: bool,
+    /// Active runtime terminal graphics protocol and its transfer/encoding mode.
+    pub protocol: ActiveProtocol,
 }
 
 /// A response payload sent by the resizing worker thread.
@@ -1081,90 +1079,7 @@ pub fn process_resize(
 
     let start_protocol = std::time::Instant::now();
     let target_size = ratatui::layout::Size::new(rendered_cells.0, rendered_cells.1);
-    let protocol = if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty {
-        let make_direct_or_standard = |canvas: DynamicImage| match KittyDirectProtocol::new(
-            &canvas,
-            req.picker.font_size(),
-            target_size,
-            req.picker.tmux_detected(),
-            req.use_kitty_compression,
-        ) {
-            Ok(direct_proto) => ViewportProtocol::KittyDirect(direct_proto),
-            Err(_) => {
-                let mut p = req.picker.new_resize_protocol(canvas);
-                ratatui_image::ResizeEncodeRender::resize_encode(
-                    &mut p,
-                    &ratatui_image::Resize::Crop(None),
-                    target_size,
-                );
-                ViewportProtocol::Standard(p)
-            }
-        };
-
-        if req.use_kitty_shm {
-            match KittyShmProtocol::new(
-                &canvas,
-                req.picker.font_size(),
-                target_size,
-                req.picker.tmux_detected(),
-            ) {
-                Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
-                Err(_) => make_direct_or_standard(canvas),
-            }
-        } else {
-            make_direct_or_standard(canvas)
-        }
-    } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Sixel {
-        match SixelProtocol::new(
-            &canvas,
-            req.picker.font_size(),
-            target_size,
-            req.picker.tmux_detected(),
-        ) {
-            Ok(sixel_proto) => ViewportProtocol::Sixel(sixel_proto),
-            Err(_) => {
-                let mut p = req.picker.new_resize_protocol(canvas);
-                ratatui_image::ResizeEncodeRender::resize_encode(
-                    &mut p,
-                    &ratatui_image::Resize::Crop(None),
-                    target_size,
-                );
-                ViewportProtocol::Standard(p)
-            }
-        }
-    } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Iterm2 {
-        match Iterm2Protocol::new(
-            &canvas,
-            req.picker.font_size(),
-            target_size,
-            req.picker.tmux_detected(),
-            req.use_iterm2_jpeg,
-        ) {
-            Ok(iterm2_proto) => ViewportProtocol::Iterm2(iterm2_proto),
-            Err(_) => {
-                let mut p = req.picker.new_resize_protocol(canvas);
-                ratatui_image::ResizeEncodeRender::resize_encode(
-                    &mut p,
-                    &ratatui_image::Resize::Crop(None),
-                    target_size,
-                );
-                ViewportProtocol::Standard(p)
-            }
-        }
-    } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks {
-        match HalfblocksProtocol::new(&canvas, target_size, resizer) {
-            Ok(hb_proto) => ViewportProtocol::Halfblocks(hb_proto),
-            Err(_) => {
-                let mut p = req.picker.new_resize_protocol(canvas);
-                ratatui_image::ResizeEncodeRender::resize_encode(
-                    &mut p,
-                    &ratatui_image::Resize::Crop(None),
-                    target_size,
-                );
-                ViewportProtocol::Standard(p)
-            }
-        }
-    } else {
+    let fallback_standard = |canvas: DynamicImage| {
         let mut p = req.picker.new_resize_protocol(canvas);
         ratatui_image::ResizeEncodeRender::resize_encode(
             &mut p,
@@ -1172,6 +1087,61 @@ pub fn process_resize(
             target_size,
         );
         ViewportProtocol::Standard(p)
+    };
+    let make_kitty_direct_or_standard =
+        |canvas: DynamicImage, compressed: bool| match KittyDirectProtocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+            compressed,
+        ) {
+            Ok(direct_proto) => ViewportProtocol::KittyDirect(direct_proto),
+            Err(_) => fallback_standard(canvas),
+        };
+
+    let protocol = match req.protocol {
+        ActiveProtocol::Kitty(KittyTransferMode::SharedMemory) => match KittyShmProtocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+        ) {
+            Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
+            Err(_) => make_kitty_direct_or_standard(canvas, false),
+        },
+        ActiveProtocol::Kitty(KittyTransferMode::Direct) => {
+            make_kitty_direct_or_standard(canvas, false)
+        }
+        ActiveProtocol::Kitty(KittyTransferMode::Compressed) => {
+            make_kitty_direct_or_standard(canvas, true)
+        }
+        ActiveProtocol::Sixel(mode) => match SixelProtocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+            matches!(mode, SixelTransferMode::Compressed),
+        ) {
+            Ok(sixel_proto) => ViewportProtocol::Sixel(sixel_proto),
+            Err(_) => fallback_standard(canvas),
+        },
+        ActiveProtocol::Iterm2(mode) => match Iterm2Protocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+            matches!(mode, Iterm2TransferMode::Jpeg),
+        ) {
+            Ok(iterm2_proto) => ViewportProtocol::Iterm2(iterm2_proto),
+            Err(_) => fallback_standard(canvas),
+        },
+        ActiveProtocol::Halfblocks => {
+            match HalfblocksProtocol::new(&canvas, target_size, resizer) {
+                Ok(hb_proto) => ViewportProtocol::Halfblocks(hb_proto),
+                Err(_) => fallback_standard(canvas),
+            }
+        }
     };
     let protocol_duration = start_protocol.elapsed();
 
@@ -1560,9 +1530,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (5, 3),
             sequence: 1,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -1593,7 +1561,7 @@ mod tests {
         let mut resizer = fir::Resizer::new();
         let src = Arc::new(make_test_image(80, 80));
 
-        // 1. Halfblocks picker with use_kitty_shm = true produces ViewportProtocol::Halfblocks
+        // 1. Halfblocks protocol produces ViewportProtocol::Halfblocks
         let picker_halfblocks = Picker::halfblocks();
         let req_halfblocks = ResizeRequest {
             img: Arc::clone(&src),
@@ -1609,9 +1577,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
             sequence: 1,
-            use_kitty_shm: true,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
         let (proto_halfblocks, _, _) = process_resize(req_halfblocks, &mut resizer);
         assert!(matches!(proto_halfblocks, ViewportProtocol::Halfblocks(_)));
@@ -1631,14 +1597,12 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (0, 10),
             sequence: 10,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
         let (proto_fallback, _, _) = process_resize(req_fallback, &mut resizer);
         assert!(matches!(proto_fallback, ViewportProtocol::Standard(_)));
 
-        // 2. Kitty picker with use_kitty_shm = true produces ViewportProtocol::KittyShm
+        // 2. Kitty SharedMemory produces ViewportProtocol::KittyShm
         let mut picker_kitty = Picker::halfblocks();
         picker_kitty.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
         let req_shm = ResizeRequest {
@@ -1655,14 +1619,12 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
             sequence: 2,
-            use_kitty_shm: true,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
         };
         let (proto_shm, _, _) = process_resize(req_shm, &mut resizer);
         assert!(matches!(proto_shm, ViewportProtocol::KittyShm(_)));
 
-        // 2b. Kitty picker with use_kitty_shm = false produces ViewportProtocol::KittyDirect
+        // 2b. Kitty Direct and Compressed produce ViewportProtocol::KittyDirect
         // (both uncompressed t=d and compressed o=z,t=d)
         let mut picker_kitty_direct = Picker::halfblocks();
         picker_kitty_direct.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
@@ -1680,9 +1642,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
             sequence: 20,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Kitty(KittyTransferMode::Direct),
         };
         let (proto_direct, _, _) = process_resize(req_direct, &mut resizer);
         match proto_direct {
@@ -1707,9 +1667,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
             sequence: 21,
-            use_kitty_shm: false,
-            use_kitty_compression: true,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Kitty(KittyTransferMode::Compressed),
         };
         let (proto_direct_comp, _, _) = process_resize(req_direct_comp, &mut resizer);
         match proto_direct_comp {
@@ -1719,10 +1677,29 @@ mod tests {
             _ => panic!("Expected ViewportProtocol::KittyDirect for compressed Kitty"),
         }
 
-        // 3. Sixel picker produces ViewportProtocol::Sixel
+        // 3. Sixel produces ViewportProtocol::Sixel (Full and Compressed modes)
         let mut picker_sixel = Picker::halfblocks();
         picker_sixel.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
         let req_sixel = ResizeRequest {
+            img: Arc::new(make_test_image(80, 80)),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_sixel.clone(),
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 3,
+            protocol: ActiveProtocol::Sixel(SixelTransferMode::Full),
+        };
+        let (proto_sixel, _, _) = process_resize(req_sixel, &mut resizer);
+        assert!(matches!(proto_sixel, ViewportProtocol::Sixel(_)));
+
+        let req_sixel_comp = ResizeRequest {
             img: Arc::new(make_test_image(80, 80)),
             original_size: (80, 80),
             scale: 1.0,
@@ -1735,15 +1712,13 @@ mod tests {
             brightness: Brightness::ZERO,
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
-            sequence: 3,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            sequence: 4,
+            protocol: ActiveProtocol::Sixel(SixelTransferMode::Compressed),
         };
-        let (proto_sixel, _, _) = process_resize(req_sixel, &mut resizer);
-        assert!(matches!(proto_sixel, ViewportProtocol::Sixel(_)));
+        let (proto_sixel_comp, _, _) = process_resize(req_sixel_comp, &mut resizer);
+        assert!(matches!(proto_sixel_comp, ViewportProtocol::Sixel(_)));
 
-        // 4. iTerm2 picker produces ViewportProtocol::Iterm2 (PNG and JPEG modes)
+        // 4. iTerm2 produces ViewportProtocol::Iterm2 (PNG and JPEG modes)
         let mut picker_iterm2 = Picker::halfblocks();
         picker_iterm2.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
         let req_iterm2_png = ResizeRequest {
@@ -1760,9 +1735,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
             sequence: 4,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Iterm2(Iterm2TransferMode::Png),
         };
         let (proto_iterm2_png, _, _) = process_resize(req_iterm2_png, &mut resizer);
         assert!(matches!(proto_iterm2_png, ViewportProtocol::Iterm2(_)));
@@ -1781,9 +1754,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (10, 10),
             sequence: 5,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: true,
+            protocol: ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg),
         };
         let (proto_iterm2_jpeg, _, _) = process_resize(req_iterm2_jpeg, &mut resizer);
         assert!(matches!(proto_iterm2_jpeg, ViewportProtocol::Iterm2(_)));
@@ -1813,9 +1784,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (50, 50),
             sequence: 1,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -1859,9 +1828,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (40, 40),
             sequence: 1,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -1902,9 +1869,7 @@ mod tests {
             contrast: Contrast::new(20.0),
             rendered_size_cells: (30, 30),
             sequence: 1,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
         let canvas_pos = render_resize_canvas(&req_pos, &mut resizer);
         assert_eq!(canvas_pos.width(), 60);
@@ -1934,9 +1899,7 @@ mod tests {
             contrast: Contrast::new(-20.0),
             rendered_size_cells: (30, 30),
             sequence: 2,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
         let canvas_neg = render_resize_canvas(&req_neg, &mut resizer);
         assert_eq!(canvas_neg.width(), 60);
@@ -2129,9 +2092,7 @@ mod tests {
             contrast: Contrast::new(25.0),
             rendered_size_cells: (40, 40),
             sequence: 1,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
         let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
         // Margin pixel at (0, 0) was never touched by apply_adjustments_lut
@@ -2164,9 +2125,7 @@ mod tests {
             contrast: Contrast::new(10.0),
             rendered_size_cells: (12, 10),
             sequence: 1,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
@@ -2195,9 +2154,7 @@ mod tests {
             contrast: Contrast::new(15.0),
             rendered_size_cells: (20, 20),
             sequence: 2,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
 
         let canvas_margin = render_resize_canvas(&req_margin, &mut resizer).to_rgba8();
@@ -3385,9 +3342,7 @@ mod tests {
             contrast: Contrast::ZERO,
             rendered_size_cells: (40, 20),
             sequence: seq,
-            use_kitty_shm: false,
-            use_kitty_compression: false,
-            use_iterm2_jpeg: false,
+            protocol: ActiveProtocol::Halfblocks,
         };
 
         // 1. Send stale request (seq 0 < active_seq 1) -> should be skipped

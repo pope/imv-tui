@@ -3,6 +3,10 @@ pub mod cli;
 /// Key definitions and crossterm matching logic.
 pub mod keys;
 
+pub use crate::imaging::{
+    ActiveProtocol, Iterm2TransferMode, KittyTransferMode, SixelTransferMode,
+};
+
 /// Position of the status infobar on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoBarPosition {
@@ -178,7 +182,8 @@ impl std::str::FromStr for SlideshowState {
 }
 
 /// Controls whether terminal graphics payloads use transport compression
-/// (zlib `o=z` deflate for Kitty, or quality-90 JPEG for opaque iTerm2 images).
+/// (zlib `o=z` deflate for Kitty, quality-90 JPEG for opaque iTerm2 images,
+/// or 128-color palette quantization for Sixel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionPolicy {
     /// Automatically enable compression only when running over a remote SSH session
@@ -218,7 +223,7 @@ impl CompressionPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolConfig {
     /// Auto-detect terminal protocol; if `--compress` was explicitly set,
-    /// `explicit_compress` is `Some(...)` and requires the detected protocol to be Kitty or iTerm2.
+    /// `explicit_compress` is `Some(...)` and requires the detected protocol to be Kitty, iTerm2, or Sixel.
     Auto {
         /// Explicit `--compress` (or `--kitty-compress`) override passed on the CLI, if any.
         explicit_compress: Option<CompressionPolicy>,
@@ -237,8 +242,11 @@ pub enum ProtocolConfig {
         /// Compression policy (`Auto` when `--compress` was omitted).
         compression: CompressionPolicy,
     },
-    /// Force DEC Sixel graphics protocol.
-    Sixel,
+    /// Force DEC Sixel graphics protocol with the specified compression policy.
+    Sixel {
+        /// Compression policy (`Auto` when `--compress` was omitted).
+        compression: CompressionPolicy,
+    },
     /// Force Unicode halfblocks fallback.
     Halfblocks,
 }
@@ -254,7 +262,7 @@ impl Default for ProtocolConfig {
 
 impl ProtocolConfig {
     /// Parses protocol configuration from CLI arguments, validating that protocol-specific options
-    /// like `--compress` (Kitty/iTerm2) and `--no-kitty-shm` (Kitty only) match the selected protocol.
+    /// like `--compress` (Kitty/iTerm2/Sixel) and `--no-kitty-shm` (Kitty only) match the selected protocol.
     pub fn from_cli(
         protocol: Option<ratatui_image::picker::ProtocolType>,
         explicit_compress: Option<CompressionPolicy>,
@@ -266,11 +274,12 @@ impl ProtocolConfig {
                     p,
                     ratatui_image::picker::ProtocolType::Kitty
                         | ratatui_image::picker::ProtocolType::Iterm2
+                        | ratatui_image::picker::ProtocolType::Sixel
                 )
             })
         {
             return Err(
-                "Error: Option --compress can only be used with the kitty or iterm2 protocol"
+                "Error: Option --compress can only be used with the kitty, iterm2, or sixel protocol"
                     .to_string(),
             );
         }
@@ -293,7 +302,9 @@ impl ProtocolConfig {
             Some(ratatui_image::picker::ProtocolType::Iterm2) => Ok(Self::Iterm2 {
                 compression: explicit_compress.unwrap_or(CompressionPolicy::Auto),
             }),
-            Some(ratatui_image::picker::ProtocolType::Sixel) => Ok(Self::Sixel),
+            Some(ratatui_image::picker::ProtocolType::Sixel) => Ok(Self::Sixel {
+                compression: explicit_compress.unwrap_or(CompressionPolicy::Auto),
+            }),
             Some(ratatui_image::picker::ProtocolType::Halfblocks) => Ok(Self::Halfblocks),
         }
     }
@@ -301,15 +312,15 @@ impl ProtocolConfig {
     /// Evaluates whether payload compression should be enabled for the configured protocol.
     pub fn should_enable_compression(self) -> bool {
         match self {
-            Self::Kitty { compression, .. } | Self::Iterm2 { compression } => {
-                compression.should_compress()
-            }
+            Self::Kitty { compression, .. }
+            | Self::Iterm2 { compression }
+            | Self::Sixel { compression } => compression.should_compress(),
             Self::Auto {
                 explicit_compress, ..
             } => explicit_compress
                 .unwrap_or(CompressionPolicy::Auto)
                 .should_compress(),
-            Self::Sixel | Self::Halfblocks => false,
+            Self::Halfblocks => false,
         }
     }
 
@@ -322,7 +333,7 @@ impl ProtocolConfig {
             } => explicit_compress
                 .unwrap_or(CompressionPolicy::Auto)
                 .should_compress(),
-            Self::Sixel | Self::Iterm2 { .. } | Self::Halfblocks => false,
+            Self::Sixel { .. } | Self::Iterm2 { .. } | Self::Halfblocks => false,
         }
     }
 
@@ -345,7 +356,7 @@ impl ProtocolConfig {
         match self {
             Self::Auto { .. } => None,
             Self::Kitty { .. } => Some(ratatui_image::picker::ProtocolType::Kitty),
-            Self::Sixel => Some(ratatui_image::picker::ProtocolType::Sixel),
+            Self::Sixel { .. } => Some(ratatui_image::picker::ProtocolType::Sixel),
             Self::Iterm2 { .. } => Some(ratatui_image::picker::ProtocolType::Iterm2),
             Self::Halfblocks => Some(ratatui_image::picker::ProtocolType::Halfblocks),
         }
@@ -367,10 +378,11 @@ impl ProtocolConfig {
                         detected,
                         ratatui_image::picker::ProtocolType::Kitty
                             | ratatui_image::picker::ProtocolType::Iterm2
+                            | ratatui_image::picker::ProtocolType::Sixel
                     )
                 {
                     return Err(format!(
-                        "Error: Option --compress was specified, but detected terminal protocol is {:?} (not Kitty or Iterm2)",
+                        "Error: Option --compress was specified, but detected terminal protocol is {:?} (not Kitty, Iterm2, or Sixel)",
                         detected
                     ));
                 }
@@ -397,7 +409,14 @@ impl ProtocolConfig {
                         };
                         Ok(ActiveProtocol::Iterm2(mode))
                     }
-                    ratatui_image::picker::ProtocolType::Sixel => Ok(ActiveProtocol::Sixel),
+                    ratatui_image::picker::ProtocolType::Sixel => {
+                        let mode = if compressed {
+                            SixelTransferMode::Compressed
+                        } else {
+                            SixelTransferMode::Full
+                        };
+                        Ok(ActiveProtocol::Sixel(mode))
+                    }
                     ratatui_image::picker::ProtocolType::Halfblocks => {
                         Ok(ActiveProtocol::Halfblocks)
                     }
@@ -419,116 +438,15 @@ impl ProtocolConfig {
                 };
                 Ok(ActiveProtocol::Iterm2(mode))
             }
-            Self::Sixel => Ok(ActiveProtocol::Sixel),
+            Self::Sixel { .. } => {
+                let mode = if compressed {
+                    SixelTransferMode::Compressed
+                } else {
+                    SixelTransferMode::Full
+                };
+                Ok(ActiveProtocol::Sixel(mode))
+            }
             Self::Halfblocks => Ok(ActiveProtocol::Halfblocks),
-        }
-    }
-}
-
-/// Transmission mode for the Kitty graphics protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KittyTransferMode {
-    /// Standard uncompressed inline Base64 transmission (`t=d`).
-    #[default]
-    Direct,
-    /// Zlib-compressed inline Base64 transmission (`o=z,t=d`).
-    Compressed,
-    /// Zero-copy POSIX shared memory transmission (`t=s`).
-    SharedMemory,
-}
-
-/// Transmission encoding mode for the iTerm2 inline image protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Iterm2TransferMode {
-    /// Lossless PNG (`Fast` + `Paeth`) inline transmission.
-    #[default]
-    Png,
-    /// Quality-90 JPEG inline transmission for opaque images (falls back to PNG when transparent).
-    Jpeg,
-}
-
-/// Active runtime terminal graphics protocol and its protocol-specific configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ActiveProtocol {
-    /// Kitty graphics protocol with its transmission mode.
-    Kitty(KittyTransferMode),
-    /// DEC Sixel graphics protocol.
-    Sixel,
-    /// iTerm2 inline images protocol with its encoding mode.
-    Iterm2(Iterm2TransferMode),
-    /// Unicode halfblock character fallback.
-    #[default]
-    Halfblocks,
-}
-
-impl ActiveProtocol {
-    #[cfg(test)]
-    /// Constructs an `ActiveProtocol` from a `ProtocolType` and a compression state.
-    pub fn from_protocol_type(
-        proto: ratatui_image::picker::ProtocolType,
-        compressed: bool,
-    ) -> Self {
-        match proto {
-            ratatui_image::picker::ProtocolType::Kitty => {
-                if compressed {
-                    Self::Kitty(KittyTransferMode::Compressed)
-                } else {
-                    Self::Kitty(KittyTransferMode::Direct)
-                }
-            }
-            ratatui_image::picker::ProtocolType::Sixel => Self::Sixel,
-            ratatui_image::picker::ProtocolType::Iterm2 => {
-                if compressed {
-                    Self::Iterm2(Iterm2TransferMode::Jpeg)
-                } else {
-                    Self::Iterm2(Iterm2TransferMode::Png)
-                }
-            }
-            ratatui_image::picker::ProtocolType::Halfblocks => Self::Halfblocks,
-        }
-    }
-
-    /// Returns an updated `ActiveProtocol` enabling or disabling Kitty shared memory transmission.
-    ///
-    /// Only upgrades `Self::Kitty(KittyTransferMode::Direct)` to `Self::Kitty(KittyTransferMode::SharedMemory)`
-    /// when `shm_supported` is `true` (never touching `Compressed`).
-    pub const fn with_kitty_shm(self, shm_supported: bool) -> Self {
-        match self {
-            Self::Kitty(KittyTransferMode::Direct) if shm_supported => {
-                Self::Kitty(KittyTransferMode::SharedMemory)
-            }
-            Self::Kitty(KittyTransferMode::SharedMemory) if !shm_supported => {
-                Self::Kitty(KittyTransferMode::Direct)
-            }
-            other => other,
-        }
-    }
-
-    /// Returns `true` if POSIX shared memory transmission is active.
-    pub const fn uses_kitty_shm(self) -> bool {
-        matches!(self, Self::Kitty(KittyTransferMode::SharedMemory))
-    }
-
-    /// Returns `true` if Kitty zlib transport compression (`o=z`) is active.
-    pub const fn uses_kitty_compression(self) -> bool {
-        matches!(self, Self::Kitty(KittyTransferMode::Compressed))
-    }
-
-    /// Returns `true` if iTerm2 JPEG compression is active for opaque images.
-    pub const fn uses_iterm2_jpeg(self) -> bool {
-        matches!(self, Self::Iterm2(Iterm2TransferMode::Jpeg))
-    }
-
-    /// Returns the descriptive label for Stats for Nerds, indicating compression or SHM only when active.
-    pub const fn display_label(self) -> &'static str {
-        match self {
-            Self::Kitty(KittyTransferMode::Direct) => "Kitty",
-            Self::Kitty(KittyTransferMode::Compressed) => "Kitty (Compressed)",
-            Self::Kitty(KittyTransferMode::SharedMemory) => "Kitty (SHM)",
-            Self::Sixel => "Sixel",
-            Self::Iterm2(Iterm2TransferMode::Png) => "Iterm2",
-            Self::Iterm2(Iterm2TransferMode::Jpeg) => "Iterm2 (JPEG)",
-            Self::Halfblocks => "Halfblocks",
         }
     }
 }

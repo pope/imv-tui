@@ -70,7 +70,7 @@ mod tests {
     use crate::commands::PromptType;
     use crate::config::{
         ActiveProtocol, Classification, InfoBarPosition, Iterm2TransferMode, KittyTransferMode,
-        SlideshowState,
+        SixelTransferMode, SlideshowState,
     };
     use crate::imaging::{Brightness, Contrast, PanOffset, ScaleMode};
     use ratatui::Terminal;
@@ -300,6 +300,30 @@ mod tests {
         terminal.draw(|f| ui(f, &mut model)).unwrap();
         let rendered_iterm2_jpeg = buffer_to_string(&terminal);
         assert!(rendered_iterm2_jpeg.contains("Iterm2 (JPEG)"));
+
+        // Test Sixel Full and Compressed display
+        if let OverlayModel::Info(InfoBoxModel::Populated {
+            ref mut active_protocol,
+            ..
+        }) = model.overlay
+        {
+            *active_protocol = ActiveProtocol::Sixel(SixelTransferMode::Full);
+        }
+        terminal.draw(|f| ui(f, &mut model)).unwrap();
+        let rendered_sixel_full = buffer_to_string(&terminal);
+        assert!(rendered_sixel_full.contains("Sixel"));
+        assert!(!rendered_sixel_full.contains("Sixel (Compressed)"));
+
+        if let OverlayModel::Info(InfoBoxModel::Populated {
+            ref mut active_protocol,
+            ..
+        }) = model.overlay
+        {
+            *active_protocol = ActiveProtocol::Sixel(SixelTransferMode::Compressed);
+        }
+        terminal.draw(|f| ui(f, &mut model)).unwrap();
+        let rendered_sixel_comp = buffer_to_string(&terminal);
+        assert!(rendered_sixel_comp.contains("Sixel (Compressed)"));
 
         // Test Skipped (Prefetched) when full image hit comes from prefetch cache with thumbnail = ThumbnailState::Skipped
         let prefetched_stats = StatsForNerds {

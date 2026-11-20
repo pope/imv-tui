@@ -21,8 +21,11 @@ const PARALLEL_PIXEL_THRESHOLD: usize = 65_536;
 /// Number of 5-5-5 RGB histogram / LUT entries (`32 * 32 * 32`).
 const RGB555_LEN: usize = 32_768;
 
-/// Maximum number of Sixel palette registers emitted.
+/// Maximum number of Sixel palette registers emitted in full mode.
 const MAX_PALETTE_COLORS: usize = 256;
+
+/// Maximum number of Sixel palette registers emitted in compressed mode.
+const COMPRESSED_PALETTE_COLORS: usize = 128;
 
 /// Alpha threshold at or above which an RGBA pixel is considered opaque.
 const ALPHA_OPAQUE_THRESHOLD: u8 = 128;
@@ -46,6 +49,9 @@ pub struct SixelProtocol {
 impl SixelProtocol {
     /// Encodes `canvas` into a Sixel escape sequence sized for `size` terminal cells.
     ///
+    /// When `compressed` is `true`, caps the quantized palette at 128 colors (instead of 256)
+    /// while keeping 4x4 Bayer ordered dithering enabled.
+    ///
     /// If `canvas` dimensions already match `size * font_size`, avoids any intermediate resize
     /// or full-buffer copy; otherwise crops/pads via `ratatui_image::Resize::Crop(None)`.
     pub fn new(
@@ -53,6 +59,7 @@ impl SixelProtocol {
         font_size: ratatui_image::FontSize,
         size: Size,
         is_tmux: bool,
+        compressed: bool,
     ) -> Result<Self, String> {
         if size.width == 0 || size.height == 0 {
             return Err("Target size has zero width or height".to_string());
@@ -74,6 +81,12 @@ impl SixelProtocol {
             return Err("Source image has zero width or height".to_string());
         }
 
+        let max_colors = if compressed {
+            COMPRESSED_PALETTE_COLORS
+        } else {
+            MAX_PALETTE_COLORS
+        };
+
         let data = match source {
             DynamicImage::ImageRgba8(img) => encode_sixel(
                 PixelBuffer::Rgba(img.as_raw()),
@@ -81,10 +94,16 @@ impl SixelProtocol {
                 height,
                 size,
                 is_tmux,
+                max_colors,
             ),
-            DynamicImage::ImageRgb8(img) => {
-                encode_sixel(PixelBuffer::Rgb(img.as_raw()), width, height, size, is_tmux)
-            }
+            DynamicImage::ImageRgb8(img) => encode_sixel(
+                PixelBuffer::Rgb(img.as_raw()),
+                width,
+                height,
+                size,
+                is_tmux,
+                max_colors,
+            ),
             other => {
                 let rgba = super::types::to_rgba8_fast(other);
                 encode_sixel(
@@ -93,6 +112,7 @@ impl SixelProtocol {
                     height,
                     size,
                     is_tmux,
+                    max_colors,
                 )
             }
         };
@@ -354,11 +374,11 @@ impl PartialOrd for ColorBox {
     }
 }
 
-/// Generates a palette of up to 256 RGB colors using weighted Median-Cut on non-empty histogram bins.
+/// Generates a palette of up to `max_colors` RGB colors using weighted Median-Cut on non-empty histogram bins.
 ///
 /// Returns an empty vector for all-transparent images and an exact unsplit palette when the
-/// image contains 256 or fewer unique 5-5-5 colors.
-fn build_palette_median_cut(hist: &[u32]) -> Vec<[u8; 3]> {
+/// image contains `max_colors` or fewer unique 5-5-5 colors.
+fn build_palette_median_cut(hist: &[u32], max_colors: usize) -> Vec<[u8; 3]> {
     let mut bins = Vec::with_capacity(4096);
     for (idx, &count) in hist.iter().enumerate() {
         if count > 0 {
@@ -374,17 +394,17 @@ fn build_palette_median_cut(hist: &[u32]) -> Vec<[u8; 3]> {
         }
     }
 
-    if bins.is_empty() {
+    if bins.is_empty() || max_colors == 0 {
         return Vec::new();
     }
-    if bins.len() <= MAX_PALETTE_COLORS {
+    if bins.len() <= max_colors {
         return bins.iter().map(|b| [b.r, b.g, b.b]).collect();
     }
 
-    let mut heap = BinaryHeap::with_capacity(MAX_PALETTE_COLORS);
+    let mut heap = BinaryHeap::with_capacity(max_colors);
     heap.push(ColorBox::from_slice(&bins, 0, bins.len()));
 
-    while heap.len() < MAX_PALETTE_COLORS {
+    while heap.len() < max_colors {
         let Some(cbox) = heap.pop() else {
             break;
         };
@@ -641,10 +661,11 @@ fn encode_sixel(
     height: usize,
     size: Size,
     is_tmux: bool,
+    max_colors: usize,
 ) -> String {
     let pixel_count = width * height;
     let hist = build_histogram(pixels, pixel_count);
-    let palette = build_palette_median_cut(&hist);
+    let palette = build_palette_median_cut(&hist, max_colors);
 
     let (start, escape, end) =
         ratatui_image::picker::cap_parser::Parser::tmux_start_escape_end(is_tmux);
@@ -858,7 +879,7 @@ mod tests {
     #[test]
     fn test_sixel_single_color_rgb_and_structure() {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 12, Rgb([255, 0, 0])));
-        let proto = SixelProtocol::new(&img, unit_font(), Size::new(16, 12), false)
+        let proto = SixelProtocol::new(&img, unit_font(), Size::new(16, 12), false, false)
             .expect("Sixel encode failed");
 
         let data = proto.data();
@@ -877,8 +898,14 @@ mod tests {
         for &h in &[1u32, 5, 6, 7, 13] {
             let w = if h == 1 { 1 } else { 9 };
             let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(w, h, Rgba([0, 255, 0, 255])));
-            let proto = SixelProtocol::new(&img, unit_font(), Size::new(w as u16, h as u16), false)
-                .expect("Sixel encode failed");
+            let proto = SixelProtocol::new(
+                &img,
+                unit_font(),
+                Size::new(w as u16, h as u16),
+                false,
+                false,
+            )
+            .expect("Sixel encode failed");
 
             let (dw, dh, palette, pixels) = decode_sixel_body(proto.data());
             assert_eq!((dw, dh), (w, h));
@@ -904,7 +931,7 @@ mod tests {
     fn test_sixel_transparency_and_all_transparent_image() {
         // 1. All-transparent image -> minimal valid Sixel sequence with 0 palette entries
         let empty = DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([100, 200, 50, 0])));
-        let proto_empty = SixelProtocol::new(&empty, unit_font(), Size::new(8, 8), false)
+        let proto_empty = SixelProtocol::new(&empty, unit_font(), Size::new(8, 8), false, false)
             .expect("Transparent Sixel encode failed");
         let (w, h, palette, pixels) = decode_sixel_body(proto_empty.data());
         assert_eq!((w, h), (8, 8));
@@ -919,7 +946,7 @@ mod tests {
             }
         }
         let img = DynamicImage::ImageRgba8(rgba);
-        let proto = SixelProtocol::new(&img, unit_font(), Size::new(8, 6), false)
+        let proto = SixelProtocol::new(&img, unit_font(), Size::new(8, 6), false, false)
             .expect("Partial transparent Sixel encode failed");
         let (w, h, palette, pixels) = decode_sixel_body(proto.data());
         assert_eq!((w, h), (8, 6));
@@ -942,7 +969,7 @@ mod tests {
             rgb.put_pixel(1, y, Rgb([255, 0, 0]));
         }
         let img = DynamicImage::ImageRgb8(rgb);
-        let proto = SixelProtocol::new(&img, unit_font(), Size::new(100, 6), false)
+        let proto = SixelProtocol::new(&img, unit_font(), Size::new(100, 6), false, false)
             .expect("Sixel encode failed");
 
         let data = proto.data();
@@ -990,7 +1017,8 @@ mod tests {
             height: 16,
         };
         let size = Size::new(40, 15);
-        let proto = SixelProtocol::new(&img, font, size, false).expect("Parallel Sixel failed");
+        let proto =
+            SixelProtocol::new(&img, font, size, false, false).expect("Parallel Sixel failed");
 
         let (w, h, palette, pixels) = decode_sixel_body(proto.data());
         assert_eq!((w, h), (320, 240));
@@ -1006,9 +1034,49 @@ mod tests {
     }
 
     #[test]
+    fn test_sixel_compressed_caps_palette_at_128_colors() {
+        // High-color gradient with > 256 unique 5-5-5 RGB colors
+        let mut rgb = RgbImage::new(64, 48);
+        for y in 0..48 {
+            for x in 0..64 {
+                let r = ((x * 255) / 63) as u8;
+                let g = ((y * 255) / 47) as u8;
+                let b = (((x + y) * 255) / 110) as u8;
+                rgb.put_pixel(x, y, Rgb([r, g, b]));
+            }
+        }
+        let img = DynamicImage::ImageRgb8(rgb);
+        let size = Size::new(64, 48);
+
+        let full = SixelProtocol::new(&img, unit_font(), size, false, false)
+            .expect("Full Sixel encode failed");
+        let compressed = SixelProtocol::new(&img, unit_font(), size, false, true)
+            .expect("Compressed Sixel encode failed");
+
+        let (fw, fh, full_palette, full_pixels) = decode_sixel_body(full.data());
+        assert_eq!((fw, fh), (64, 48));
+        assert!(
+            full_palette.len() > COMPRESSED_PALETTE_COLORS
+                && full_palette.len() <= MAX_PALETTE_COLORS,
+            "Expected full palette in (128, 256], got {}",
+            full_palette.len()
+        );
+        assert!(full_pixels.iter().all(|p| p.is_some()));
+
+        let (cw, ch, comp_palette, comp_pixels) = decode_sixel_body(compressed.data());
+        assert_eq!((cw, ch), (64, 48));
+        assert!(
+            !comp_palette.is_empty() && comp_palette.len() <= COMPRESSED_PALETTE_COLORS,
+            "Expected compressed palette in (0, 128], got {}",
+            comp_palette.len()
+        );
+        assert!(comp_pixels.iter().all(|p| p.is_some()));
+    }
+
+    #[test]
     fn test_sixel_tmux_passthrough_framing() {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 6, Rgb([255, 255, 255])));
-        let proto = SixelProtocol::new(&img, unit_font(), Size::new(4, 6), true)
+        let proto = SixelProtocol::new(&img, unit_font(), Size::new(4, 6), true, false)
             .expect("Tmux Sixel encode failed");
         let data = proto.data();
 
@@ -1034,7 +1102,8 @@ mod tests {
             height: 3,
         };
         let size = Size::new(2, 2);
-        let proto = SixelProtocol::new(&img, font, size, false).expect("Sixel encode failed");
+        let proto =
+            SixelProtocol::new(&img, font, size, false, false).expect("Sixel encode failed");
         assert_eq!(proto.size(), size);
 
         // 1. Render into a larger area
@@ -1061,7 +1130,7 @@ mod tests {
     #[test]
     fn test_sixel_zero_size_returns_error() {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 4, Rgb([0, 0, 0])));
-        assert!(SixelProtocol::new(&img, unit_font(), Size::new(0, 4), false).is_err());
-        assert!(SixelProtocol::new(&img, unit_font(), Size::new(4, 0), false).is_err());
+        assert!(SixelProtocol::new(&img, unit_font(), Size::new(0, 4), false, false).is_err());
+        assert!(SixelProtocol::new(&img, unit_font(), Size::new(4, 0), false, false).is_err());
     }
 }
