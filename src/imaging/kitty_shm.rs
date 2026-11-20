@@ -8,7 +8,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
 use std::num::NonZeroU16;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -16,6 +16,7 @@ use image::DynamicImage;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Rect, Size};
 use ratatui::style::Color;
+use rayon::prelude::*;
 
 /// Standard RFC 4648 Base64 encoding for ASCII byte sequences.
 pub fn encode_base64_ascii(bytes: &[u8]) -> String {
@@ -68,15 +69,64 @@ pub fn cleanup_all_kitty_shm_segments() {
     }
 }
 
-/// A POSIX shared memory segment holding raw RGBA pixel data for Kitty transmission.
+/// Minimum byte length before `KittyShmSegment::new` copies into the `mmap`'d SHM region
+/// in parallel across `rayon` worker threads.
+const PARALLEL_COPY_MIN_BYTES: usize = 256 * 1024;
+
+/// Minimum pixel count before `KittyShmSegment::new_packed_rgb` packs RGBA32 -> RGB24 directly
+/// into the `mmap`'d SHM region in parallel across `rayon` worker threads.
+const PARALLEL_PACK_MIN_PIXELS: usize = 65_536;
+
+/// RAII guard for a POSIX `mmap` mapping that unmaps the region on drop.
+struct MmapGuard {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl MmapGuard {
+    /// Returns a mutable byte slice covering the mapped region, binding the slice lifetime
+    /// to `&mut self` so `munmap` cannot run while the slice is live.
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `MmapGuard` is only constructed from a valid, non-null, non-`MAP_FAILED`
+        // `mmap` region of `self.len` writable bytes on an exclusively opened SHM object,
+        // and the returned slice borrows `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+impl Drop for MmapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
+}
+
+/// Packs a slice of 4-pixel RGBA blocks (`[u8; 16]`) into 4-pixel RGB blocks (`[u8; 12]`).
+#[inline]
+fn pack_rgba_blocks(in_blocks: &[[u8; 16]], out_blocks: &mut [[u8; 12]]) {
+    for (src, dst) in in_blocks.iter().zip(out_blocks.iter_mut()) {
+        *dst = [
+            src[0], src[1], src[2], src[4], src[5], src[6], src[8], src[9], src[10], src[12],
+            src[13], src[14],
+        ];
+    }
+}
+
+/// A POSIX shared memory segment holding raw RGB or RGBA pixel data for Kitty transmission.
 pub struct KittyShmSegment {
     c_name: CString,
     transmitted: AtomicBool,
 }
 
 impl KittyShmSegment {
-    /// Creates a new POSIX shared memory object and writes the raw pixel bytes into it.
-    pub fn new(raw_bytes: &[u8]) -> Result<Self, String> {
+    /// Creates a new POSIX shared memory object of `len` bytes and populates it via `fill`.
+    ///
+    /// Maps the shared memory object directly into the process address space with `mmap` so
+    /// callers can write (or parallelize writes via `rayon`) without an intermediate kernel
+    /// `write(2)` buffer copy, gracefully falling back to `write_all` if `mmap` fails.
+    pub fn create_and_fill(len: usize, fill: impl FnOnce(&mut [u8])) -> Result<Self, String> {
         let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
         let shm_name = format!("/imv-tui-{}-{}", std::process::id(), seq);
         let c_name =
@@ -97,32 +147,114 @@ impl KittyShmSegment {
             ));
         }
 
+        // Construct `segment` immediately after `shm_open` succeeds so its `Drop` impl
+        // automatically unlinks the SHM object on any early error or panic inside `fill`
+        // (in reverse drop order: `MmapGuard` munmap -> `File` close -> `segment` shm_unlink).
+        let segment = Self {
+            c_name,
+            transmitted: AtomicBool::new(false),
+        };
+
         let mut file = unsafe { File::from_raw_fd(fd) };
-        if let Err(e) = file.set_len(raw_bytes.len() as u64) {
-            unsafe {
-                libc::shm_unlink(c_name.as_ptr());
-            }
+        if let Err(e) = file.set_len(len as u64) {
             return Err(format!(
                 "Failed to set shm size for {}: {}",
-                c_name.to_str().unwrap_or(""),
+                segment.shm_name(),
                 e
             ));
         }
-        if let Err(e) = file.write_all(raw_bytes) {
-            unsafe {
-                libc::shm_unlink(c_name.as_ptr());
+
+        if len > 0 {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED || ptr.is_null() {
+                let mut buf = vec![0u8; len];
+                fill(&mut buf);
+                if let Err(e) = file.write_all(&buf) {
+                    return Err(format!(
+                        "Failed to write bytes to shm {}: {}",
+                        segment.shm_name(),
+                        e
+                    ));
+                }
+            } else {
+                let mut guard = MmapGuard { ptr, len };
+                fill(guard.as_mut_slice());
             }
-            return Err(format!(
-                "Failed to write bytes to shm {}: {}",
-                c_name.to_str().unwrap_or(""),
-                e
-            ));
+        } else {
+            fill(&mut []);
         }
         drop(file);
 
-        Ok(Self {
-            c_name,
-            transmitted: AtomicBool::new(false),
+        Ok(segment)
+    }
+
+    /// Creates a new POSIX shared memory object and writes the raw pixel bytes into it.
+    ///
+    /// Uses `rayon` parallel page-aligned `mmap` writes for payloads `>= 256 KiB` and a
+    /// direct `copy_from_slice` below that threshold.
+    pub fn new(raw_bytes: &[u8]) -> Result<Self, String> {
+        Self::create_and_fill(raw_bytes.len(), |mapped| {
+            if raw_bytes.len() >= PARALLEL_COPY_MIN_BYTES {
+                let target_slabs = rayon::current_num_threads().max(1) * 4;
+                // Align slab size to 4 KiB page boundaries so parallel workers fault
+                // disjoint tmpfs pages without contention.
+                let slab_size = raw_bytes.len().div_ceil(target_slabs).div_ceil(4096) * 4096;
+                mapped
+                    .par_chunks_mut(slab_size)
+                    .enumerate()
+                    .for_each(|(i, dst)| {
+                        let start = i * slab_size;
+                        dst.copy_from_slice(&raw_bytes[start..start + dst.len()]);
+                    });
+            } else {
+                mapped.copy_from_slice(raw_bytes);
+            }
+        })
+    }
+
+    /// Creates a new POSIX shared memory object by packing 32-bit RGBA (`[R, G, B, A]`) bytes
+    /// directly into packed 24-bit RGB (`[R, G, B]`) bytes inside the `mmap`'d SHM segment.
+    ///
+    /// Avoids allocating an intermediate RGB buffer and parallelizes 4-pixel (16 -> 12 byte)
+    /// block packing across `rayon` workers when `num_pixels >= 65_536`.
+    pub fn new_packed_rgb(rgba_bytes: &[u8]) -> Result<Self, String> {
+        let num_pixels = rgba_bytes.len() / 4;
+        let rgb_len = num_pixels * 3;
+        Self::create_and_fill(rgb_len, |mapped| {
+            let (in_chunks, in_rem) = rgba_bytes[..num_pixels * 4].as_chunks::<16>();
+            let (out_chunks, out_rem) = mapped.as_chunks_mut::<12>();
+
+            if num_pixels >= PARALLEL_PACK_MIN_PIXELS {
+                let target_slabs = rayon::current_num_threads().max(1) * 4;
+                let slab_blocks = out_chunks.len().div_ceil(target_slabs).max(1);
+                out_chunks.par_chunks_mut(slab_blocks).enumerate().for_each(
+                    |(slab_idx, dst_slab)| {
+                        let start = slab_idx * slab_blocks;
+                        let src_slab = &in_chunks[start..start + dst_slab.len()];
+                        pack_rgba_blocks(src_slab, dst_slab);
+                    },
+                );
+            } else {
+                pack_rgba_blocks(in_chunks, out_chunks);
+            }
+
+            for (src, dst) in in_rem
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(out_rem.as_chunks_mut::<3>().0.iter_mut())
+            {
+                *dst = [src[0], src[1], src[2]];
+            }
         })
     }
 
@@ -528,6 +660,10 @@ pub struct KittyShmProtocol {
 
 impl KittyShmProtocol {
     /// Creates a new `KittyShmProtocol` from a canvas image and target dimensions.
+    ///
+    /// Automatically selects `f=24` (RGB8) for opaque images (including zero-intermediate-allocation
+    /// RGBA32 -> RGB24 packing directly into the `mmap`'d `/dev/shm` segment) and `f=32` (RGBA8)
+    /// for images containing transparency.
     pub fn new(
         canvas: &DynamicImage,
         font_size: ratatui_image::FontSize,
@@ -541,26 +677,48 @@ impl KittyShmProtocol {
         let target_px_h = u32::from(size.height) * u32::from(font_size.height);
 
         let normalized;
-        let rgba = if canvas.width() == target_px_w && canvas.height() == target_px_h {
-            super::types::to_rgba8_fast(canvas)
+        let source = if canvas.width() == target_px_w && canvas.height() == target_px_h {
+            canvas
         } else {
             normalized = ratatui_image::Resize::Crop(None).resize(canvas, font_size, size, None);
-            super::types::to_rgba8_fast(&normalized)
+            &normalized
+        };
+
+        let width = source.width();
+        let height = source.height();
+        if width == 0 || height == 0 {
+            return Err("Source image has zero width or height".to_string());
+        }
+
+        let (segment, pixel_fmt) = match source {
+            DynamicImage::ImageRgb8(rgb) => (KittyShmSegment::new(rgb.as_raw())?, 24u8),
+            DynamicImage::ImageRgba8(rgba) => {
+                if super::types::is_rgba8_opaque(rgba.as_raw()) {
+                    (KittyShmSegment::new_packed_rgb(rgba.as_raw())?, 24u8)
+                } else {
+                    (KittyShmSegment::new(rgba.as_raw())?, 32u8)
+                }
+            }
+            other => {
+                let rgba = super::types::to_rgba8_fast(other);
+                if super::types::is_rgba8_opaque(rgba.as_raw()) {
+                    (KittyShmSegment::new_packed_rgb(rgba.as_raw())?, 24u8)
+                } else {
+                    (KittyShmSegment::new(rgba.as_raw())?, 32u8)
+                }
+            }
         };
 
         let id = next_kitty_id();
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let fg = Color::Rgb(id_r, id_g, id_b);
 
-        let segment = KittyShmSegment::new(rgba.as_raw())?;
         let b64_name = encode_base64_ascii(segment.shm_name().as_bytes());
 
         let (start, escape, end) =
             ratatui_image::picker::cap_parser::Parser::tmux_start_escape_end(is_tmux);
         let transmit_str = format!(
-            "{start}{escape}_Gq=2,i={id},a=T,U=1,f=32,t=s,s={w},v={h},m=0;{b64_name}{escape}\\{end}",
-            w = rgba.width(),
-            h = rgba.height(),
+            "{start}{escape}_Gq=2,i={id},a=T,U=1,f={pixel_fmt},t=s,s={width},v={height},m=0;{b64_name}{escape}\\{end}",
         );
 
         Ok(Self {
@@ -698,10 +856,21 @@ pub fn probe_kitty_shm_support(is_tmux: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::RgbaImage;
+    use image::{GrayAlphaImage, GrayImage, RgbImage, RgbaImage};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
     use ratatui_image::FontSize;
+    use std::io::Read;
+
+    fn read_shm_bytes(segment: &KittyShmSegment) -> Vec<u8> {
+        let fd = unsafe { libc::shm_open(segment.c_name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0, "Failed to open shm segment {}", segment.shm_name());
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)
+            .expect("Failed to read shm segment bytes");
+        out
+    }
 
     #[test]
     fn test_base64_ascii_rfc4648_test_vectors() {
@@ -721,27 +890,27 @@ mod tests {
 
     #[test]
     fn test_kitty_shm_protocol_lifecycle_transmission_and_drop_cleanup() {
-        let raw = vec![255u8; 10 * 10 * 4];
-        let img = DynamicImage::ImageRgba8(RgbaImage::from_raw(10, 10, raw.clone()).unwrap());
         let font_size = FontSize {
             width: 1,
             height: 1,
         };
         let size = Size::new(10, 10);
-
-        // 1. Create protocol: must create a valid POSIX shm segment with t=s transmission string
-        let proto =
-            KittyShmProtocol::new(&img, font_size, size, false).expect("SHM creation failed");
-        assert!(proto.transmit_str().contains("t=s"));
-        assert!(proto.transmit_str().contains("f=32"));
-        assert!(proto.transmit_str().contains("a=T,U=1"));
-        assert!(!proto.segment.is_transmitted());
-
-        // 2. Render to buffer: first render must inject transmission escape sequence into (0, 0)
         let area = Rect::new(0, 0, 10, 10);
+
+        // 1. Opaque ImageRgba8 must automatically select f=24 with t=s transmission string
+        let opaque_raw = vec![255u8; 10 * 10 * 4];
+        let opaque_img = DynamicImage::ImageRgba8(RgbaImage::from_raw(10, 10, opaque_raw).unwrap());
+        let proto_opaque = KittyShmProtocol::new(&opaque_img, font_size, size, false)
+            .expect("Opaque SHM creation failed");
+        assert!(proto_opaque.transmit_str().contains("t=s"));
+        assert!(proto_opaque.transmit_str().contains("f=24"));
+        assert!(proto_opaque.transmit_str().contains("a=T,U=1"));
+        assert!(!proto_opaque.segment.is_transmitted());
+
+        // First render must inject transmission escape sequence into (0, 0)
         let mut buf = Buffer::empty(area);
-        proto.render(area, &mut buf);
-        assert!(proto.segment.is_transmitted());
+        proto_opaque.render(area, &mut buf);
+        assert!(proto_opaque.segment.is_transmitted());
 
         let first_cell = &buf[(0, 0)];
         assert!(
@@ -757,9 +926,9 @@ mod tests {
         let second_cell = &buf[(1, 0)];
         assert_eq!(second_cell.symbol(), PLACEHOLDER.to_string());
 
-        // 3. Second render: one-shot transmission must NOT re-emit transmission escape sequence
+        // Second render: one-shot transmission must NOT re-emit transmission escape sequence
         let mut buf2 = Buffer::empty(area);
-        proto.render(area, &mut buf2);
+        proto_opaque.render(area, &mut buf2);
         let first_cell2 = &buf2[(0, 0)];
         assert!(
             !first_cell2.symbol().contains("_Gq=2"),
@@ -767,7 +936,28 @@ mod tests {
         );
         assert!(first_cell2.symbol().starts_with(PLACEHOLDER));
 
-        // 4. Verify unrendered segment is unlinked on Drop
+        // 2. Transparent ImageRgba8 must automatically select f=32
+        let mut transparent_raw = vec![255u8; 10 * 10 * 4];
+        transparent_raw[3] = 128;
+        let transparent_img =
+            DynamicImage::ImageRgba8(RgbaImage::from_raw(10, 10, transparent_raw).unwrap());
+        let proto_transparent = KittyShmProtocol::new(&transparent_img, font_size, size, false)
+            .expect("Transparent SHM creation failed");
+        assert!(proto_transparent.transmit_str().contains("t=s"));
+        assert!(proto_transparent.transmit_str().contains("f=32"));
+        assert!(proto_transparent.transmit_str().contains("a=T,U=1"));
+        assert!(!proto_transparent.segment.is_transmitted());
+
+        let mut buf3 = Buffer::empty(area);
+        proto_transparent.render(area, &mut buf3);
+        assert!(proto_transparent.segment.is_transmitted());
+        assert!(buf3[(0, 0)].symbol().contains("f=32"));
+
+        let mut buf4 = Buffer::empty(area);
+        proto_transparent.render(area, &mut buf4);
+        assert!(!buf4[(0, 0)].symbol().contains("_Gq=2"));
+
+        // 3. Verify unrendered segment is unlinked on Drop
         let unrendered_seg = KittyShmSegment::new(b"test unrendered bytes").unwrap();
         let unrendered_c_name = unrendered_seg.c_name.clone();
         let fd_open = unsafe { libc::shm_open(unrendered_c_name.as_ptr(), libc::O_RDONLY, 0) };
@@ -785,7 +975,246 @@ mod tests {
             "Unrendered shared memory segment must be unlinked on drop"
         );
 
-        // 5. Cleanup transmitted segments
+        // 4. Cleanup transmitted segments
         cleanup_all_kitty_shm_segments();
+    }
+
+    #[test]
+    fn test_kitty_shm_rgb8_small_and_parallel_readback() {
+        // Small (< 256 KiB sequential mmap copy path)
+        let small_w = 7u32;
+        let small_h = 5u32;
+        let small_raw: Vec<u8> = (0..(small_w * small_h * 3) as usize)
+            .map(|i| ((i * 37 + 13) & 0xFF) as u8)
+            .collect();
+        let small_img = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(small_w, small_h, small_raw.clone()).unwrap(),
+        );
+        let proto_small = KittyShmProtocol::new(
+            &small_img,
+            FontSize {
+                width: 1,
+                height: 1,
+            },
+            Size::new(small_w as u16, small_h as u16),
+            false,
+        )
+        .expect("Small RGB8 SHM creation failed");
+        assert!(proto_small.transmit_str().contains("f=24"));
+        assert!(proto_small.transmit_str().contains("s=7,v=5"));
+        assert_eq!(read_shm_bytes(&proto_small.segment), small_raw);
+        drop(proto_small);
+
+        // Large (>= 256 KiB parallel rayon mmap copy path: 400 * 300 * 3 = 360,000 bytes)
+        let large_w = 400u32;
+        let large_h = 300u32;
+        let large_raw: Vec<u8> = (0..(large_w * large_h * 3) as usize)
+            .map(|i| ((i * 53 + 7) & 0xFF) as u8)
+            .collect();
+        assert!(large_raw.len() >= PARALLEL_COPY_MIN_BYTES);
+        let large_img = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(large_w, large_h, large_raw.clone()).unwrap(),
+        );
+        let proto_large = KittyShmProtocol::new(
+            &large_img,
+            FontSize {
+                width: 4,
+                height: 3,
+            },
+            Size::new(100, 100),
+            false,
+        )
+        .expect("Large RGB8 SHM creation failed");
+        assert!(proto_large.transmit_str().contains("f=24"));
+        assert!(proto_large.transmit_str().contains("s=400,v=300"));
+        assert_eq!(read_shm_bytes(&proto_large.segment), large_raw);
+        drop(proto_large);
+    }
+
+    #[test]
+    fn test_kitty_shm_opaque_rgba8_small_and_parallel_packed_rgb_readback() {
+        // Tail remainder coverage for 0, 1, 2, 3 pixels via new_packed_rgb
+        for num_pixels in 0..=7usize {
+            let mut rgba = Vec::with_capacity(num_pixels * 4);
+            let mut expected_rgb = Vec::with_capacity(num_pixels * 3);
+            for p in 0..num_pixels {
+                let r = ((p * 29 + 1) & 0xFF) as u8;
+                let g = ((p * 43 + 2) & 0xFF) as u8;
+                let b = ((p * 61 + 3) & 0xFF) as u8;
+                rgba.extend_from_slice(&[r, g, b, 255]);
+                expected_rgb.extend_from_slice(&[r, g, b]);
+            }
+            let seg = KittyShmSegment::new_packed_rgb(&rgba).expect("Packed RGB SHM failed");
+            assert_eq!(read_shm_bytes(&seg), expected_rgb);
+            drop(seg);
+        }
+
+        // Small opaque ImageRgba8 with non-multiple-of-4 pixel count (7 * 5 = 35 pixels, 35 % 4 == 3)
+        let small_w = 7u32;
+        let small_h = 5u32;
+        let small_pixels = (small_w * small_h) as usize;
+        let mut small_rgba = Vec::with_capacity(small_pixels * 4);
+        let mut small_expected_rgb = Vec::with_capacity(small_pixels * 3);
+        for p in 0..small_pixels {
+            let r = ((p * 17 + 5) & 0xFF) as u8;
+            let g = ((p * 31 + 11) & 0xFF) as u8;
+            let b = ((p * 47 + 23) & 0xFF) as u8;
+            small_rgba.extend_from_slice(&[r, g, b, 255]);
+            small_expected_rgb.extend_from_slice(&[r, g, b]);
+        }
+        let small_img =
+            DynamicImage::ImageRgba8(RgbaImage::from_raw(small_w, small_h, small_rgba).unwrap());
+        let proto_small = KittyShmProtocol::new(
+            &small_img,
+            FontSize {
+                width: 1,
+                height: 1,
+            },
+            Size::new(small_w as u16, small_h as u16),
+            false,
+        )
+        .expect("Small opaque RGBA8 SHM creation failed");
+        assert!(proto_small.transmit_str().contains("f=24"));
+        assert!(proto_small.transmit_str().contains("s=7,v=5"));
+        assert_eq!(read_shm_bytes(&proto_small.segment), small_expected_rgb);
+        drop(proto_small);
+
+        // Large opaque ImageRgba8 (>= 65_536 pixels parallel rayon mmap pack path,
+        // 301 * 251 = 75_551 pixels, 75_551 % 4 == 3 to also exercise tail remainder)
+        let large_w = 301u32;
+        let large_h = 251u32;
+        let large_pixels = (large_w * large_h) as usize;
+        assert!(large_pixels >= PARALLEL_PACK_MIN_PIXELS);
+        assert_eq!(large_pixels % 4, 3);
+        let mut large_rgba = Vec::with_capacity(large_pixels * 4);
+        let mut large_expected_rgb = Vec::with_capacity(large_pixels * 3);
+        for p in 0..large_pixels {
+            let r = ((p * 13 + 3) & 0xFF) as u8;
+            let g = ((p * 29 + 7) & 0xFF) as u8;
+            let b = ((p * 59 + 19) & 0xFF) as u8;
+            large_rgba.extend_from_slice(&[r, g, b, 255]);
+            large_expected_rgb.extend_from_slice(&[r, g, b]);
+        }
+        let large_img =
+            DynamicImage::ImageRgba8(RgbaImage::from_raw(large_w, large_h, large_rgba).unwrap());
+        let proto_large = KittyShmProtocol::new(
+            &large_img,
+            FontSize {
+                width: 1,
+                height: 1,
+            },
+            Size::new(large_w as u16, large_h as u16),
+            false,
+        )
+        .expect("Large opaque RGBA8 SHM creation failed");
+        assert!(proto_large.transmit_str().contains("f=24"));
+        assert!(proto_large.transmit_str().contains("s=301,v=251"));
+        assert_eq!(read_shm_bytes(&proto_large.segment), large_expected_rgb);
+        drop(proto_large);
+    }
+
+    #[test]
+    fn test_kitty_shm_transparent_rgba8_small_and_parallel_readback() {
+        // Small transparent ImageRgba8 (< 256 KiB sequential mmap copy path)
+        let small_w = 7u32;
+        let small_h = 5u32;
+        let mut small_raw: Vec<u8> = (0..(small_w * small_h * 4) as usize)
+            .map(|i| {
+                if i % 4 == 3 {
+                    255
+                } else {
+                    ((i * 19 + 5) & 0xFF) as u8
+                }
+            })
+            .collect();
+        *small_raw.last_mut().unwrap() = 254;
+        let small_img = DynamicImage::ImageRgba8(
+            RgbaImage::from_raw(small_w, small_h, small_raw.clone()).unwrap(),
+        );
+        let proto_small = KittyShmProtocol::new(
+            &small_img,
+            FontSize {
+                width: 1,
+                height: 1,
+            },
+            Size::new(small_w as u16, small_h as u16),
+            false,
+        )
+        .expect("Small transparent RGBA8 SHM creation failed");
+        assert!(proto_small.transmit_str().contains("f=32"));
+        assert!(proto_small.transmit_str().contains("s=7,v=5"));
+        assert_eq!(read_shm_bytes(&proto_small.segment), small_raw);
+        drop(proto_small);
+
+        // Large transparent ImageRgba8 (>= 256 KiB parallel rayon mmap copy path:
+        // 300 * 300 * 4 = 360,000 bytes)
+        let large_w = 300u32;
+        let large_h = 300u32;
+        let mut large_raw: Vec<u8> = (0..(large_w * large_h * 4) as usize)
+            .map(|i| {
+                if i % 4 == 3 {
+                    255
+                } else {
+                    ((i * 41 + 9) & 0xFF) as u8
+                }
+            })
+            .collect();
+        assert!(large_raw.len() >= PARALLEL_COPY_MIN_BYTES);
+        let mid_alpha_idx = (large_raw.len() / 2) | 3;
+        large_raw[mid_alpha_idx] = 0;
+        let large_img = DynamicImage::ImageRgba8(
+            RgbaImage::from_raw(large_w, large_h, large_raw.clone()).unwrap(),
+        );
+        let proto_large = KittyShmProtocol::new(
+            &large_img,
+            FontSize {
+                width: 3,
+                height: 3,
+            },
+            Size::new(100, 100),
+            false,
+        )
+        .expect("Large transparent RGBA8 SHM creation failed");
+        assert!(proto_large.transmit_str().contains("f=32"));
+        assert!(proto_large.transmit_str().contains("s=300,v=300"));
+        assert_eq!(read_shm_bytes(&proto_large.segment), large_raw);
+        drop(proto_large);
+    }
+
+    #[test]
+    fn test_kitty_shm_other_dynamic_image_variants() {
+        let font_size = FontSize {
+            width: 1,
+            height: 1,
+        };
+        let size = Size::new(5, 3);
+
+        // Opaque Luma8 -> f=24 packed RGB
+        let luma_raw: Vec<u8> = (0..15u8).map(|v| v * 17).collect();
+        let luma_img =
+            DynamicImage::ImageLuma8(GrayImage::from_raw(5, 3, luma_raw.clone()).unwrap());
+        let proto_luma = KittyShmProtocol::new(&luma_img, font_size, size, false)
+            .expect("Luma8 SHM creation failed");
+        assert!(proto_luma.transmit_str().contains("f=24"));
+        let expected_rgb: Vec<u8> = luma_raw.iter().flat_map(|&l| [l, l, l]).collect();
+        assert_eq!(read_shm_bytes(&proto_luma.segment), expected_rgb);
+        drop(proto_luma);
+
+        // Transparent LumaA8 -> f=32 RGBA
+        let mut lumaa_raw = Vec::with_capacity(30);
+        let mut expected_rgba = Vec::with_capacity(60);
+        for i in 0..15u8 {
+            let l = i * 16;
+            let a = if i == 7 { 100 } else { 255 };
+            lumaa_raw.extend_from_slice(&[l, a]);
+            expected_rgba.extend_from_slice(&[l, l, l, a]);
+        }
+        let lumaa_img =
+            DynamicImage::ImageLumaA8(GrayAlphaImage::from_raw(5, 3, lumaa_raw).unwrap());
+        let proto_lumaa = KittyShmProtocol::new(&lumaa_img, font_size, size, false)
+            .expect("LumaA8 SHM creation failed");
+        assert!(proto_lumaa.transmit_str().contains("f=32"));
+        assert_eq!(read_shm_bytes(&proto_lumaa.segment), expected_rgba);
+        drop(proto_lumaa);
     }
 }
