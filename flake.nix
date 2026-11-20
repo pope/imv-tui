@@ -33,7 +33,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       sys-config =
@@ -80,30 +79,32 @@
             samply
             self.formatter.${system}
           ];
+          commonArgs = {
+            pname = "imv-tui";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+          };
         in
         {
           packages.${system} = rec {
-            imv-tui = pkgs.rustPlatform.buildRustPackage {
-              pname = "imv-tui";
-              version = "0.1.0";
-              src = ./.;
-              cargoLock = {
-                lockFile = ./Cargo.lock;
-              };
-              nativeBuildInputs = [ pkgs.llvmPackages.bintools ];
-            };
+            imv-tui = pkgs.rustPlatform.buildRustPackage (
+              commonArgs
+              // {
+                nativeBuildInputs = pkgs.lib.optionals (system == "x86_64-linux") [
+                  pkgs.llvmPackages.bintools
+                ];
+              }
+            );
             default = imv-tui;
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            imv-tui-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
-              pname = "imv-tui";
-              version = "0.1.0";
-              src = ./.;
-              cargoLock = {
-                lockFile = ./Cargo.lock;
-              };
-              target = "x86_64-unknown-linux-musl";
-            };
+            imv-tui-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage commonArgs;
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            imv-tui-static-aarch64 = pkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.rustPlatform.buildRustPackage commonArgs;
           };
           devShells.${system}.default = pkgs.mkShell {
             packages = packages ++ [
