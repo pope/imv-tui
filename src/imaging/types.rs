@@ -404,6 +404,7 @@ impl CropBox {
     }
 
     /// Calculates current width of the crop box.
+    #[cfg(test)]
     pub fn width(&self) -> u64 {
         (self.x2 - self.x1) as u64
     }
@@ -452,6 +453,126 @@ impl ImageIntersection {
     /// If true, the intersection is empty (no overlapping region).
     pub fn is_empty(&self) -> bool {
         self.x1 >= self.x2 || self.y1 >= self.y2
+    }
+}
+
+/// Validated non-empty floating-point source crop rectangle strictly clamped within
+/// the backing image buffer dimensions `(img_w, img_h)`.
+///
+/// Guarantees by construction:
+/// - `img_dims.width > 0` and `img_dims.height > 0`
+/// - `left`, `top`, `width`, `height` are finite
+/// - `0.0 <= left < img_dims.width as f64` and `0.0 <= top < img_dims.height as f64`
+/// - `width > 0.0` and `height > 0.0`
+/// - `left + width <= img_dims.width as f64` and `top + height <= img_dims.height as f64`
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceCropRect {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+    img_dims: PixelDimensions,
+}
+
+impl SourceCropRect {
+    /// Maps an `intersection` in `original_size` pixel space into `img_dims` pixel space.
+    ///
+    /// Returns `None` if `img_dims` is empty, `intersection` is empty, or `intersection`
+    /// lies completely outside the reference bounds. When `img_dims != original_size`
+    /// (thumbnail placeholder), coordinates are scaled independently along X and Y via
+    /// floating-point `(factor_x, factor_y)` so the sampled region matches normalized-UV
+    /// quad mapping without aspect-ratio distortion.
+    pub fn map_from_original(
+        intersection: ImageIntersection,
+        original_size: PixelDimensions,
+        img_dims: PixelDimensions,
+    ) -> Option<Self> {
+        if intersection.is_empty() || img_dims.is_empty() {
+            return None;
+        }
+
+        let img_w_f = img_dims.width as f64;
+        let img_h_f = img_dims.height as f64;
+
+        let (mut left, mut top, mut width, mut height) = if img_dims != original_size
+            && !original_size.is_empty()
+        {
+            if intersection.x1 >= original_size.width || intersection.y1 >= original_size.height {
+                return None;
+            }
+            let factor_x = img_w_f / original_size.width as f64;
+            let factor_y = img_h_f / original_size.height as f64;
+
+            let src_left = (intersection.x1 as f64 * factor_x).clamp(0.0, img_w_f);
+            let src_top = (intersection.y1 as f64 * factor_y).clamp(0.0, img_h_f);
+            let src_w = (intersection.width() as f64 * factor_x).min(img_w_f - src_left);
+            let src_h = (intersection.height() as f64 * factor_y).min(img_h_f - src_top);
+            (src_left, src_top, src_w, src_h)
+        } else {
+            if intersection.x1 >= img_dims.width || intersection.y1 >= img_dims.height {
+                return None;
+            }
+            let x2 = intersection.x2.min(img_dims.width);
+            let y2 = intersection.y2.min(img_dims.height);
+            if intersection.x1 >= x2 || intersection.y1 >= y2 {
+                return None;
+            }
+            (
+                intersection.x1 as f64,
+                intersection.y1 as f64,
+                (x2 - intersection.x1) as f64,
+                (y2 - intersection.y1) as f64,
+            )
+        };
+
+        if !left.is_finite() || !top.is_finite() || !width.is_finite() || !height.is_finite() {
+            return None;
+        }
+
+        if width <= 0.0 {
+            left = left.min((img_dims.width - 1) as f64);
+            width = (img_w_f - left).min(1.0);
+        } else if left + width > img_w_f {
+            width = f64::from_bits(width.to_bits().saturating_sub(1));
+        }
+
+        if height <= 0.0 {
+            top = top.min((img_dims.height - 1) as f64);
+            height = (img_h_f - top).min(1.0);
+        } else if top + height > img_h_f {
+            height = f64::from_bits(height.to_bits().saturating_sub(1));
+        }
+
+        debug_assert!(left >= 0.0 && left < img_w_f);
+        debug_assert!(top >= 0.0 && top < img_h_f);
+        debug_assert!(width > 0.0 && left + width <= img_w_f);
+        debug_assert!(height > 0.0 && top + height <= img_h_f);
+
+        Some(Self {
+            left,
+            top,
+            width,
+            height,
+            img_dims,
+        })
+    }
+
+    /// Returns the validated floating-point `(left, top, width, height)` crop tuple
+    /// suitable for `fast_image_resize::ResizeOptions::crop`.
+    pub const fn as_f64_tuple(self) -> (f64, f64, f64, f64) {
+        (self.left, self.top, self.width, self.height)
+    }
+
+    /// Converts the validated crop rectangle into safe, non-empty integer `(x, y, width, height)`
+    /// bounds strictly within the backing image dimensions for `DynamicImage::crop_imm`.
+    pub fn as_u32_bounds(self) -> (u32, u32, u32, u32) {
+        let x = (self.left.floor() as u32).min(self.img_dims.width - 1);
+        let y = (self.top.floor() as u32).min(self.img_dims.height - 1);
+        let max_w = self.img_dims.width - x;
+        let max_h = self.img_dims.height - y;
+        let w = (self.width.ceil() as u32).clamp(1, max_w);
+        let h = (self.height.ceil() as u32).clamp(1, max_h);
+        (x, y, w, h)
     }
 }
 
@@ -1679,5 +1800,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_source_crop_rect_invariants() {
+        let orig = PixelDimensions::new(4416, 2944);
+        let thumb = PixelDimensions::new(160, 104);
+
+        // Empty intersection or empty image returns None.
+        assert_eq!(
+            SourceCropRect::map_from_original(ImageIntersection::new(10, 10, 10, 20), orig, thumb),
+            None
+        );
+        assert_eq!(
+            SourceCropRect::map_from_original(
+                ImageIntersection::new(0, 0, 100, 100),
+                orig,
+                PixelDimensions::new(0, 104)
+            ),
+            None
+        );
+        // Out-of-bounds intersection returns None.
+        assert_eq!(
+            SourceCropRect::map_from_original(
+                ImageIntersection::new(4416, 0, 4500, 100),
+                orig,
+                thumb
+            ),
+            None
+        );
+        assert_eq!(
+            SourceCropRect::map_from_original(
+                ImageIntersection::new(160, 0, 200, 50),
+                thumb,
+                thumb
+            ),
+            None
+        );
+
+        // Full-image intersection maps cleanly to the entire thumbnail.
+        let full_thumb = SourceCropRect::map_from_original(
+            ImageIntersection::new(0, 0, 4416, 2944),
+            orig,
+            thumb,
+        )
+        .expect("full thumbnail crop should be valid");
+        let (l, t, w, h) = full_thumb.as_f64_tuple();
+        assert_eq!(l, 0.0);
+        assert_eq!(t, 0.0);
+        assert!((w - 160.0).abs() < 1e-9 && l + w <= 160.0);
+        assert!((h - 104.0).abs() < 1e-9 && t + h <= 104.0);
+        assert_eq!(full_thumb.as_u32_bounds(), (0, 0, 160, 104));
+
+        // Full-res identity mapping preserves exact integer coordinates.
+        let full_res = SourceCropRect::map_from_original(
+            ImageIntersection::new(100, 200, 1100, 800),
+            orig,
+            orig,
+        )
+        .expect("full-res crop should be valid");
+        assert_eq!(full_res.as_f64_tuple(), (100.0, 200.0, 1000.0, 600.0));
+        assert_eq!(full_res.as_u32_bounds(), (100, 200, 1000, 600));
+
+        // Extreme 1x1 pixel zoom at the bottom-right corner stays strictly in-bounds.
+        let corner_zoom = SourceCropRect::map_from_original(
+            ImageIntersection::new(4415, 2943, 4416, 2944),
+            orig,
+            thumb,
+        )
+        .expect("corner 1px zoom should produce valid SourceCropRect");
+        let (cl, ct, cw, ch) = corner_zoom.as_f64_tuple();
+        assert!((0.0..160.0).contains(&cl));
+        assert!((0.0..104.0).contains(&ct));
+        assert!(cw > 0.0 && cl + cw <= 160.0);
+        assert!(ch > 0.0 && ct + ch <= 104.0);
+        let (ux, uy, uw, uh) = corner_zoom.as_u32_bounds();
+        assert_eq!((ux, uy, uw, uh), (159, 103, 1, 1));
     }
 }

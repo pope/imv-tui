@@ -960,74 +960,59 @@ pub fn fast_resize(
     }
 }
 
+/// Resizes the validated `src_crop` region of `img` to exact `(target_w, target_h)` dimensions
+/// via `fast_resize`, falling back to `crop_imm` + `resize_exact` if needed.
+fn resize_cropped_source(
+    resizer: &mut fir::Resizer,
+    img: &DynamicImage,
+    src_crop: SourceCropRect,
+    target_w: u32,
+    target_h: u32,
+    filter_type: FilterType,
+) -> DynamicImage {
+    match fast_resize(
+        resizer,
+        img,
+        target_w,
+        target_h,
+        filter_type,
+        Some(src_crop.as_f64_tuple()),
+    ) {
+        Ok(resized) => resized,
+        Err(_) => {
+            let (x, y, w, h) = src_crop.as_u32_bounds();
+            img.crop_imm(x, y, w, h)
+                .resize_exact(target_w, target_h, filter_type.to_image_filter())
+        }
+    }
+}
+
 /// Renders the scaled and panned image onto the destination canvas, applying
 /// offscreen boundary margins, centering, and brightness/contrast adjustments.
 pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> DynamicImage {
-    // Map input crop/intersection coordinates from the full image space to the thumbnail space
-    // if the loaded image buffer is a thumbnail placeholder of different dimensions.
-    let (scale, crop, intersection) =
-        if req.img.width() != req.original_size.0 || req.img.height() != req.original_size.1 {
-            let factor_x = req.img.width() as f64 / req.original_size.0 as f64;
-            let factor_y = req.img.height() as f64 / req.original_size.1 as f64;
-
-            let crop_x1 = (req.crop.x1 as f64 * factor_x).round() as i64;
-            let crop_y1 = (req.crop.y1 as f64 * factor_y).round() as i64;
-            let crop_x2 = (req.crop.x2 as f64 * factor_x).round() as i64;
-            let crop_y2 = (req.crop.y2 as f64 * factor_y).round() as i64;
-            let scaled_crop = CropBox::new(crop_x1, crop_y1, crop_x2, crop_y2);
-
-            let inter_x1 =
-                ((req.intersection.x1 as f64 * factor_x).round() as u32).min(req.img.width());
-            let inter_y1 =
-                ((req.intersection.y1 as f64 * factor_y).round() as u32).min(req.img.height());
-            let inter_x2 =
-                ((req.intersection.x2 as f64 * factor_x).round() as u32).min(req.img.width());
-            let inter_y2 =
-                ((req.intersection.y2 as f64 * factor_y).round() as u32).min(req.img.height());
-            let scaled_inter = ImageIntersection::new(inter_x1, inter_y1, inter_x2, inter_y2);
-
-            let new_scale = req.target_w as f64 / scaled_crop.width().max(1) as f64;
-
-            (new_scale, scaled_crop, scaled_inter)
-        } else {
-            (req.scale, req.crop, req.intersection)
-        };
     let img_to_resize: &DynamicImage = &req.img;
+    let src_crop = SourceCropRect::map_from_original(
+        req.intersection,
+        PixelDimensions::new(req.original_size.0, req.original_size.1),
+        PixelDimensions::new(img_to_resize.width(), img_to_resize.height()),
+    );
 
-    if intersection.x1 as i64 == crop.x1
-        && intersection.x2 as i64 == crop.x2
-        && intersection.y1 as i64 == crop.y1
-        && intersection.y2 as i64 == crop.y2
+    if req.intersection.x1 as i64 == req.crop.x1
+        && req.intersection.x2 as i64 == req.crop.x2
+        && req.intersection.y1 as i64 == req.crop.y1
+        && req.intersection.y2 as i64 == req.crop.y2
     {
-        let crop_rect = Some((
-            intersection.x1 as f64,
-            intersection.y1 as f64,
-            intersection.width() as f64,
-            intersection.height() as f64,
-        ));
-        let mut canvas = match fast_resize(
+        let Some(src_crop) = src_crop else {
+            return DynamicImage::ImageRgba8(image::RgbaImage::new(req.target_w, req.target_h));
+        };
+        let mut canvas = resize_cropped_source(
             resizer,
             img_to_resize,
+            src_crop,
             req.target_w,
             req.target_h,
             req.filter_type,
-            crop_rect,
-        ) {
-            Ok(resized) => resized,
-            Err(_) => {
-                let cropped_part = img_to_resize.crop_imm(
-                    intersection.x1,
-                    intersection.y1,
-                    intersection.width(),
-                    intersection.height(),
-                );
-                cropped_part.resize(
-                    req.target_w,
-                    req.target_h,
-                    req.filter_type.to_image_filter(),
-                )
-            }
-        };
+        );
 
         if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
             apply_adjustments_lut(
@@ -1040,43 +1025,25 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
     } else {
         let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
 
-        if !intersection.is_empty() {
-            let target_inter_w = ((intersection.width() as f64 * scale).round() as u32).max(1);
-            let target_inter_h = ((intersection.height() as f64 * scale).round() as u32).max(1);
+        if let Some(src_crop) = src_crop {
+            let target_inter_w =
+                ((req.intersection.width() as f64 * req.scale).round() as u32).max(1);
+            let target_inter_h =
+                ((req.intersection.height() as f64 * req.scale).round() as u32).max(1);
 
-            let crop_rect = Some((
-                intersection.x1 as f64,
-                intersection.y1 as f64,
-                intersection.width() as f64,
-                intersection.height() as f64,
-            ));
-
-            let resized_part = match fast_resize(
+            let resized_part = resize_cropped_source(
                 resizer,
                 img_to_resize,
+                src_crop,
                 target_inter_w,
                 target_inter_h,
                 req.filter_type,
-                crop_rect,
-            ) {
-                Ok(resized) => resized,
-                Err(_) => {
-                    let cropped_part = img_to_resize.crop_imm(
-                        intersection.x1,
-                        intersection.y1,
-                        intersection.width(),
-                        intersection.height(),
-                    );
-                    cropped_part.resize(
-                        target_inter_w,
-                        target_inter_h,
-                        req.filter_type.to_image_filter(),
-                    )
-                }
-            };
+            );
 
-            let paste_x = ((intersection.x1 as i64 - crop.x1) as f64 * scale).round() as i64;
-            let paste_y = ((intersection.y1 as i64 - crop.y1) as f64 * scale).round() as i64;
+            let paste_x =
+                ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
+            let paste_y =
+                ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
 
             let paste_x =
                 paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;
@@ -3704,5 +3671,185 @@ mod tests {
         drop(loader_tx);
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    fn opaque_bounding_box(rgba: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut found = false;
+
+        for (x, y, px) in rgba.enumerate_pixels() {
+            if px[3] > 0 {
+                found = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        found.then_some((min_x, min_y, max_x, max_y))
+    }
+
+    #[test]
+    fn test_render_resize_canvas_mismatched_aspect_thumbnail_matches_full_res_bounds() {
+        let mut resizer = fir::Resizer::new();
+        let orig_w = 4416u32;
+        let orig_h = 2944u32;
+        let thumb_w = 160u32;
+        let thumb_h = 104u32;
+
+        // Solid opaque RGB images so every rendered image pixel has alpha == 255
+        // while viewport letterbox/pillarbox margins remain transparent (alpha == 0).
+        let full_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            orig_w,
+            orig_h,
+            image::Rgb([180, 120, 60]),
+        )));
+        let thumb_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            thumb_w,
+            thumb_h,
+            image::Rgb([180, 120, 60]),
+        )));
+        let picker = Picker::halfblocks();
+
+        // Test both letterboxed (4:3 viewport -> vertical margins) and pillarboxed
+        // (16:9 viewport like 1920x1080 -> horizontal margins) viewports.
+        for &(target_w, target_h) in &[(400u32, 300u32), (480u32, 270u32)] {
+            let scale = (target_w as f64 / orig_w as f64).min(target_h as f64 / orig_h as f64);
+            let crop_w = (target_w as f64 / scale).round() as i64;
+            let crop_h = (target_h as f64 / scale).round() as i64;
+            let crop_x1 = (orig_w as i64 - crop_w) / 2;
+            let crop_y1 = (orig_h as i64 - crop_h) / 2;
+            let crop = CropBox::new(crop_x1, crop_y1, crop_x1 + crop_w, crop_y1 + crop_h);
+            let intersection = ImageIntersection::new(0, 0, orig_w, orig_h);
+
+            let make_req = |img: Arc<DynamicImage>| ResizeRequest {
+                img,
+                original_size: (orig_w, orig_h),
+                scale,
+                crop,
+                intersection,
+                target_w,
+                target_h,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness: Brightness::ZERO,
+                contrast: Contrast::ZERO,
+                rendered_size_cells: (40, 20),
+                sequence: 1,
+                protocol: ActiveProtocol::Halfblocks,
+            };
+
+            let full_canvas =
+                render_resize_canvas(&make_req(Arc::clone(&full_img)), &mut resizer).to_rgba8();
+            let thumb_canvas =
+                render_resize_canvas(&make_req(Arc::clone(&thumb_img)), &mut resizer).to_rgba8();
+
+            let full_bbox = opaque_bounding_box(&full_canvas)
+                .expect("Full-res canvas must contain opaque pixels");
+            let thumb_bbox = opaque_bounding_box(&thumb_canvas)
+                .expect("Thumbnail canvas must contain opaque pixels");
+
+            assert_eq!(
+                thumb_bbox, full_bbox,
+                "Thumbnail (160x104) and full-res (4416x2944) must occupy the exact same \
+                 bounding box in {target_w}x{target_h} viewport"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_resize_canvas_mismatched_aspect_thumbnail_zoom_and_extreme_pan() {
+        let mut resizer = fir::Resizer::new();
+        let orig_w = 4416u32;
+        let orig_h = 2944u32;
+        let thumb_w = 160u32;
+        let thumb_h = 104u32;
+
+        // Quadrant-colored thumbnail:
+        // TL = Red, TR = Green, BL = Blue, BR = Yellow
+        let thumb_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            thumb_w,
+            thumb_h,
+            |x, y| match (x < thumb_w / 2, y < thumb_h / 2) {
+                (true, true) => image::Rgb([255, 0, 0]),
+                (false, true) => image::Rgb([0, 255, 0]),
+                (true, false) => image::Rgb([0, 0, 255]),
+                (false, false) => image::Rgb([255, 255, 0]),
+            },
+        )));
+        let picker = Picker::halfblocks();
+
+        // Zoomed-in full-viewport crops strictly inside each quadrant (intersection == crop).
+        let quadrant_cases = [
+            ("TL", (200u32, 200u32, 1200u32, 800u32), [255u8, 0, 0]),
+            ("TR", (3000, 200, 4000, 800), [0, 255, 0]),
+            ("BL", (200, 1800, 1200, 2400), [0, 0, 255]),
+            ("BR", (3000, 1800, 4000, 2400), [255, 255, 0]),
+        ];
+
+        for (label, (x1, y1, x2, y2), expected_rgb) in quadrant_cases {
+            let req = ResizeRequest {
+                img: Arc::clone(&thumb_img),
+                original_size: (orig_w, orig_h),
+                scale: 0.2,
+                crop: CropBox::new(x1 as i64, y1 as i64, x2 as i64, y2 as i64),
+                intersection: ImageIntersection::new(x1, y1, x2, y2),
+                target_w: 200,
+                target_h: 120,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness: Brightness::ZERO,
+                contrast: Contrast::ZERO,
+                rendered_size_cells: (20, 10),
+                sequence: 1,
+                protocol: ActiveProtocol::Halfblocks,
+            };
+
+            let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
+            assert_eq!(canvas.dimensions(), (200, 120));
+            let center = canvas.get_pixel(100, 60);
+            assert_eq!(
+                [center[0], center[1], center[2], center[3]],
+                [expected_rgb[0], expected_rgb[1], expected_rgb[2], 255],
+                "Quadrant {label} zoom sampled wrong region of mismatched-aspect thumbnail"
+            );
+        }
+
+        // Extreme 1x1 pixel zoom at top-left and bottom-right corners across filters must not panic.
+        let extreme_cases = [
+            ((0u32, 0u32, 1u32, 1u32), [255u8, 0, 0]),
+            ((orig_w - 1, orig_h - 1, orig_w, orig_h), [255, 255, 0]),
+        ];
+        for ((x1, y1, x2, y2), expected_rgb) in extreme_cases {
+            for filter in [FilterType::Nearest, FilterType::Linear, FilterType::Lanczos] {
+                let req = ResizeRequest {
+                    img: Arc::clone(&thumb_img),
+                    original_size: (orig_w, orig_h),
+                    scale: 64.0,
+                    crop: CropBox::new(x1 as i64, y1 as i64, x2 as i64, y2 as i64),
+                    intersection: ImageIntersection::new(x1, y1, x2, y2),
+                    target_w: 64,
+                    target_h: 64,
+                    filter_type: filter,
+                    picker: picker.clone(),
+                    brightness: Brightness::ZERO,
+                    contrast: Contrast::ZERO,
+                    rendered_size_cells: (8, 8),
+                    sequence: 2,
+                    protocol: ActiveProtocol::Halfblocks,
+                };
+                let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
+                assert_eq!(canvas.dimensions(), (64, 64));
+                let px = canvas.get_pixel(32, 32);
+                assert_eq!(
+                    [px[0], px[1], px[2], px[3]],
+                    [expected_rgb[0], expected_rgb[1], expected_rgb[2], 255],
+                    "Extreme 1x1 zoom ({x1},{y1}) with {filter:?} sampled unexpected color"
+                );
+            }
+        }
     }
 }
