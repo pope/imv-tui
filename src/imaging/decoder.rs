@@ -581,10 +581,7 @@ fn decode_single_payload_cancellable(
         img.apply_orientation(orientation);
     }
 
-    let img = match img {
-        image::DynamicImage::ImageRgb8(_) | image::DynamicImage::ImageRgba8(_) => img,
-        other => image::DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-    };
+    let img = normalize_decoded_image(img);
     let w = img.width();
     let h = img.height();
     let final_raw_dims = raw_dimensions.unwrap_or((w, h));
@@ -640,10 +637,7 @@ fn decode_jpeg_thumbnail_bytes(thumb_bytes: &[u8]) -> Option<DynamicImage> {
     } else {
         image::load_from_memory(thumb_bytes)
             .ok()
-            .map(|img| match img {
-                DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => img,
-                other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-            })
+            .map(normalize_decoded_image)
     }
 }
 
@@ -901,10 +895,7 @@ fn decode_thumbnail_and_dimensions_impl(
         }
 
         let cropped_thumb = crop_thumbnail_padding(thumb_img, raw_w, raw_h);
-        let final_thumb = match cropped_thumb {
-            DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => cropped_thumb,
-            other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-        };
+        let final_thumb = normalize_decoded_image(cropped_thumb);
 
         return Some((final_thumb, raw_w, raw_h));
     }
@@ -930,10 +921,7 @@ fn decode_thumbnail_and_dimensions_impl(
     }
 
     let cropped_thumb = crop_thumbnail_padding(thumb_img, raw_w, raw_h);
-    let final_thumb = match cropped_thumb {
-        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => cropped_thumb,
-        other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-    };
+    let final_thumb = normalize_decoded_image(cropped_thumb);
 
     Some((final_thumb, raw_w, raw_h))
 }
@@ -2166,5 +2154,85 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_opaque_rgba_png_decodes_to_rgb8_and_transparent_stays_rgba8() {
+        // 1. Opaque RGBA PNG (every pixel has alpha == 255) -> decoded as ImageRgb8
+        let opaque_rgba = image::RgbaImage::from_fn(19, 7, |x, y| {
+            image::Rgba([(x * 13) as u8, (y * 37) as u8, ((x + y) * 11) as u8, 255])
+        });
+        let expected_rgb = DynamicImage::ImageRgba8(opaque_rgba.clone()).into_rgb8();
+        let mut opaque_png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(opaque_rgba)
+            .write_to(
+                &mut std::io::Cursor::new(&mut opaque_png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let src_opaque = ImageSource::Local(PathBuf::from("opaque_rgba.png"));
+        let decoded_opaque =
+            decode_image_bytes(&opaque_png_bytes, &src_opaque).expect("opaque RGBA PNG decode");
+        match decoded_opaque.image.as_ref() {
+            DynamicImage::ImageRgb8(rgb) => {
+                assert_eq!(rgb.dimensions(), (19, 7));
+                assert_eq!(rgb.as_raw(), expected_rgb.as_raw());
+            }
+            other => panic!(
+                "Expected opaque RGBA PNG to decode as ImageRgb8, got {:?}",
+                other.color()
+            ),
+        }
+
+        // 2. Semi-transparent RGBA PNG (single pixel with alpha < 255) -> stays ImageRgba8
+        let mut trans_rgba = image::RgbaImage::from_fn(19, 7, |x, y| {
+            image::Rgba([(x * 13) as u8, (y * 37) as u8, ((x + y) * 11) as u8, 255])
+        });
+        trans_rgba.put_pixel(18, 6, image::Rgba([42, 84, 126, 200]));
+        let expected_rgba_raw = trans_rgba.as_raw().clone();
+        let mut trans_png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(trans_rgba)
+            .write_to(
+                &mut std::io::Cursor::new(&mut trans_png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let src_trans = ImageSource::Local(PathBuf::from("transparent_rgba.png"));
+        let decoded_trans =
+            decode_image_bytes(&trans_png_bytes, &src_trans).expect("transparent RGBA PNG decode");
+        match decoded_trans.image.as_ref() {
+            DynamicImage::ImageRgba8(rgba) => {
+                assert_eq!(rgba.dimensions(), (19, 7));
+                assert_eq!(rgba.as_raw(), &expected_rgba_raw);
+            }
+            other => panic!(
+                "Expected transparent RGBA PNG to stay ImageRgba8, got {:?}",
+                other.color()
+            ),
+        }
+
+        // 3. Grayscale Luma8 PNG -> decoded directly as ImageRgb8
+        let luma = image::GrayImage::from_fn(11, 5, |x, y| image::Luma([(x * 20 + y * 5) as u8]));
+        let mut luma_png_bytes = Vec::new();
+        DynamicImage::ImageLuma8(luma)
+            .write_to(
+                &mut std::io::Cursor::new(&mut luma_png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let src_luma = ImageSource::Local(PathBuf::from("gray.png"));
+        let decoded_luma = decode_image_bytes(&luma_png_bytes, &src_luma).expect("luma PNG decode");
+        assert!(matches!(*decoded_luma.image, DynamicImage::ImageRgb8(_)));
+
+        // 4. decode_jpeg_thumbnail_bytes fallback also normalizes opaque RGBA PNG to ImageRgb8
+        // while keeping transparent RGBA PNG as ImageRgba8
+        let thumb_opaque =
+            decode_jpeg_thumbnail_bytes(&opaque_png_bytes).expect("fallback opaque decode");
+        assert!(matches!(thumb_opaque, DynamicImage::ImageRgb8(_)));
+        let thumb_trans =
+            decode_jpeg_thumbnail_bytes(&trans_png_bytes).expect("fallback transparent decode");
+        assert!(matches!(thumb_trans, DynamicImage::ImageRgba8(_)));
     }
 }

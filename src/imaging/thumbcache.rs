@@ -10,8 +10,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::types::{
-    FilterType, into_rgba8_fast, maybe_reclaim_resizer_scratch, to_fir_resize_alg, to_rgba8_fast,
-    unpack_rgb24_to_rgba32,
+    FilterType, maybe_reclaim_resizer_scratch, normalize_decoded_image, to_fir_resize_alg,
+    to_rgba8_fast, unpack_rgb24_to_rgba32,
 };
 
 #[cfg(unix)]
@@ -684,10 +684,7 @@ pub fn load_cached_thumbnail_with_metadata(
             _ => continue,
         };
         let img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
-            Ok(loaded) => match loaded {
-                DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => loaded,
-                other => DynamicImage::ImageRgba8(into_rgba8_fast(other)),
-            },
+            Ok(loaded) => normalize_decoded_image(loaded),
             Err(_) => continue,
         };
         return Some(CachedThumbnail {

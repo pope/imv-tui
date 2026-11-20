@@ -749,6 +749,93 @@ pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
     rgba
 }
 
+/// Returns `true` if every RGBA8 pixel in `rgba` is fully opaque (`alpha == 0xFF`).
+///
+/// Processes 4 pixels (16 bytes) per iteration using bitwise AND across the 4 alpha lanes
+/// for auto-vectorization, exiting early on the first non-opaque chunk.
+/// Trailing incomplete pixel bytes (`rgba.len() % 4`) are ignored.
+pub fn is_rgba8_opaque(rgba: &[u8]) -> bool {
+    let num_pixels = rgba.len() / 4;
+    let (chunks, rem) = rgba[..num_pixels * 4].as_chunks::<16>();
+
+    for c in chunks {
+        if (c[3] & c[7] & c[11] & c[15]) != 0xFF {
+            return false;
+        }
+    }
+
+    for px in rem.as_chunks::<4>().0 {
+        if px[3] != 0xFF {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Packs 32-bit RGBA (`[R, G, B, A]`) bytes into packed 24-bit RGB (`[R, G, B]`) bytes
+/// using 4-pixel (16-byte -> 12-byte) unrolled block packing for SIMD auto-vectorization.
+pub fn pack_rgba32_to_rgb24(rgba: &[u8]) -> Vec<u8> {
+    let num_pixels = rgba.len() / 4;
+    let mut rgb = vec![0u8; num_pixels * 3];
+    let (in_chunks, in_rem) = rgba[..num_pixels * 4].as_chunks::<16>();
+    let (out_chunks, out_rem) = rgb.as_chunks_mut::<12>();
+
+    for (src, dst) in in_chunks.iter().zip(out_chunks.iter_mut()) {
+        *dst = [
+            src[0], src[1], src[2], src[4], src[5], src[6], src[8], src[9], src[10], src[12],
+            src[13], src[14],
+        ];
+    }
+
+    for (src, dst) in in_rem
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out_rem.as_chunks_mut::<3>().0.iter_mut())
+    {
+        *dst = [src[0], src[1], src[2]];
+    }
+
+    rgb
+}
+
+/// Strips redundant fully-opaque alpha channels from `DynamicImage::ImageRgba8` buffers,
+/// converting them to `DynamicImage::ImageRgb8` via SIMD-friendly packing.
+///
+/// Images that contain any pixel with `alpha < 255`, or that are already another variant,
+/// are returned untouched.
+pub fn strip_opaque_alpha(img: DynamicImage) -> DynamicImage {
+    match img {
+        DynamicImage::ImageRgba8(rgba) if is_rgba8_opaque(rgba.as_raw()) => {
+            let (w, h) = (rgba.width(), rgba.height());
+            let raw = pack_rgba32_to_rgb24(rgba.as_raw());
+            DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(w, h, raw).expect("valid RGB dimensions"),
+            )
+        }
+        other => other,
+    }
+}
+
+/// Normalizes a decoded `DynamicImage` into either `DynamicImage::ImageRgb8` (for opaque images)
+/// or `DynamicImage::ImageRgba8` (for images with transparency).
+///
+/// Formats without an alpha channel (e.g. `ImageLuma8`, `ImageRgb16`) are converted directly to
+/// `ImageRgb8`; `ImageRgba8` and other alpha-capable formats are checked via `strip_opaque_alpha`
+/// so opaque buffers avoid alpha premultiplication during resizing and use 25% less memory.
+pub fn normalize_decoded_image(img: DynamicImage) -> DynamicImage {
+    match img {
+        DynamicImage::ImageRgb8(_) => img,
+        DynamicImage::ImageRgba8(_) => strip_opaque_alpha(img),
+        DynamicImage::ImageLuma8(_)
+        | DynamicImage::ImageLuma16(_)
+        | DynamicImage::ImageRgb16(_)
+        | DynamicImage::ImageRgb32F(_) => DynamicImage::ImageRgb8(img.into_rgb8()),
+        other => strip_opaque_alpha(DynamicImage::ImageRgba8(into_rgba8_fast(other))),
+    }
+}
+
 /// Converts a `DynamicImage` into an `RgbaImage` by consuming it, utilizing SIMD-vectorized
 /// unpacking when the source is `DynamicImage::ImageRgb8` to avoid per-pixel allocations.
 pub fn into_rgba8_fast(img: DynamicImage) -> image::RgbaImage {
@@ -883,5 +970,130 @@ mod tests {
                 std::borrow::Cow::Owned(_) => panic!("Expected Cow::Borrowed for ImageRgba8"),
             }
         }
+    }
+
+    #[test]
+    fn test_is_rgba8_opaque_edge_cases_and_positions() {
+        // Empty slice is vacuously opaque
+        assert!(is_rgba8_opaque(&[]));
+
+        // Exhaustively test 1..=33 pixels: all opaque, and single non-opaque pixel at every position
+        for count in 1..=33 {
+            let mut rgba = Vec::with_capacity(count * 4);
+            for i in 0..count {
+                rgba.push(((i * 13) % 256) as u8);
+                rgba.push(((i * 29) % 256) as u8);
+                rgba.push(((i * 47) % 256) as u8);
+                rgba.push(255);
+            }
+            assert!(
+                is_rgba8_opaque(&rgba),
+                "All-opaque buffer of {count} pixels must report opaque"
+            );
+
+            // Test start, middle, end, and every pixel index (covers all 4 SIMD lanes + tail)
+            for pos in 0..count {
+                rgba[pos * 4 + 3] = 254;
+                assert!(
+                    !is_rgba8_opaque(&rgba),
+                    "Buffer of {count} pixels with alpha=254 at pixel {pos} must report non-opaque"
+                );
+                rgba[pos * 4 + 3] = 0;
+                assert!(
+                    !is_rgba8_opaque(&rgba),
+                    "Buffer of {count} pixels with alpha=0 at pixel {pos} must report non-opaque"
+                );
+                rgba[pos * 4 + 3] = 255;
+            }
+        }
+    }
+
+    #[test]
+    fn test_pack_rgba32_to_rgb24_round_trip_and_into_rgb8_equivalence() {
+        let pixel_counts = [0, 1, 2, 3, 4, 5, 7, 16, 19, 33];
+
+        for &count in &pixel_counts {
+            let mut rgb_orig = Vec::with_capacity(count * 3);
+            let mut rgba_varied_alpha = Vec::with_capacity(count * 4);
+            for i in 0..count {
+                let r = ((i * 7 + 13) % 256) as u8;
+                let g = ((i * 11 + 47) % 256) as u8;
+                let b = ((i * 13 + 89) % 256) as u8;
+                let a = ((i * 17 + 3) % 256) as u8;
+                rgb_orig.extend_from_slice(&[r, g, b]);
+                rgba_varied_alpha.extend_from_slice(&[r, g, b, a]);
+            }
+
+            // Round-trip: rgb -> unpack -> pack -> rgb
+            let unpacked = unpack_rgb24_to_rgba32(&rgb_orig);
+            let repacked = pack_rgba32_to_rgb24(&unpacked);
+            assert_eq!(repacked, rgb_orig);
+
+            // Packing RGBA with arbitrary alpha drops alpha and matches DynamicImage::into_rgb8()
+            let packed = pack_rgba32_to_rgb24(&rgba_varied_alpha);
+            assert_eq!(packed, rgb_orig);
+
+            if count > 0 {
+                let rgba_img =
+                    image::RgbaImage::from_raw(count as u32, 1, rgba_varied_alpha).unwrap();
+                let std_rgb = DynamicImage::ImageRgba8(rgba_img).into_rgb8();
+                assert_eq!(packed, std_rgb.into_raw());
+            }
+        }
+    }
+
+    #[test]
+    fn test_strip_opaque_alpha_and_normalize_decoded_image() {
+        // 1. Opaque ImageRgba8 -> ImageRgb8 with identical RGB pixels
+        let opaque_rgba = image::RgbaImage::from_fn(7, 5, |x, y| {
+            image::Rgba([(x * 31) as u8, (y * 47) as u8, ((x + y) * 19) as u8, 255])
+        });
+        let expected_rgb = DynamicImage::ImageRgba8(opaque_rgba.clone()).into_rgb8();
+        let stripped = strip_opaque_alpha(DynamicImage::ImageRgba8(opaque_rgba));
+        match stripped {
+            DynamicImage::ImageRgb8(rgb) => assert_eq!(rgb.as_raw(), expected_rgb.as_raw()),
+            other => panic!(
+                "Expected ImageRgb8 for opaque RGBA8, got {:?}",
+                other.color()
+            ),
+        }
+
+        // 2. Semi-transparent ImageRgba8 (single pixel alpha < 255) -> preserved as ImageRgba8
+        let mut trans_rgba = image::RgbaImage::from_fn(7, 5, |x, y| {
+            image::Rgba([(x * 31) as u8, (y * 47) as u8, 128, 255])
+        });
+        trans_rgba.put_pixel(6, 4, image::Rgba([10, 20, 30, 254]));
+        let expected_rgba_raw = trans_rgba.as_raw().clone();
+        let preserved = strip_opaque_alpha(DynamicImage::ImageRgba8(trans_rgba));
+        match preserved {
+            DynamicImage::ImageRgba8(rgba) => assert_eq!(rgba.as_raw(), &expected_rgba_raw),
+            other => panic!(
+                "Expected ImageRgba8 to be preserved when alpha < 255, got {:?}",
+                other.color()
+            ),
+        }
+
+        // 3. Existing ImageRgb8 passes through untouched
+        let rgb_img = image::RgbImage::from_fn(5, 3, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 60) as u8, 99])
+        });
+        let rgb_raw = rgb_img.as_raw().clone();
+        match strip_opaque_alpha(DynamicImage::ImageRgb8(rgb_img)) {
+            DynamicImage::ImageRgb8(rgb) => assert_eq!(rgb.as_raw(), &rgb_raw),
+            other => panic!("Expected ImageRgb8 unchanged, got {:?}", other.color()),
+        }
+
+        // 4. normalize_decoded_image converts Luma8 to ImageRgb8 and preserves transparent LumaA8 as ImageRgba8
+        let luma = image::GrayImage::from_fn(4, 4, |x, y| image::Luma([(x * 50 + y * 10) as u8]));
+        let norm_luma = normalize_decoded_image(DynamicImage::ImageLuma8(luma));
+        assert!(matches!(norm_luma, DynamicImage::ImageRgb8(_)));
+
+        let mut luma_a = image::GrayAlphaImage::from_fn(4, 4, |x, _| image::LumaA([x as u8, 255]));
+        let norm_opaque_la = normalize_decoded_image(DynamicImage::ImageLumaA8(luma_a.clone()));
+        assert!(matches!(norm_opaque_la, DynamicImage::ImageRgb8(_)));
+
+        luma_a.put_pixel(3, 3, image::LumaA([42, 128]));
+        let norm_trans_la = normalize_decoded_image(DynamicImage::ImageLumaA8(luma_a));
+        assert!(matches!(norm_trans_la, DynamicImage::ImageRgba8(_)));
     }
 }
