@@ -21,6 +21,8 @@ pub use kitty_shm::*;
 pub mod protocol;
 pub use protocol::*;
 
+pub mod iterm2;
+
 pub mod sixel;
 
 #[cfg(test)]

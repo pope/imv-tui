@@ -207,6 +207,7 @@ impl App {
                 rendered_size_cells: rendered_cells,
                 sequence: self.current_sequence,
                 use_kitty_shm: self.active_protocol.uses_kitty_shm(),
+                use_iterm2_jpeg: self.active_protocol.uses_iterm2_jpeg(),
             };
 
             let sent = self.resize_tx.send(req).is_ok();

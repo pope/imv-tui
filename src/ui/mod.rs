@@ -69,7 +69,8 @@ mod tests {
     use super::*;
     use crate::commands::PromptType;
     use crate::config::{
-        ActiveProtocol, Classification, InfoBarPosition, KittyTransferMode, SlideshowState,
+        ActiveProtocol, Classification, InfoBarPosition, Iterm2TransferMode, KittyTransferMode,
+        SlideshowState,
     };
     use crate::imaging::{Brightness, Contrast, PanOffset, ScaleMode};
     use ratatui::Terminal;
@@ -275,6 +276,30 @@ mod tests {
         let rendered_kitty_shm = buffer_to_string(&terminal);
         assert!(rendered_kitty_shm.contains("Kitty (SHM)"));
         assert!(rendered_kitty_shm.contains("Thumbnail Load: N/A"));
+
+        // Test iTerm2 PNG and JPEG display
+        if let OverlayModel::Info(InfoBoxModel::Populated {
+            ref mut active_protocol,
+            ..
+        }) = model.overlay
+        {
+            *active_protocol = ActiveProtocol::Iterm2(Iterm2TransferMode::Png);
+        }
+        terminal.draw(|f| ui(f, &mut model)).unwrap();
+        let rendered_iterm2_png = buffer_to_string(&terminal);
+        assert!(rendered_iterm2_png.contains("Iterm2"));
+        assert!(!rendered_iterm2_png.contains("(JPEG)"));
+
+        if let OverlayModel::Info(InfoBoxModel::Populated {
+            ref mut active_protocol,
+            ..
+        }) = model.overlay
+        {
+            *active_protocol = ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg);
+        }
+        terminal.draw(|f| ui(f, &mut model)).unwrap();
+        let rendered_iterm2_jpeg = buffer_to_string(&terminal);
+        assert!(rendered_iterm2_jpeg.contains("Iterm2 (JPEG)"));
 
         // Test Skipped (Prefetched) when full image hit comes from prefetch cache with thumbnail = ThumbnailState::Skipped
         let prefetched_stats = StatsForNerds {

@@ -16,7 +16,8 @@ fn test_cli_help_flag() {
     assert!(stdout.contains("Usage: imv-tui [path] [options]"));
     assert!(stdout.contains("Options:"));
     assert!(stdout.contains("-f, --filter"));
-    assert!(stdout.contains("--kitty-compress"));
+    assert!(stdout.contains("--compress"));
+    assert!(stdout.contains("--no-kitty-shm"));
     assert!(stdout.contains("-v, --version"));
 
     // Also test short -h flag
@@ -110,24 +111,28 @@ fn test_cli_invalid_flags() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("requires a positive integer argument"));
 
-    // Invalid kitty-compress
-    let output = Command::new(env!("CARGO_BIN_EXE_imv-tui"))
-        .args(["--kitty-compress", "invalid_mode"])
-        .output()
-        .expect("Failed to execute process");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Unknown kitty-compress mode 'invalid_mode'"));
+    // Invalid --compress and --kitty-compress alias
+    for flag in ["--compress", "--kitty-compress"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_imv-tui"))
+            .args([flag, "invalid_mode"])
+            .output()
+            .expect("Failed to execute process");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Unknown compress mode 'invalid_mode'"));
+    }
 
-    // Incompatible --kitty-compress with non-kitty protocol
+    // Incompatible --compress with non-kitty/non-iterm2 protocol
     let output = Command::new(env!("CARGO_BIN_EXE_imv-tui"))
-        .args(["--protocol", "sixel", "--kitty-compress", "always"])
+        .args(["--protocol", "sixel", "--compress", "always"])
         .output()
         .expect("Failed to execute process");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Error: Option --kitty-compress can only be used with the kitty protocol")
+        stderr.contains(
+            "Error: Option --compress can only be used with the kitty or iterm2 protocol"
+        )
     );
 }
 

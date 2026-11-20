@@ -14,6 +14,7 @@ use super::decoder::{
     CancellationToken, decode_image_bytes_with_header_cancellable,
     decode_thumbnail_and_dimensions_for_mode,
 };
+use super::iterm2::Iterm2Protocol;
 use super::kitty_shm::KittyShmProtocol;
 use super::protocol::ViewportProtocol;
 use super::raw::{
@@ -60,6 +61,8 @@ pub struct ResizeRequest {
     pub sequence: u64,
     /// Whether POSIX shared memory (`t=s`) should be used for Kitty protocol rendering.
     pub use_kitty_shm: bool,
+    /// Whether quality-90 JPEG encoding should be used for opaque iTerm2 protocol images.
+    pub use_iterm2_jpeg: bool,
 }
 
 /// A response payload sent by the resizing worker thread.
@@ -1112,6 +1115,25 @@ pub fn process_resize(
                 ViewportProtocol::Standard(p)
             }
         }
+    } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Iterm2 {
+        match Iterm2Protocol::new(
+            &canvas,
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+            req.use_iterm2_jpeg,
+        ) {
+            Ok(iterm2_proto) => ViewportProtocol::Iterm2(iterm2_proto),
+            Err(_) => {
+                let mut p = req.picker.new_resize_protocol(canvas);
+                ratatui_image::ResizeEncodeRender::resize_encode(
+                    &mut p,
+                    &ratatui_image::Resize::Crop(None),
+                    target_size,
+                );
+                ViewportProtocol::Standard(p)
+            }
+        }
     } else {
         let mut p = req.picker.new_resize_protocol(canvas);
         ratatui_image::ResizeEncodeRender::resize_encode(
@@ -1509,6 +1531,7 @@ mod tests {
             rendered_size_cells: (5, 3),
             sequence: 1,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -1556,6 +1579,7 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 1,
             use_kitty_shm: true,
+            use_iterm2_jpeg: false,
         };
         let (proto_fallback, _, _) = process_resize(req_fallback, &mut resizer);
         assert!(matches!(proto_fallback, ViewportProtocol::Standard(_)));
@@ -1578,6 +1602,7 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 2,
             use_kitty_shm: true,
+            use_iterm2_jpeg: false,
         };
         let (proto_shm, _, _) = process_resize(req_shm, &mut resizer);
         assert!(matches!(proto_shm, ViewportProtocol::KittyShm(_)));
@@ -1600,9 +1625,53 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 3,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
         let (proto_sixel, _, _) = process_resize(req_sixel, &mut resizer);
         assert!(matches!(proto_sixel, ViewportProtocol::Sixel(_)));
+
+        // 4. iTerm2 picker produces ViewportProtocol::Iterm2 (PNG and JPEG modes)
+        let mut picker_iterm2 = Picker::halfblocks();
+        picker_iterm2.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+        let req_iterm2_png = ResizeRequest {
+            img: Arc::new(make_test_image(80, 80)),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_iterm2.clone(),
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 4,
+            use_kitty_shm: false,
+            use_iterm2_jpeg: false,
+        };
+        let (proto_iterm2_png, _, _) = process_resize(req_iterm2_png, &mut resizer);
+        assert!(matches!(proto_iterm2_png, ViewportProtocol::Iterm2(_)));
+
+        let req_iterm2_jpeg = ResizeRequest {
+            img: Arc::new(make_test_image(80, 80)),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_iterm2,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 5,
+            use_kitty_shm: false,
+            use_iterm2_jpeg: true,
+        };
+        let (proto_iterm2_jpeg, _, _) = process_resize(req_iterm2_jpeg, &mut resizer);
+        assert!(matches!(proto_iterm2_jpeg, ViewportProtocol::Iterm2(_)));
 
         cleanup_all_kitty_shm_segments();
     }
@@ -1630,6 +1699,7 @@ mod tests {
             rendered_size_cells: (50, 50),
             sequence: 1,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -1674,6 +1744,7 @@ mod tests {
             rendered_size_cells: (40, 40),
             sequence: 1,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer);
@@ -1715,6 +1786,7 @@ mod tests {
             rendered_size_cells: (30, 30),
             sequence: 1,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
         let canvas_pos = render_resize_canvas(&req_pos, &mut resizer);
         assert_eq!(canvas_pos.width(), 60);
@@ -1745,6 +1817,7 @@ mod tests {
             rendered_size_cells: (30, 30),
             sequence: 2,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
         let canvas_neg = render_resize_canvas(&req_neg, &mut resizer);
         assert_eq!(canvas_neg.width(), 60);
@@ -1938,6 +2011,7 @@ mod tests {
             rendered_size_cells: (40, 40),
             sequence: 1,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
         let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
         // Margin pixel at (0, 0) was never touched by apply_adjustments_lut
@@ -1971,6 +2045,7 @@ mod tests {
             rendered_size_cells: (12, 10),
             sequence: 1,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
 
         let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
@@ -2000,6 +2075,7 @@ mod tests {
             rendered_size_cells: (20, 20),
             sequence: 2,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
 
         let canvas_margin = render_resize_canvas(&req_margin, &mut resizer).to_rgba8();
@@ -3188,6 +3264,7 @@ mod tests {
             rendered_size_cells: (40, 20),
             sequence: seq,
             use_kitty_shm: false,
+            use_iterm2_jpeg: false,
         };
 
         // 1. Send stale request (seq 0 < active_seq 1) -> should be skipped

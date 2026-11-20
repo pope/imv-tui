@@ -1,4 +1,4 @@
-pub use super::{KittyCompression, ProtocolConfig};
+pub use super::{CompressionPolicy, ProtocolConfig};
 use crate::config::{InfoBarPosition, SlideshowState};
 use crate::imaging::{FilterType, ScaleMode};
 use ratatui_image::picker::ProtocolType;
@@ -137,7 +137,7 @@ where
     let mut initial_path: Option<PathBuf> = None;
     let mut filter = FilterType::Nearest;
     let mut raw_protocol: Option<ProtocolType> = None;
-    let mut explicit_kitty_compress: Option<KittyCompression> = None;
+    let mut explicit_compress: Option<CompressionPolicy> = None;
     let mut disable_kitty_shm = false;
     let mut scale = ScaleMode::Shrink;
     let mut slideshow = None;
@@ -235,21 +235,21 @@ where
                 disable_kitty_shm = true;
                 i += 1;
             }
-            "--kitty-compress" => {
+            "--compress" | "--kitty-compress" => {
                 let flag = args[i].clone();
                 let val = get_arg(&args, &mut i, &flag)?;
                 let mode = match val.to_lowercase().as_str() {
-                    "auto" => KittyCompression::Auto,
-                    "always" => KittyCompression::Always,
-                    "never" => KittyCompression::Never,
+                    "auto" => CompressionPolicy::Auto,
+                    "always" => CompressionPolicy::Always,
+                    "never" => CompressionPolicy::Never,
                     other => {
                         return Err(format!(
-                            "Error: Unknown kitty-compress mode '{}'. Choose from: auto, always, never",
+                            "Error: Unknown compress mode '{}'. Choose from: auto, always, never",
                             other
                         ));
                     }
                 };
-                explicit_kitty_compress = Some(mode);
+                explicit_compress = Some(mode);
             }
             "--infobar" => {
                 let flag = args[i].clone();
@@ -311,7 +311,7 @@ where
                     "      --no-thumbnail         Disable low-res EXIF thumbnail placeholder loading"
                 );
                 println!(
-                    "      --kitty-compress <mode>  Kitty zlib compression mode: auto, always, never (defaults to auto)"
+                    "      --compress <mode>      Payload compression mode (Kitty zlib / iTerm2 JPEG): auto, always, never (defaults to auto)"
                 );
                 println!(
                     "      --no-kitty-shm         Disable Kitty POSIX shared memory (t=s) image transmission"
@@ -360,8 +360,7 @@ where
         export_path = Some(path);
     }
 
-    let protocol =
-        ProtocolConfig::from_cli(raw_protocol, explicit_kitty_compress, disable_kitty_shm)?;
+    let protocol = ProtocolConfig::from_cli(raw_protocol, explicit_compress, disable_kitty_shm)?;
 
     Ok(CliOptions {
         initial_path,
@@ -381,7 +380,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ActiveProtocol, KittyTransferMode};
+    use crate::config::{ActiveProtocol, Iterm2TransferMode, KittyTransferMode};
 
     #[test]
     fn test_sync_exclusion() {
@@ -553,7 +552,7 @@ mod tests {
         assert_eq!(
             opts.protocol,
             ProtocolConfig::Kitty {
-                compression: KittyCompression::Auto,
+                compression: CompressionPolicy::Auto,
                 disable_kitty_shm: false,
             }
         );
@@ -569,30 +568,32 @@ mod tests {
     }
 
     #[test]
-    fn test_kitty_compress_parsing_and_env_resolution() {
-        // 1. Valid parsing without explicit protocol produces ProtocolConfig::Auto with explicit_kitty_compress
-        for (flag_val, expected) in [
-            ("auto", KittyCompression::Auto),
-            ("AUTO", KittyCompression::Auto),
-            ("Auto", KittyCompression::Auto),
-            ("always", KittyCompression::Always),
-            ("ALWAYS", KittyCompression::Always),
-            ("never", KittyCompression::Never),
-            ("NEVER", KittyCompression::Never),
-        ] {
-            let args = vec![
-                "imv-tui".to_string(),
-                "--kitty-compress".to_string(),
-                flag_val.to_string(),
-            ];
-            let opts = parse_cli_args_from(args).unwrap();
-            assert_eq!(
-                opts.protocol,
-                ProtocolConfig::Auto {
-                    explicit_kitty_compress: Some(expected),
-                    disable_kitty_shm: false,
-                }
-            );
+    fn test_compress_parsing_and_env_resolution() {
+        // 1. Valid parsing for both --compress and backwards-compatible --kitty-compress alias
+        for flag in ["--compress", "--kitty-compress"] {
+            for (flag_val, expected) in [
+                ("auto", CompressionPolicy::Auto),
+                ("AUTO", CompressionPolicy::Auto),
+                ("Auto", CompressionPolicy::Auto),
+                ("always", CompressionPolicy::Always),
+                ("ALWAYS", CompressionPolicy::Always),
+                ("never", CompressionPolicy::Never),
+                ("NEVER", CompressionPolicy::Never),
+            ] {
+                let args = vec![
+                    "imv-tui".to_string(),
+                    flag.to_string(),
+                    flag_val.to_string(),
+                ];
+                let opts = parse_cli_args_from(args).unwrap();
+                assert_eq!(
+                    opts.protocol,
+                    ProtocolConfig::Auto {
+                        explicit_compress: Some(expected),
+                        disable_kitty_shm: false,
+                    }
+                );
+            }
         }
 
         // 2. Default value
@@ -600,7 +601,7 @@ mod tests {
         assert_eq!(
             default_opts.protocol,
             ProtocolConfig::Auto {
-                explicit_kitty_compress: None,
+                explicit_compress: None,
                 disable_kitty_shm: false,
             }
         );
@@ -608,29 +609,25 @@ mod tests {
         // 3. Invalid mode rejection
         let invalid_args = vec![
             "imv-tui".to_string(),
-            "--kitty-compress".to_string(),
+            "--compress".to_string(),
             "invalid".to_string(),
         ];
         let err = parse_cli_args_from(invalid_args).err().unwrap();
-        assert!(err.contains("Unknown kitty-compress mode 'invalid'"));
+        assert!(err.contains("Unknown compress mode 'invalid'"));
 
         // 4. Incompatible protocol combinations fail regardless of argument order
-        for (proto, mode) in [
-            ("iterm2", "always"),
-            ("sixel", "never"),
-            ("halfblocks", "auto"),
-        ] {
+        for (proto, mode) in [("sixel", "never"), ("halfblocks", "auto")] {
             let args1 = vec![
                 "imv-tui".to_string(),
                 "--protocol".to_string(),
                 proto.to_string(),
-                "--kitty-compress".to_string(),
+                "--compress".to_string(),
                 mode.to_string(),
             ];
             let err1 = parse_cli_args_from(args1).err().unwrap();
             assert_eq!(
                 err1,
-                "Error: Option --kitty-compress can only be used with the kitty protocol"
+                "Error: Option --compress can only be used with the kitty or iterm2 protocol"
             );
 
             let args2 = vec![
@@ -643,40 +640,92 @@ mod tests {
             let err2 = parse_cli_args_from(args2).err().unwrap();
             assert_eq!(
                 err2,
-                "Error: Option --kitty-compress can only be used with the kitty protocol"
+                "Error: Option --compress can only be used with the kitty or iterm2 protocol"
             );
         }
 
-        // 5. Compatible protocol combination with Kitty
+        // 5. Compatible protocol combinations with Kitty and iTerm2
         let kitty_args = vec![
             "imv-tui".to_string(),
             "--protocol".to_string(),
             "kitty".to_string(),
-            "--kitty-compress".to_string(),
+            "--compress".to_string(),
             "always".to_string(),
         ];
         let kitty_opts = parse_cli_args_from(kitty_args).unwrap();
         assert_eq!(
             kitty_opts.protocol,
             ProtocolConfig::Kitty {
-                compression: KittyCompression::Always,
+                compression: CompressionPolicy::Always,
                 disable_kitty_shm: false,
+            }
+        );
+        assert!(kitty_opts.protocol.should_enable_compression());
+        assert!(kitty_opts.protocol.should_enable_kitty_compression());
+
+        let iterm2_args = vec![
+            "imv-tui".to_string(),
+            "--protocol".to_string(),
+            "iterm2".to_string(),
+            "--compress".to_string(),
+            "always".to_string(),
+        ];
+        let iterm2_opts = parse_cli_args_from(iterm2_args).unwrap();
+        assert_eq!(
+            iterm2_opts.protocol,
+            ProtocolConfig::Iterm2 {
+                compression: CompressionPolicy::Always,
+            }
+        );
+        assert!(iterm2_opts.protocol.should_enable_compression());
+        assert!(!iterm2_opts.protocol.should_enable_kitty_compression());
+
+        // Default iTerm2 without --compress uses CompressionPolicy::Auto
+        let iterm2_default_args = vec![
+            "imv-tui".to_string(),
+            "--protocol".to_string(),
+            "iterm2".to_string(),
+        ];
+        let iterm2_default_opts = parse_cli_args_from(iterm2_default_args).unwrap();
+        assert_eq!(
+            iterm2_default_opts.protocol,
+            ProtocolConfig::Iterm2 {
+                compression: CompressionPolicy::Auto,
             }
         );
 
         // 6. resolve_active_protocol enforcement
         let auto_explicit = ProtocolConfig::Auto {
-            explicit_kitty_compress: Some(KittyCompression::Always),
+            explicit_compress: Some(CompressionPolicy::Always),
             disable_kitty_shm: false,
         };
         let err = auto_explicit
             .resolve_active_protocol(ProtocolType::Sixel, true)
             .err()
             .unwrap();
-        assert!(err.contains("detected terminal protocol is Sixel (not Kitty)"));
+        assert!(err.contains("detected terminal protocol is Sixel (not Kitty or Iterm2)"));
+
+        let err_hb = auto_explicit
+            .resolve_active_protocol(ProtocolType::Halfblocks, true)
+            .err()
+            .unwrap();
+        assert!(err_hb.contains("detected terminal protocol is Halfblocks (not Kitty or Iterm2)"));
+
+        assert_eq!(
+            auto_explicit
+                .resolve_active_protocol(ProtocolType::Iterm2, true)
+                .unwrap(),
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg)
+        );
+        assert_eq!(
+            auto_explicit
+                .resolve_active_protocol(ProtocolType::Iterm2, false)
+                .unwrap(),
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Png)
+        );
 
         let auto_default = ProtocolConfig::Auto {
-            explicit_kitty_compress: None,
+            explicit_compress: None,
             disable_kitty_shm: false,
         };
         assert_eq!(
@@ -691,6 +740,29 @@ mod tests {
                 .unwrap(),
             ActiveProtocol::Kitty(KittyTransferMode::Compressed)
         );
+        assert_eq!(
+            auto_default
+                .resolve_active_protocol(ProtocolType::Iterm2, true)
+                .unwrap(),
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg)
+        );
+
+        // Forced iTerm2 resolution
+        let forced_iterm2 = ProtocolConfig::Iterm2 {
+            compression: CompressionPolicy::Always,
+        };
+        assert_eq!(
+            forced_iterm2
+                .resolve_active_protocol(ProtocolType::Iterm2, true)
+                .unwrap(),
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg)
+        );
+        assert_eq!(
+            forced_iterm2
+                .resolve_active_protocol(ProtocolType::Iterm2, false)
+                .unwrap(),
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Png)
+        );
 
         // 7. ActiveProtocol helpers
         assert_eq!(
@@ -699,7 +771,11 @@ mod tests {
         );
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Iterm2, false),
-            ActiveProtocol::Iterm2
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Png)
+        );
+        assert_eq!(
+            ActiveProtocol::from_protocol_type(ProtocolType::Iterm2, true),
+            ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg)
         );
         assert_eq!(
             ActiveProtocol::from_protocol_type(ProtocolType::Halfblocks, false),
@@ -707,14 +783,14 @@ mod tests {
         );
 
         // 8. should_compress_for_env resolution logic
-        assert!(!KittyCompression::Auto.should_compress_for_env(false));
-        assert!(KittyCompression::Auto.should_compress_for_env(true));
+        assert!(!CompressionPolicy::Auto.should_compress_for_env(false));
+        assert!(CompressionPolicy::Auto.should_compress_for_env(true));
 
-        assert!(KittyCompression::Always.should_compress_for_env(false));
-        assert!(KittyCompression::Always.should_compress_for_env(true));
+        assert!(CompressionPolicy::Always.should_compress_for_env(false));
+        assert!(CompressionPolicy::Always.should_compress_for_env(true));
 
-        assert!(!KittyCompression::Never.should_compress_for_env(false));
-        assert!(!KittyCompression::Never.should_compress_for_env(true));
+        assert!(!CompressionPolicy::Never.should_compress_for_env(false));
+        assert!(!CompressionPolicy::Never.should_compress_for_env(true));
     }
 
     #[test]
@@ -725,7 +801,7 @@ mod tests {
         assert_eq!(
             opts_default.protocol,
             ProtocolConfig::Auto {
-                explicit_kitty_compress: None,
+                explicit_compress: None,
                 disable_kitty_shm: true,
             }
         );
@@ -742,7 +818,7 @@ mod tests {
         assert_eq!(
             opts_kitty.protocol,
             ProtocolConfig::Kitty {
-                compression: KittyCompression::Auto,
+                compression: CompressionPolicy::Auto,
                 disable_kitty_shm: true,
             }
         );
@@ -771,7 +847,7 @@ mod tests {
 
         // 4. resolve_active_protocol enforcement on Auto with disable_kitty_shm
         let auto_shm_disabled = ProtocolConfig::Auto {
-            explicit_kitty_compress: None,
+            explicit_compress: None,
             disable_kitty_shm: true,
         };
         let err = auto_shm_disabled
@@ -779,6 +855,12 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("--no-kitty-shm"));
+
+        let err_iterm2 = auto_shm_disabled
+            .resolve_active_protocol(ProtocolType::Iterm2, false)
+            .err()
+            .unwrap();
+        assert!(err_iterm2.contains("--no-kitty-shm"));
 
         // Kitty resolution succeeds and retains Direct transfer mode
         let active_kitty = auto_shm_disabled
@@ -791,10 +873,11 @@ mod tests {
     }
 
     #[test]
-    fn test_active_protocol_display_label_and_shm_helpers() {
+    fn test_active_protocol_display_label_and_mode_helpers() {
         let proto = ActiveProtocol::Kitty(KittyTransferMode::SharedMemory);
         assert_eq!(proto.display_label(), "Kitty (SHM)");
         assert!(proto.uses_kitty_shm());
+        assert!(!proto.uses_iterm2_jpeg());
 
         let proto_off = proto.with_kitty_shm(false);
         assert_eq!(proto_off.display_label(), "Kitty");
@@ -808,5 +891,16 @@ mod tests {
         let proto_comp_attempt = proto_comp.with_kitty_shm(true);
         assert_eq!(proto_comp_attempt.display_label(), "Kitty (Compressed)");
         assert!(!proto_comp_attempt.uses_kitty_shm());
+
+        // iTerm2 PNG vs JPEG transfer modes
+        let iterm2_png = ActiveProtocol::Iterm2(Iterm2TransferMode::Png);
+        assert_eq!(iterm2_png.display_label(), "Iterm2");
+        assert!(!iterm2_png.uses_iterm2_jpeg());
+        assert!(!iterm2_png.uses_kitty_shm());
+
+        let iterm2_jpeg = ActiveProtocol::Iterm2(Iterm2TransferMode::Jpeg);
+        assert_eq!(iterm2_jpeg.display_label(), "Iterm2 (JPEG)");
+        assert!(iterm2_jpeg.uses_iterm2_jpeg());
+        assert!(!iterm2_jpeg.uses_kitty_shm());
     }
 }

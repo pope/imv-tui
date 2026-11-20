@@ -188,9 +188,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Query terminal protocol before raw mode
-    let kitty_compression = options.protocol.should_enable_kitty_compression();
+    let compression_enabled = options.protocol.should_enable_compression();
     let query_options = ratatui_image::picker::cap_parser::QueryStdioOptions {
-        kitty_compression,
+        kitty_compression: options.protocol.should_enable_kitty_compression(),
         ..Default::default()
     };
     let mut picker = Picker::from_query_stdio_with_options(query_options)
@@ -200,7 +200,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let active_protocol = options
         .protocol
-        .resolve_active_protocol(picker.protocol_type(), kitty_compression)?;
+        .resolve_active_protocol(picker.protocol_type(), compression_enabled)?;
 
     // Setup terminal using RAII guard
     let _guard = TerminalGuard::new()?;
@@ -210,7 +210,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             active_protocol,
             crate::config::ActiveProtocol::Kitty(crate::config::KittyTransferMode::Direct)
         )
-        && !crate::config::KittyCompression::is_remote_ssh_session()
+        && !crate::config::CompressionPolicy::is_remote_ssh_session()
     {
         let shm_ok = crate::imaging::probe_kitty_shm_support(picker.tmux_detected());
         active_protocol = active_protocol.with_kitty_shm(shm_ok);
