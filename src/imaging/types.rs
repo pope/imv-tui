@@ -752,20 +752,44 @@ pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
 
 /// Returns `true` if every RGBA8 pixel in `rgba` is fully opaque (`alpha == 0xFF`).
 ///
-/// Processes 4 pixels (16 bytes) per iteration using bitwise AND across the 4 alpha lanes
-/// for auto-vectorization, exiting early on the first non-opaque chunk.
+/// Processes 16 pixels (64 bytes) per iteration using bitwise AND across all 16 alpha lanes
+/// for SIMD auto-vectorization, exiting early on the first non-opaque block, followed by
+/// 16-byte (4-pixel) and 4-byte (1-pixel) tail handling.
 /// Trailing incomplete pixel bytes (`rgba.len() % 4`) are ignored.
 pub fn is_rgba8_opaque(rgba: &[u8]) -> bool {
     let num_pixels = rgba.len() / 4;
-    let (chunks, rem) = rgba[..num_pixels * 4].as_chunks::<16>();
+    let (chunks64, rem64) = rgba[..num_pixels * 4].as_chunks::<64>();
 
-    for c in chunks {
+    for c in chunks64 {
+        let a = c[3]
+            & c[7]
+            & c[11]
+            & c[15]
+            & c[19]
+            & c[23]
+            & c[27]
+            & c[31]
+            & c[35]
+            & c[39]
+            & c[43]
+            & c[47]
+            & c[51]
+            & c[55]
+            & c[59]
+            & c[63];
+        if a != 0xFF {
+            return false;
+        }
+    }
+
+    let (chunks16, rem16) = rem64.as_chunks::<16>();
+    for c in chunks16 {
         if (c[3] & c[7] & c[11] & c[15]) != 0xFF {
             return false;
         }
     }
 
-    for px in rem.as_chunks::<4>().0 {
+    for px in rem16.as_chunks::<4>().0 {
         if px[3] != 0xFF {
             return false;
         }
@@ -1309,8 +1333,11 @@ mod tests {
         // Empty slice is vacuously opaque
         assert!(is_rgba8_opaque(&[]));
 
-        // Exhaustively test 1..=33 pixels: all opaque, and single non-opaque pixel at every position
-        for count in 1..=33 {
+        // Exhaustively test 1..=33 plus 64-byte/16-pixel chunk boundaries and tails
+        // (63, 64, 65, 68, 128, 129 pixels): all opaque, and single non-opaque pixel at every
+        // position (covering all 16 lanes of 64-byte chunks, 4 lanes of 16-byte tail, scalar tail,
+        // and every position 0..=67).
+        for count in (1..=33).chain([63, 64, 65, 68, 128, 129]) {
             let mut rgba = Vec::with_capacity(count * 4);
             for i in 0..count {
                 rgba.push(((i * 13) % 256) as u8);
@@ -1323,7 +1350,6 @@ mod tests {
                 "All-opaque buffer of {count} pixels must report opaque"
             );
 
-            // Test start, middle, end, and every pixel index (covers all 4 SIMD lanes + tail)
             for pos in 0..count {
                 rgba[pos * 4 + 3] = 254;
                 assert!(

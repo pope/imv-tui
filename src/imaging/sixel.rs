@@ -455,16 +455,28 @@ fn build_palette_median_cut(hist: &[u32], max_colors: usize) -> Vec<[u8; 3]> {
 }
 
 /// Builds a 32 KB L1-resident LUT mapping every 5-5-5 RGB color to its nearest palette index.
+///
+/// Packs `(squared_dist << 8) | index` into a `u32` and scans the SoA palette arrays without
+/// early exits so LLVM can auto-vectorize the squared-distance reduction across palette entries
+/// while preserving exact lowest-index tie-breaking.
 fn build_rgb555_lut(palette: &[[u8; 3]]) -> Vec<u8> {
     let mut lut = vec![0u8; RGB555_LEN];
-    if palette.len() <= 1 {
+    let pal_len = palette.len().min(MAX_PALETTE_COLORS);
+    if pal_len <= 1 {
         return lut;
     }
 
-    let pal_r: Vec<i32> = palette.iter().map(|c| i32::from(c[0])).collect();
-    let pal_g: Vec<i32> = palette.iter().map(|c| i32::from(c[1])).collect();
-    let pal_b: Vec<i32> = palette.iter().map(|c| i32::from(c[2])).collect();
-    let pal_len = palette.len();
+    let mut pal_r_buf = [0i32; MAX_PALETTE_COLORS];
+    let mut pal_g_buf = [0i32; MAX_PALETTE_COLORS];
+    let mut pal_b_buf = [0i32; MAX_PALETTE_COLORS];
+    for (i, c) in palette[..pal_len].iter().enumerate() {
+        pal_r_buf[i] = i32::from(c[0]);
+        pal_g_buf[i] = i32::from(c[1]);
+        pal_b_buf[i] = i32::from(c[2]);
+    }
+    let pal_r = &pal_r_buf[..pal_len];
+    let pal_g = &pal_g_buf[..pal_len];
+    let pal_b = &pal_b_buf[..pal_len];
 
     let fill_chunk = |chunk_idx: usize, chunk: &mut [u8]| {
         let base = chunk_idx * 1024;
@@ -474,22 +486,18 @@ fn build_rgb555_lut(palette: &[[u8; 3]]) -> Vec<u8> {
             let g = i32::from(expand5(((idx >> 5) & 31) as u8));
             let b = i32::from(expand5((idx & 31) as u8));
 
-            let mut best_idx = 0usize;
-            let mut best_dist = i32::MAX;
-            for i in 0..pal_len {
-                let dr = r - pal_r[i];
-                let dg = g - pal_g[i];
-                let db = b - pal_b[i];
-                let dist = dr * dr + dg * dg + db * db;
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_idx = i;
-                    if dist == 0 {
-                        break;
-                    }
-                }
+            let mut best_key = u32::MAX;
+            for (p, ((&pr, &pg), &pb)) in
+                pal_r.iter().zip(pal_g.iter()).zip(pal_b.iter()).enumerate()
+            {
+                let dr = r - pr;
+                let dg = g - pg;
+                let db = b - pb;
+                let dist = (dr * dr + dg * dg + db * db) as u32;
+                let key = (dist << 8) | (p as u32);
+                best_key = best_key.min(key);
             }
-            *dst = best_idx as u8;
+            *dst = best_key as u8;
         }
     };
 
@@ -1124,5 +1132,58 @@ mod tests {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 4, Rgb([0, 0, 0])));
         assert!(SixelProtocol::new(&img, unit_font(), Size::new(0, 4), false, false).is_err());
         assert!(SixelProtocol::new(&img, unit_font(), Size::new(4, 0), false, false).is_err());
+    }
+
+    #[test]
+    fn test_build_rgb555_lut_matches_scalar_reference_and_tie_breaking() {
+        fn build_rgb555_lut_scalar_ref(palette: &[[u8; 3]]) -> Vec<u8> {
+            let mut lut = vec![0u8; RGB555_LEN];
+            if palette.len() <= 1 {
+                return lut;
+            }
+            for (idx, dst) in lut.iter_mut().enumerate() {
+                let r = i32::from(expand5((idx >> 10) as u8));
+                let g = i32::from(expand5(((idx >> 5) & 31) as u8));
+                let b = i32::from(expand5((idx & 31) as u8));
+                let mut best_idx = 0usize;
+                let mut best_dist = i32::MAX;
+                for (p, &[pr, pg, pb]) in palette.iter().enumerate() {
+                    let dr = r - i32::from(pr);
+                    let dg = g - i32::from(pg);
+                    let db = b - i32::from(pb);
+                    let dist = dr * dr + dg * dg + db * db;
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx = p;
+                    }
+                }
+                *dst = best_idx as u8;
+            }
+            lut
+        }
+
+        for &pal_len in &[1usize, 16, 17, 128, 256] {
+            let mut palette = Vec::with_capacity(pal_len);
+            for i in 0..pal_len {
+                let r = ((i * 53 + 17) & 0xFF) as u8;
+                let g = ((i * 97 + 41) & 0xFF) as u8;
+                let b = ((i * 193 + 83) & 0xFF) as u8;
+                palette.push([r, g, b]);
+            }
+            // Inject duplicate and equidistant entries when palette has room to exercise
+            // lowest-index tie-breaking explicitly.
+            if pal_len >= 4 {
+                palette[pal_len - 1] = palette[0];
+                palette[2] = [0, 0, 0];
+                palette[3] = [255, 255, 255];
+            }
+
+            let actual = build_rgb555_lut(&palette);
+            let expected = build_rgb555_lut_scalar_ref(&palette);
+            assert_eq!(
+                actual, expected,
+                "build_rgb555_lut mismatch for {pal_len}-color palette"
+            );
+        }
     }
 }
