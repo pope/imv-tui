@@ -1,5 +1,6 @@
 use fast_image_resize as fir;
 use image::DynamicImage;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -773,19 +774,43 @@ pub fn is_rgba8_opaque(rgba: &[u8]) -> bool {
     true
 }
 
+/// Minimum pixel count (~1 MP) before `pack_rgba32_to_rgb24` parallelizes block packing
+/// and destination page-faulting across `rayon` worker threads.
+const PARALLEL_PACK_MIN_PIXELS: usize = 1_000_000;
+
+/// Packs a slice of 4-pixel RGBA blocks (`[u8; 16]`) into 4-pixel RGB blocks (`[u8; 12]`).
+#[inline]
+fn pack_rgba_blocks(in_blocks: &[[u8; 16]], out_blocks: &mut [[u8; 12]]) {
+    for (src, dst) in in_blocks.iter().zip(out_blocks.iter_mut()) {
+        *dst = [
+            src[0], src[1], src[2], src[4], src[5], src[6], src[8], src[9], src[10], src[12],
+            src[13], src[14],
+        ];
+    }
+}
+
 /// Packs 32-bit RGBA (`[R, G, B, A]`) bytes into packed 24-bit RGB (`[R, G, B]`) bytes
-/// using 4-pixel (16-byte -> 12-byte) unrolled block packing for SIMD auto-vectorization.
+/// using 4-pixel (16-byte -> 12-byte) unrolled block packing for SIMD auto-vectorization,
+/// parallelized across disjoint destination slabs via `rayon` for large images (`>= 1 MP`).
 pub fn pack_rgba32_to_rgb24(rgba: &[u8]) -> Vec<u8> {
     let num_pixels = rgba.len() / 4;
     let mut rgb = vec![0u8; num_pixels * 3];
     let (in_chunks, in_rem) = rgba[..num_pixels * 4].as_chunks::<16>();
     let (out_chunks, out_rem) = rgb.as_chunks_mut::<12>();
 
-    for (src, dst) in in_chunks.iter().zip(out_chunks.iter_mut()) {
-        *dst = [
-            src[0], src[1], src[2], src[4], src[5], src[6], src[8], src[9], src[10], src[12],
-            src[13], src[14],
-        ];
+    if num_pixels >= PARALLEL_PACK_MIN_PIXELS {
+        let target_slabs = rayon::current_num_threads().max(1) * 4;
+        let slab_blocks = out_chunks.len().div_ceil(target_slabs).max(1);
+        out_chunks
+            .par_chunks_mut(slab_blocks)
+            .enumerate()
+            .for_each(|(slab_idx, dst_slab)| {
+                let start = slab_idx * slab_blocks;
+                let src_slab = &in_chunks[start..start + dst_slab.len()];
+                pack_rgba_blocks(src_slab, dst_slab);
+            });
+    } else {
+        pack_rgba_blocks(in_chunks, out_chunks);
     }
 
     for (src, dst) in in_rem
@@ -870,24 +895,19 @@ pub fn to_rgba8_fast(img: &DynamicImage) -> std::borrow::Cow<'_, image::RgbaImag
 /// A 32×32 tile of RGB8 (3 KB) or RGBA8 (4 KB) fits comfortably inside L1D cache.
 const ROTATE_TILE_SIZE: usize = 32;
 
-/// Minimum pixel count (~1 MP) before rotation spawns scoped worker threads to parallelize
+/// Minimum pixel count (~1 MP) before rotation dispatches to `rayon` to parallelize
 /// page-faulting and memory bandwidth across disjoint destination slabs.
 const PARALLEL_ROTATE_MIN_PIXELS: usize = 1_000_000;
 
-/// Upper bound on worker threads used for parallel image rotation.
-const MAX_ROTATE_THREADS: usize = 8;
-
-/// Computes the number of worker threads to use for rotating an image of `total_pixels`
-/// partitioned across `dst_rows` destination rows.
-fn rotate_worker_count(total_pixels: usize, dst_rows: usize) -> usize {
-    if total_pixels < PARALLEL_ROTATE_MIN_PIXELS || dst_rows < ROTATE_TILE_SIZE * 2 {
-        return 1;
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, MAX_ROTATE_THREADS)
-        .min(dst_rows.div_ceil(ROTATE_TILE_SIZE))
+/// Computes the tile-aligned destination slab height (in rows) for parallel 90°/270°
+/// rotation, targeting ~4 slabs per `rayon` worker thread for balanced work-stealing.
+fn rotate_slab_rows(dst_rows: usize) -> usize {
+    let target_slabs = rayon::current_num_threads().max(1) * 4;
+    let tiles_per_slab = dst_rows
+        .div_ceil(ROTATE_TILE_SIZE)
+        .div_ceil(target_slabs)
+        .max(1);
+    tiles_per_slab * ROTATE_TILE_SIZE
 }
 
 /// Rotates a contiguous horizontal destination slab (`dst_y_start..dst_y_start + slab_rows`)
@@ -933,7 +953,7 @@ fn rotate90_slab<const N: usize>(
 
 /// Rotates a tightly packed `w × h` pixel buffer (with `N` bytes per pixel) 90° clockwise
 /// into a `h × w` buffer using destination-sequential cache-blocked tiling, parallelized
-/// across disjoint destination row slabs for large images.
+/// across disjoint destination row slabs via `rayon` for large images (`>= 1 MP`).
 fn rotate90_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     let w = w as usize;
     let h = h as usize;
@@ -945,21 +965,18 @@ fn rotate90_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
     let src_px = &src.as_chunks::<N>().0[..total_pixels];
     let dst_px = &mut dst.as_chunks_mut::<N>().0[..total_pixels];
-    let workers = rotate_worker_count(total_pixels, w);
 
-    if workers == 1 {
+    if total_pixels < PARALLEL_ROTATE_MIN_PIXELS || w < ROTATE_TILE_SIZE * 2 {
         rotate90_slab(src_px, dst_px, w, h, 0);
     } else {
-        let tiles_per_worker = w.div_ceil(ROTATE_TILE_SIZE).div_ceil(workers);
-        let slab_rows = tiles_per_worker * ROTATE_TILE_SIZE;
-        std::thread::scope(|scope| {
-            for (slab_idx, dst_slab) in dst_px.chunks_mut(slab_rows * h).enumerate() {
+        let slab_rows = rotate_slab_rows(w);
+        dst_px
+            .par_chunks_mut(slab_rows * h)
+            .enumerate()
+            .for_each(|(slab_idx, dst_slab)| {
                 let dst_y_start = slab_idx * slab_rows;
-                scope.spawn(move || {
-                    rotate90_slab(src_px, dst_slab, w, h, dst_y_start);
-                });
-            }
-        });
+                rotate90_slab(src_px, dst_slab, w, h, dst_y_start);
+            });
     }
 
     dst
@@ -967,7 +984,7 @@ fn rotate90_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 /// Rotates a tightly packed `w × h` pixel buffer (with `N` bytes per pixel) 180°
 /// by reversing the pixel slice sequentially, parallelized across disjoint destination
-/// chunks for large images.
+/// chunks via `rayon` for large images (`>= 1 MP`).
 fn rotate180_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     let n = (w as usize) * (h as usize);
     let mut dst = vec![0u8; n * N];
@@ -977,33 +994,25 @@ fn rotate180_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
     let src_px = &src.as_chunks::<N>().0[..n];
     let dst_px = &mut dst.as_chunks_mut::<N>().0[..n];
-    let workers = if n >= PARALLEL_ROTATE_MIN_PIXELS {
-        std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(1)
-            .clamp(1, MAX_ROTATE_THREADS)
-    } else {
-        1
-    };
 
-    if workers == 1 {
+    if n < PARALLEL_ROTATE_MIN_PIXELS {
         for (d, s) in dst_px.iter_mut().zip(src_px.iter().rev()) {
             *d = *s;
         }
     } else {
-        let chunk_len = n.div_ceil(workers);
-        std::thread::scope(|scope| {
-            for (chunk_idx, dst_chunk) in dst_px.chunks_mut(chunk_len).enumerate() {
+        let target_chunks = rayon::current_num_threads().max(1) * 4;
+        let chunk_len = n.div_ceil(target_chunks).max(1);
+        dst_px
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(chunk_idx, dst_chunk)| {
                 let start = chunk_idx * chunk_len;
                 let end = start + dst_chunk.len();
                 let src_slice = &src_px[n - end..n - start];
-                scope.spawn(move || {
-                    for (d, s) in dst_chunk.iter_mut().zip(src_slice.iter().rev()) {
-                        *d = *s;
-                    }
-                });
-            }
-        });
+                for (d, s) in dst_chunk.iter_mut().zip(src_slice.iter().rev()) {
+                    *d = *s;
+                }
+            });
     }
 
     dst
@@ -1050,7 +1059,8 @@ fn rotate270_slab<const N: usize>(
 
 /// Rotates a tightly packed `w × h` pixel buffer (with `N` bytes per pixel) 270° clockwise
 /// (90° counter-clockwise) into a `h × w` buffer using destination-sequential cache-blocked
-/// tiling, parallelized across disjoint destination row slabs for large images.
+/// tiling, parallelized across disjoint destination row slabs via `rayon` for large images
+/// (`>= 1 MP`).
 fn rotate270_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     let w = w as usize;
     let h = h as usize;
@@ -1062,21 +1072,18 @@ fn rotate270_pixels<const N: usize>(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
     let src_px = &src.as_chunks::<N>().0[..total_pixels];
     let dst_px = &mut dst.as_chunks_mut::<N>().0[..total_pixels];
-    let workers = rotate_worker_count(total_pixels, w);
 
-    if workers == 1 {
+    if total_pixels < PARALLEL_ROTATE_MIN_PIXELS || w < ROTATE_TILE_SIZE * 2 {
         rotate270_slab(src_px, dst_px, w, h, 0);
     } else {
-        let tiles_per_worker = w.div_ceil(ROTATE_TILE_SIZE).div_ceil(workers);
-        let slab_rows = tiles_per_worker * ROTATE_TILE_SIZE;
-        std::thread::scope(|scope| {
-            for (slab_idx, dst_slab) in dst_px.chunks_mut(slab_rows * h).enumerate() {
+        let slab_rows = rotate_slab_rows(w);
+        dst_px
+            .par_chunks_mut(slab_rows * h)
+            .enumerate()
+            .for_each(|(slab_idx, dst_slab)| {
                 let dst_y_start = slab_idx * slab_rows;
-                scope.spawn(move || {
-                    rotate270_slab(src_px, dst_slab, w, h, dst_y_start);
-                });
-            }
-        });
+                rotate270_slab(src_px, dst_slab, w, h, dst_y_start);
+            });
     }
 
     dst
@@ -1365,6 +1372,27 @@ mod tests {
                 assert_eq!(packed, std_rgb.into_raw());
             }
         }
+    }
+
+    #[test]
+    fn test_pack_rgba32_to_rgb24_parallel_large_buffer() {
+        // Exceeds PARALLEL_PACK_MIN_PIXELS (1_000_000) with a non-multiple of 4 and
+        // non-multiple of slab size so both parallel slabs and the scalar tail execute.
+        let count = PARALLEL_PACK_MIN_PIXELS + 3;
+        let mut rgba = Vec::with_capacity(count * 4);
+        let mut expected = Vec::with_capacity(count * 3);
+        for i in 0..count {
+            let r = ((i.wrapping_mul(7) + 13) & 0xFF) as u8;
+            let g = ((i.wrapping_mul(11) + 47) & 0xFF) as u8;
+            let b = ((i.wrapping_mul(13) + 89) & 0xFF) as u8;
+            let a = ((i.wrapping_mul(17) + 3) & 0xFF) as u8;
+            rgba.extend_from_slice(&[r, g, b, a]);
+            expected.extend_from_slice(&[r, g, b]);
+        }
+
+        let packed = pack_rgba32_to_rgb24(&rgba);
+        assert_eq!(packed.len(), count * 3);
+        assert_eq!(packed, expected);
     }
 
     #[test]

@@ -618,6 +618,7 @@ dependencies = [
  "document-features",
  "image",
  "num-traits",
+ "rayon",
  "thiserror 2.0.21",
 ]
 
@@ -876,6 +877,7 @@ dependencies = [
  "nucleo",
  "ratatui",
  "ratatui-image",
+ "rayon",
  "serde",
  "serde_json",
  "strum",
