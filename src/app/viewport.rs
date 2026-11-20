@@ -207,6 +207,7 @@ impl App {
                 rendered_size_cells: rendered_cells,
                 sequence: self.current_sequence,
                 use_kitty_shm: self.active_protocol.uses_kitty_shm(),
+                use_kitty_compression: self.active_protocol.uses_kitty_compression(),
                 use_iterm2_jpeg: self.active_protocol.uses_iterm2_jpeg(),
             };
 

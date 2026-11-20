@@ -48,7 +48,8 @@ static TRANSMITTED_SHM_RING: Mutex<VecDeque<CString>> = Mutex::new(VecDeque::new
 static SHM_SEQ: AtomicU64 = AtomicU64::new(1);
 static NEXT_KITTY_ID: AtomicU32 = AtomicU32::new(100);
 
-fn next_kitty_id() -> u32 {
+/// Returns the next unique 24-bit+extra Kitty graphics image identifier.
+pub fn next_kitty_id() -> u32 {
     let id = NEXT_KITTY_ID.fetch_add(1, Ordering::Relaxed);
     if id >= 0x00FF_FFFE {
         NEXT_KITTY_ID.store(100, Ordering::Relaxed);
@@ -458,6 +459,64 @@ fn diacritic(y: u16) -> char {
         .unwrap_or_else(|| &DIACRITICS[0])
 }
 
+/// Renders a Kitty Unicode placeholder grid (`U+10EEEE`) into `buf` within `area`,
+/// optionally prepending a one-shot graphics transmission escape sequence to the top-left cell.
+pub fn render_kitty_placeholders(
+    area: Rect,
+    buf: &mut Buffer,
+    size: Size,
+    fg: Color,
+    id_extra: u16,
+    mut transmit: Option<&str>,
+) {
+    let max = DIACRITICS.len() as u16;
+    let width = area.width.min(size.width).min(max);
+    let height = area.height.min(size.height).min(max);
+
+    const PLACEHOLDER_STR: &str = "\u{10EEEE}";
+    let mut symbol = String::with_capacity(64);
+    for y in 0..height {
+        let row = y;
+        for x in 0..width {
+            let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) else {
+                continue;
+            };
+
+            if let Some(seq) = transmit.take() {
+                let mut first_symbol = String::with_capacity(seq.len() + 32);
+                first_symbol.push_str(seq);
+                first_symbol.push(PLACEHOLDER);
+                if x == 0 {
+                    first_symbol.push(diacritic(row));
+                    first_symbol.push(diacritic(x));
+                    first_symbol.push(diacritic(id_extra));
+                }
+                cell.set_symbol(&first_symbol)
+                    .set_fg(fg)
+                    .set_diff_option(UNIT_WIDTH);
+                continue;
+            }
+
+            if x > 0 {
+                cell.set_symbol(PLACEHOLDER_STR)
+                    .set_fg(fg)
+                    .set_diff_option(UNIT_WIDTH);
+                continue;
+            }
+
+            symbol.clear();
+            symbol.push(PLACEHOLDER);
+            symbol.push(diacritic(row));
+            symbol.push(diacritic(x));
+            symbol.push(diacritic(id_extra));
+
+            cell.set_symbol(&symbol)
+                .set_fg(fg)
+                .set_diff_option(UNIT_WIDTH);
+        }
+    }
+}
+
 /// Zero-copy POSIX shared memory (`t=s`) Kitty graphics protocol state.
 pub struct KittyShmProtocol {
     segment: KittyShmSegment,
@@ -522,10 +581,6 @@ impl KittyShmProtocol {
     /// Renders the Kitty Unicode placeholder grid, prepending the transmission escape sequence
     /// only on the first render call.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let max = DIACRITICS.len() as u16;
-        let width = area.width.min(self.size.width).min(max);
-        let height = area.height.min(self.size.height).min(max);
-
         let is_first_render = !self.segment.transmitted.swap(true, Ordering::SeqCst);
         if is_first_render && let Ok(mut ring) = TRANSMITTED_SHM_RING.lock() {
             ring.push_back(self.segment.c_name.clone());
@@ -538,45 +593,13 @@ impl KittyShmProtocol {
             }
         }
 
-        let mut transmit = if is_first_render {
+        let transmit = if is_first_render {
             Some(self.transmit_str.as_str())
         } else {
             None
         };
 
-        const PLACEHOLDER_STR: &str = "\u{10EEEE}";
-        let mut symbol = String::with_capacity(64);
-        for y in 0..height {
-            let row = y;
-            for x in 0..width {
-                let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) else {
-                    continue;
-                };
-
-                if x > 0 && transmit.is_none() {
-                    cell.set_symbol(PLACEHOLDER_STR)
-                        .set_fg(self.fg)
-                        .set_diff_option(UNIT_WIDTH);
-                    continue;
-                }
-
-                symbol.clear();
-                if let Some(seq) = transmit.take() {
-                    symbol.push_str(seq);
-                }
-
-                symbol.push(PLACEHOLDER);
-                if x == 0 {
-                    symbol.push(diacritic(row));
-                    symbol.push(diacritic(x));
-                    symbol.push(diacritic(self.id_extra));
-                }
-
-                cell.set_symbol(&symbol)
-                    .set_fg(self.fg)
-                    .set_diff_option(UNIT_WIDTH);
-            }
-        }
+        render_kitty_placeholders(area, buf, self.size, self.fg, self.id_extra, transmit);
     }
 }
 

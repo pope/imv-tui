@@ -15,6 +15,7 @@ use super::decoder::{
     decode_thumbnail_and_dimensions_for_mode,
 };
 use super::iterm2::Iterm2Protocol;
+use super::kitty_direct::KittyDirectProtocol;
 use super::kitty_shm::KittyShmProtocol;
 use super::protocol::ViewportProtocol;
 use super::raw::{
@@ -61,6 +62,8 @@ pub struct ResizeRequest {
     pub sequence: u64,
     /// Whether POSIX shared memory (`t=s`) should be used for Kitty protocol rendering.
     pub use_kitty_shm: bool,
+    /// Whether zlib compression (`o=z`) should be used for Kitty direct (`t=d`) rendering.
+    pub use_kitty_compression: bool,
     /// Whether quality-90 JPEG encoding should be used for opaque iTerm2 protocol images.
     pub use_iterm2_jpeg: bool,
 }
@@ -1077,16 +1080,15 @@ pub fn process_resize(
 
     let start_protocol = std::time::Instant::now();
     let target_size = ratatui::layout::Size::new(rendered_cells.0, rendered_cells.1);
-    let protocol = if req.use_kitty_shm
-        && req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty
-    {
-        match KittyShmProtocol::new(
+    let protocol = if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty {
+        let make_direct_or_standard = |canvas: DynamicImage| match KittyDirectProtocol::new(
             &canvas,
             req.picker.font_size(),
             target_size,
             req.picker.tmux_detected(),
+            req.use_kitty_compression,
         ) {
-            Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
+            Ok(direct_proto) => ViewportProtocol::KittyDirect(direct_proto),
             Err(_) => {
                 let mut p = req.picker.new_resize_protocol(canvas);
                 ratatui_image::ResizeEncodeRender::resize_encode(
@@ -1096,6 +1098,20 @@ pub fn process_resize(
                 );
                 ViewportProtocol::Standard(p)
             }
+        };
+
+        if req.use_kitty_shm {
+            match KittyShmProtocol::new(
+                &canvas,
+                req.picker.font_size(),
+                target_size,
+                req.picker.tmux_detected(),
+            ) {
+                Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
+                Err(_) => make_direct_or_standard(canvas),
+            }
+        } else {
+            make_direct_or_standard(canvas)
         }
     } else if req.picker.protocol_type() == ratatui_image::picker::ProtocolType::Sixel {
         match SixelProtocol::new(
@@ -1531,6 +1547,7 @@ mod tests {
             rendered_size_cells: (5, 3),
             sequence: 1,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
 
@@ -1579,6 +1596,7 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 1,
             use_kitty_shm: true,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let (proto_fallback, _, _) = process_resize(req_fallback, &mut resizer);
@@ -1602,10 +1620,68 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 2,
             use_kitty_shm: true,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let (proto_shm, _, _) = process_resize(req_shm, &mut resizer);
         assert!(matches!(proto_shm, ViewportProtocol::KittyShm(_)));
+
+        // 2b. Kitty picker with use_kitty_shm = false produces ViewportProtocol::KittyDirect
+        // (both uncompressed t=d and compressed o=z,t=d)
+        let mut picker_kitty_direct = Picker::halfblocks();
+        picker_kitty_direct.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let req_direct = ResizeRequest {
+            img: Arc::new(make_test_image(80, 80)),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_kitty_direct.clone(),
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 20,
+            use_kitty_shm: false,
+            use_kitty_compression: false,
+            use_iterm2_jpeg: false,
+        };
+        let (proto_direct, _, _) = process_resize(req_direct, &mut resizer);
+        match proto_direct {
+            ViewportProtocol::KittyDirect(direct) => {
+                assert!(direct.transmit_str().contains("t=d"));
+                assert!(!direct.transmit_str().contains("o=z"));
+            }
+            _ => panic!("Expected ViewportProtocol::KittyDirect for uncompressed Kitty"),
+        }
+
+        let req_direct_comp = ResizeRequest {
+            img: Arc::new(make_test_image(80, 80)),
+            original_size: (80, 80),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 80),
+            intersection: ImageIntersection::new(0, 0, 80, 80),
+            target_w: 80,
+            target_h: 80,
+            filter_type: FilterType::Nearest,
+            picker: picker_kitty_direct,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 10),
+            sequence: 21,
+            use_kitty_shm: false,
+            use_kitty_compression: true,
+            use_iterm2_jpeg: false,
+        };
+        let (proto_direct_comp, _, _) = process_resize(req_direct_comp, &mut resizer);
+        match proto_direct_comp {
+            ViewportProtocol::KittyDirect(direct) => {
+                assert!(direct.transmit_str().contains("o=z,t=d"));
+            }
+            _ => panic!("Expected ViewportProtocol::KittyDirect for compressed Kitty"),
+        }
 
         // 3. Sixel picker produces ViewportProtocol::Sixel
         let mut picker_sixel = Picker::halfblocks();
@@ -1625,6 +1701,7 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 3,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let (proto_sixel, _, _) = process_resize(req_sixel, &mut resizer);
@@ -1648,6 +1725,7 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 4,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let (proto_iterm2_png, _, _) = process_resize(req_iterm2_png, &mut resizer);
@@ -1668,6 +1746,7 @@ mod tests {
             rendered_size_cells: (10, 10),
             sequence: 5,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: true,
         };
         let (proto_iterm2_jpeg, _, _) = process_resize(req_iterm2_jpeg, &mut resizer);
@@ -1699,6 +1778,7 @@ mod tests {
             rendered_size_cells: (50, 50),
             sequence: 1,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
 
@@ -1744,6 +1824,7 @@ mod tests {
             rendered_size_cells: (40, 40),
             sequence: 1,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
 
@@ -1786,6 +1867,7 @@ mod tests {
             rendered_size_cells: (30, 30),
             sequence: 1,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let canvas_pos = render_resize_canvas(&req_pos, &mut resizer);
@@ -1817,6 +1899,7 @@ mod tests {
             rendered_size_cells: (30, 30),
             sequence: 2,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let canvas_neg = render_resize_canvas(&req_neg, &mut resizer);
@@ -2011,6 +2094,7 @@ mod tests {
             rendered_size_cells: (40, 40),
             sequence: 1,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
         let canvas = render_resize_canvas(&req, &mut resizer).to_rgba8();
@@ -2045,6 +2129,7 @@ mod tests {
             rendered_size_cells: (12, 10),
             sequence: 1,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
 
@@ -2075,6 +2160,7 @@ mod tests {
             rendered_size_cells: (20, 20),
             sequence: 2,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
 
@@ -3264,6 +3350,7 @@ mod tests {
             rendered_size_cells: (40, 20),
             sequence: seq,
             use_kitty_shm: false,
+            use_kitty_compression: false,
             use_iterm2_jpeg: false,
         };
 

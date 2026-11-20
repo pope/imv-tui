@@ -877,20 +877,24 @@ mod tests {
         let proto = ActiveProtocol::Kitty(KittyTransferMode::SharedMemory);
         assert_eq!(proto.display_label(), "Kitty (SHM)");
         assert!(proto.uses_kitty_shm());
+        assert!(!proto.uses_kitty_compression());
         assert!(!proto.uses_iterm2_jpeg());
 
         let proto_off = proto.with_kitty_shm(false);
         assert_eq!(proto_off.display_label(), "Kitty");
         assert!(!proto_off.uses_kitty_shm());
+        assert!(!proto_off.uses_kitty_compression());
 
         let proto_comp = ActiveProtocol::Kitty(KittyTransferMode::Compressed);
         assert_eq!(proto_comp.display_label(), "Kitty (Compressed)");
         assert!(!proto_comp.uses_kitty_shm());
+        assert!(proto_comp.uses_kitty_compression());
 
         // with_kitty_shm does not enable shm when compression is true
         let proto_comp_attempt = proto_comp.with_kitty_shm(true);
         assert_eq!(proto_comp_attempt.display_label(), "Kitty (Compressed)");
         assert!(!proto_comp_attempt.uses_kitty_shm());
+        assert!(proto_comp_attempt.uses_kitty_compression());
 
         // iTerm2 PNG vs JPEG transfer modes
         let iterm2_png = ActiveProtocol::Iterm2(Iterm2TransferMode::Png);

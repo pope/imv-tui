@@ -18,6 +18,8 @@ pub mod thumbcache;
 pub mod kitty_shm;
 pub use kitty_shm::*;
 
+pub mod kitty_direct;
+
 pub mod protocol;
 pub use protocol::*;
 

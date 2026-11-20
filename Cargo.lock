@@ -871,6 +871,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "fast_image_resize",
+ "flate2",
  "image",
  "kamadak-exif",
  "libc",

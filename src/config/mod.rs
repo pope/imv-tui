@@ -509,6 +509,11 @@ impl ActiveProtocol {
         matches!(self, Self::Kitty(KittyTransferMode::SharedMemory))
     }
 
+    /// Returns `true` if Kitty zlib transport compression (`o=z`) is active.
+    pub const fn uses_kitty_compression(self) -> bool {
+        matches!(self, Self::Kitty(KittyTransferMode::Compressed))
+    }
+
     /// Returns `true` if iTerm2 JPEG compression is active for opaque images.
     pub const fn uses_iterm2_jpeg(self) -> bool {
         matches!(self, Self::Iterm2(Iterm2TransferMode::Jpeg))
