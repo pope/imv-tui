@@ -34,6 +34,7 @@ fn test_import_export_text_and_json() {
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("."),
@@ -141,6 +142,7 @@ fn test_write_classifications_tsv() {
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("."),
@@ -233,6 +235,7 @@ fn test_unmapped_classifications_preservation() {
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("."),
@@ -304,6 +307,7 @@ fn test_refresh_files_preservation() {
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("target/tmp/refresh_test"),
@@ -380,6 +384,7 @@ fn test_refresh_files_unmapped_migration() {
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("target/tmp/refresh_unmapped_test"),
@@ -443,6 +448,7 @@ fn test_prefetch_cache_retention_and_hits() {
         disable_thumbnail: true,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("."),
@@ -1360,6 +1366,7 @@ fn setup_multi_image_app(count: usize) -> (App, MockChannels) {
         disable_thumbnail: false,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: PathBuf::from("."),

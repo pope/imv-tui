@@ -1,7 +1,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use super::line_editor::EditorAction;
-use super::registry::Command;
+use super::registry::{Command, PanDirection};
 
 /// The specific input prompt type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,15 +57,36 @@ pub enum InputAction {
     Editor(EditorAction),
     /// Overlay list navigation, confirmation, or dismissal action.
     Overlay(OverlayAction),
+    /// Release of a directional pan key (when Kitty keyboard event types are active).
+    PanRelease(PanDirection),
+    /// Clears all tracked held pan keys (e.g. when the terminal loses focus).
+    ClearHeldKeys,
 }
 
 /// Translates a raw Crossterm `Event` into a semantic `InputAction` based on the active `PaletteMode`.
 pub fn translate_event(palette_mode: PaletteMode, ev: &Event) -> Option<InputAction> {
+    if matches!(ev, Event::FocusLost) {
+        return Some(InputAction::ClearHeldKeys);
+    }
+
+    if let Event::Key(key) = ev
+        && key.kind == KeyEventKind::Release
+    {
+        let dir = match key.code {
+            KeyCode::Left | KeyCode::Char('h' | 'H') => Some(PanDirection::Left),
+            KeyCode::Right | KeyCode::Char('l' | 'L') => Some(PanDirection::Right),
+            KeyCode::Up | KeyCode::Char('k' | 'K') => Some(PanDirection::Up),
+            KeyCode::Down | KeyCode::Char('j' | 'J') => Some(PanDirection::Down),
+            _ => None,
+        };
+        return dir.map(InputAction::PanRelease);
+    }
+
     match palette_mode {
         PaletteMode::Info => {
             if let Event::Key(KeyEvent {
                 code: KeyCode::Esc | KeyCode::Char('q'),
-                kind: KeyEventKind::Press,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             }) = ev
             {
@@ -76,7 +97,7 @@ pub fn translate_event(palette_mode: PaletteMode, ev: &Event) -> Option<InputAct
         }
         PaletteMode::Command | PaletteMode::File | PaletteMode::Prompt(_) => match ev {
             Event::Key(key) => {
-                if key.kind != KeyEventKind::Press {
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     return None;
                 }
                 if let Some(edit) = EditorAction::from_key_event(key) {
@@ -299,5 +320,150 @@ mod tests {
                 Some(InputAction::Overlay(OverlayAction::Close))
             );
         }
+    }
+
+    #[test]
+    fn test_translate_event_pan_release_and_focus_lost() {
+        let make_release = |code: KeyCode, modifiers: KeyModifiers| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            })
+        };
+
+        let all_modes = [
+            PaletteMode::Closed,
+            PaletteMode::Command,
+            PaletteMode::File,
+            PaletteMode::Prompt(PromptType::GoToImage),
+            PaletteMode::Info,
+        ];
+
+        for mode in all_modes {
+            // FocusLost clears held keys in every mode
+            assert_eq!(
+                translate_event(mode, &Event::FocusLost),
+                Some(InputAction::ClearHeldKeys)
+            );
+
+            // Arrow and hjkl releases (including uppercase/Shift) emit PanRelease
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Left, KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Left))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('h'), KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Left))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+                Some(InputAction::PanRelease(PanDirection::Left))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Right, KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Right))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('l'), KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Right))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+                Some(InputAction::PanRelease(PanDirection::Right))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Up, KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Up))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('k'), KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Up))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('K'), KeyModifiers::SHIFT)),
+                Some(InputAction::PanRelease(PanDirection::Up))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Down, KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Down))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('j'), KeyModifiers::NONE)),
+                Some(InputAction::PanRelease(PanDirection::Down))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('J'), KeyModifiers::SHIFT)),
+                Some(InputAction::PanRelease(PanDirection::Down))
+            );
+
+            // Ctrl/Alt modified releases still clear held pan state
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Left, KeyModifiers::CONTROL)),
+                Some(InputAction::PanRelease(PanDirection::Left))
+            );
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('h'), KeyModifiers::ALT)),
+                Some(InputAction::PanRelease(PanDirection::Left))
+            );
+
+            // Non-pan key releases are ignored
+            assert_eq!(
+                translate_event(mode, &make_release(KeyCode::Char('q'), KeyModifiers::NONE)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_translate_event_repeat_events() {
+        let make_repeat = |code: KeyCode, modifiers: KeyModifiers| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Repeat,
+                state: KeyEventState::NONE,
+            })
+        };
+
+        // Normal mode command repeat
+        assert_eq!(
+            translate_event(
+                PaletteMode::Closed,
+                &make_repeat(KeyCode::Left, KeyModifiers::NONE)
+            ),
+            Some(InputAction::Command(Command::PanLeft))
+        );
+        assert_eq!(
+            translate_event(
+                PaletteMode::Closed,
+                &make_repeat(KeyCode::Char('j'), KeyModifiers::NONE)
+            ),
+            Some(InputAction::Command(Command::PanDown))
+        );
+
+        // Palette editor & overlay repeat
+        assert_eq!(
+            translate_event(
+                PaletteMode::Command,
+                &make_repeat(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
+            Some(InputAction::Editor(EditorAction::Backspace))
+        );
+        assert_eq!(
+            translate_event(
+                PaletteMode::Command,
+                &make_repeat(KeyCode::Down, KeyModifiers::NONE)
+            ),
+            Some(InputAction::Overlay(OverlayAction::SelectNext))
+        );
+        assert_eq!(
+            translate_event(
+                PaletteMode::File,
+                &make_repeat(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(InputAction::Overlay(OverlayAction::SelectPrev))
+        );
     }
 }

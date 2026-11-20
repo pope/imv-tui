@@ -53,6 +53,7 @@ impl App {
 
     /// Initiates loading the currently selected image, checking prefetch cache first.
     pub fn start_load_image(&mut self) {
+        self.held_pan.clear();
         if self.queue.is_empty() {
             self.current_sequence += 1;
             self.active_sequence

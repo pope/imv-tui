@@ -8,6 +8,19 @@ use strum::IntoEnumIterator;
 
 use crate::config::keys::KeyDef;
 
+/// Cardinal viewport panning directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PanDirection {
+    /// Pan left (negative X axis).
+    Left,
+    /// Pan right (positive X axis).
+    Right,
+    /// Pan up (negative Y axis).
+    Up,
+    /// Pan down (positive Y axis).
+    Down,
+}
+
 /// User-facing metadata for a Command.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandItem {
@@ -174,9 +187,12 @@ impl Command {
     pub fn from_event(event: &event::Event) -> Option<Self> {
         let lookup = LOOKUP.get_or_init(init_command_lookup);
 
-        // Fast path for unshifted ASCII key presses (zero hashing, direct array lookup)
+        // Fast path for unshifted ASCII key presses/repeats (zero hashing, direct array lookup)
         if let event::Event::Key(key_event) = event
-            && key_event.kind == event::KeyEventKind::Press
+            && matches!(
+                key_event.kind,
+                event::KeyEventKind::Press | event::KeyEventKind::Repeat
+            )
             && key_event.modifiers.is_empty()
             && let event::KeyCode::Char(c) = key_event.code
         {
@@ -195,6 +211,17 @@ impl Command {
             }
         }
         lookup.map.get(&key_def).copied()
+    }
+
+    /// Returns the cardinal [`PanDirection`] if this command is a panning action.
+    pub const fn pan_direction(self) -> Option<PanDirection> {
+        match self {
+            Self::PanLeft => Some(PanDirection::Left),
+            Self::PanRight => Some(PanDirection::Right),
+            Self::PanUp => Some(PanDirection::Up),
+            Self::PanDown => Some(PanDirection::Down),
+            _ => None,
+        }
     }
 
     /// Retreives user-facing presentation metadata and shortcut keys configured for the command variant.

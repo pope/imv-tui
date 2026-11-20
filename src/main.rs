@@ -10,6 +10,7 @@ mod ui;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::app::{App, ImageDisplayState};
@@ -20,7 +21,11 @@ use crate::imaging::{
 };
 use crate::ui::ui;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture},
+    event::{
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     terminal::{
         BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
@@ -32,13 +37,32 @@ use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend},
 };
 
-struct TerminalGuard;
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+struct TerminalGuard {
+    keyboard_enhanced: bool,
+}
 
 impl TerminalGuard {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         enable_raw_mode()?;
-        let guard = Self;
+        let supports_enhancement =
+            crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let mut guard = Self {
+            keyboard_enhanced: false,
+        };
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        if supports_enhancement
+            && execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+                EnableFocusChange
+            )
+            .is_ok()
+        {
+            guard.keyboard_enhanced = true;
+            KEYBOARD_ENHANCED.store(true, Ordering::Release);
+        }
         Ok(guard)
     }
 }
@@ -46,6 +70,13 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         crate::imaging::cleanup_all_kitty_shm_segments();
+        if self.keyboard_enhanced && KEYBOARD_ENHANCED.swap(false, Ordering::AcqRel) {
+            let _ = execute!(
+                io::stdout(),
+                PopKeyboardEnhancementFlags,
+                DisableFocusChange
+            );
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -205,7 +236,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .resolve_active_protocol(picker.protocol_type(), effective_compression)?;
 
     // Setup terminal using RAII guard
-    let _guard = TerminalGuard::new()?;
+    let guard = TerminalGuard::new()?;
     let mut active_protocol = active_protocol;
     if options.protocol.should_probe_kitty_shm()
         && matches!(
@@ -227,6 +258,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         disable_thumbnail: options.no_thumbnail,
         infobar: options.infobar,
         active_protocol,
+        keyboard_enhanced: guard.keyboard_enhanced,
     };
 
     let scan_config = if is_piped {
@@ -330,13 +362,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // for redrawing to prevent infinite drawing feedback loops and high CPU usage.
             let mut meaningful = false;
             for ev in events.drain(..) {
-                meaningful |= matches!(
-                    ev,
-                    event::Event::Key(_)
-                        | event::Event::Resize(_, _)
-                        | event::Event::Mouse(_)
-                        | event::Event::Paste(_)
-                );
+                meaningful |= match ev {
+                    event::Event::Key(k) => k.kind != KeyEventKind::Release,
+                    event::Event::Resize(_, _)
+                    | event::Event::Mouse(_)
+                    | event::Event::Paste(_) => true,
+                    _ => false,
+                };
                 if let event::Event::Resize(w, h) = ev {
                     term_size.width = w;
                     term_size.height = h;
@@ -354,7 +386,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    drop(_guard);
+    drop(guard);
 
     if let Some(ref path) = options.export_path {
         app.export_classifications(path).map_err(io::Error::other)?;
@@ -370,6 +402,13 @@ fn main() {
     // Register custom panic hook that restores standard terminal mode
     // before displaying panic details on console stderr.
     std::panic::set_hook(Box::new(|panic_info| {
+        if KEYBOARD_ENHANCED.swap(false, Ordering::AcqRel) {
+            let _ = execute!(
+                io::stdout(),
+                PopKeyboardEnhancementFlags,
+                DisableFocusChange
+            );
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),

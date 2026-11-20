@@ -22,7 +22,12 @@ impl KeyDef {
     #[cfg(test)]
     pub fn matches(self, event: &event::Event) -> bool {
         match event {
-            event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
+            event::Event::Key(key_event)
+                if matches!(
+                    key_event.kind,
+                    event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                ) =>
+            {
                 use event::{KeyCode, KeyModifiers};
                 match self {
                     Self::Char(c) => {
@@ -86,7 +91,12 @@ impl KeyDef {
     /// with 100% behavioral parity with `KeyDef::matches`.
     pub fn from_event(event: &event::Event) -> Option<Self> {
         match event {
-            event::Event::Key(key_event) if key_event.kind == event::KeyEventKind::Press => {
+            event::Event::Key(key_event)
+                if matches!(
+                    key_event.kind,
+                    event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                ) =>
+            {
                 use event::{KeyCode, KeyModifiers};
                 if key_event.modifiers.contains(KeyModifiers::ALT) {
                     return None;
@@ -263,5 +273,46 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(KeyDef::from_event(&scroll_down), Some(KeyDef::ScrollDown));
+    }
+
+    #[test]
+    fn test_key_repeat_matches_and_release_rejected() {
+        let repeat_left = Event::Key(KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        });
+        let release_left = Event::Key(KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+        let repeat_h = Event::Key(KeyEvent {
+            code: KeyCode::Char('h'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        });
+        let release_h = Event::Key(KeyEvent {
+            code: KeyCode::Char('h'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+
+        assert!(KeyDef::Code(KeyCode::Left).matches(&repeat_left));
+        assert!(!KeyDef::Code(KeyCode::Left).matches(&release_left));
+        assert_eq!(
+            KeyDef::from_event(&repeat_left),
+            Some(KeyDef::Code(KeyCode::Left))
+        );
+        assert_eq!(KeyDef::from_event(&release_left), None);
+
+        assert!(KeyDef::Char('h').matches(&repeat_h));
+        assert!(!KeyDef::Char('h').matches(&release_h));
+        assert_eq!(KeyDef::from_event(&repeat_h), Some(KeyDef::Char('h')));
+        assert_eq!(KeyDef::from_event(&release_h), None);
     }
 }

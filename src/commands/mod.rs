@@ -9,4 +9,4 @@ pub mod registry;
 
 pub use actions::{InputAction, OverlayAction, PaletteMode, PromptType, translate_event};
 pub use line_editor::LineEditor;
-pub use registry::{Command, get_commands};
+pub use registry::{Command, PanDirection, get_commands};

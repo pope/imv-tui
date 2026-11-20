@@ -2,12 +2,179 @@
 
 use crate::app::palette::PaletteMode;
 use crate::app::{App, LoadPhase};
+use crate::commands::PanDirection;
 use crate::imaging::{
     Brightness, CellDimensions, Contrast, CropBox, ImageIntersection, PanOffset, PixelDimensions,
     ProtocolType, ResizeRequest, Rotation, ScaleMode, ZoomFactor, rotate90_fast, rotate270_fast,
 };
 use crate::ui::ThumbnailState;
 use std::sync::Arc;
+
+/// Signed unit step along a single viewport axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AxisStep {
+    /// Negative direction (left or up).
+    Neg,
+    /// Stationary (no movement along this axis).
+    #[default]
+    Zero,
+    /// Positive direction (right or down).
+    Pos,
+}
+
+impl AxisStep {
+    /// Returns the numeric sign (`-1`, `0`, or `1`) for this axis step.
+    pub const fn signum(self) -> i64 {
+        match self {
+            Self::Neg => -1,
+            Self::Zero => 0,
+            Self::Pos => 1,
+        }
+    }
+}
+
+/// Two-dimensional directional step vector for viewport panning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PanVector {
+    /// Horizontal axis step.
+    pub dx: AxisStep,
+    /// Vertical axis step.
+    pub dy: AxisStep,
+}
+
+impl PanVector {
+    /// Creates a single-axis [`PanVector`] from a cardinal [`PanDirection`].
+    pub const fn from_direction(dir: PanDirection) -> Self {
+        match dir {
+            PanDirection::Left => Self {
+                dx: AxisStep::Neg,
+                dy: AxisStep::Zero,
+            },
+            PanDirection::Right => Self {
+                dx: AxisStep::Pos,
+                dy: AxisStep::Zero,
+            },
+            PanDirection::Up => Self {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Neg,
+            },
+            PanDirection::Down => Self {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Pos,
+            },
+        }
+    }
+
+    /// Returns `true` if both horizontal and vertical steps are zero.
+    pub const fn is_zero(self) -> bool {
+        matches!(self.dx, AxisStep::Zero) && matches!(self.dy, AxisStep::Zero)
+    }
+}
+
+/// Bitmask tracking which cardinal pan keys are currently held down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeldPanMask {
+    bits: u8,
+}
+
+impl HeldPanMask {
+    const LEFT: u8 = 1 << 0;
+    const RIGHT: u8 = 1 << 1;
+    const UP: u8 = 1 << 2;
+    const DOWN: u8 = 1 << 3;
+
+    const fn bit(dir: PanDirection) -> u8 {
+        match dir {
+            PanDirection::Left => Self::LEFT,
+            PanDirection::Right => Self::RIGHT,
+            PanDirection::Up => Self::UP,
+            PanDirection::Down => Self::DOWN,
+        }
+    }
+
+    /// Marks `dir` as currently held.
+    pub fn press(&mut self, dir: PanDirection) {
+        self.bits |= Self::bit(dir);
+    }
+
+    /// Clears `dir` from the held set.
+    pub fn release(&mut self, dir: PanDirection) {
+        self.bits &= !Self::bit(dir);
+    }
+
+    /// Clears all held directions.
+    pub fn clear(&mut self) {
+        self.bits = 0;
+    }
+
+    /// Computes the combined [`PanVector`] from all currently held directions.
+    /// Opposing directions on the same axis (e.g. Left + Right) cancel to [`AxisStep::Zero`].
+    pub const fn vector(self) -> PanVector {
+        let left = (self.bits & Self::LEFT) != 0;
+        let right = (self.bits & Self::RIGHT) != 0;
+        let dx = match (left, right) {
+            (true, false) => AxisStep::Neg,
+            (false, true) => AxisStep::Pos,
+            _ => AxisStep::Zero,
+        };
+
+        let up = (self.bits & Self::UP) != 0;
+        let down = (self.bits & Self::DOWN) != 0;
+        let dy = match (up, down) {
+            (true, false) => AxisStep::Neg,
+            (false, true) => AxisStep::Pos,
+            _ => AxisStep::Zero,
+        };
+
+        PanVector { dx, dy }
+    }
+}
+
+/// Type-safe state machine for tracking held pan keys with safe fallback on legacy terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeldPanState {
+    /// Terminal does not report key release events; every press is a stateless single-axis step.
+    #[default]
+    Unsupported,
+    /// Terminal supports Kitty keyboard event types; tracks held pan keys for diagonal panning.
+    Tracking(HeldPanMask),
+}
+
+impl HeldPanState {
+    /// Creates a new [`HeldPanState`] based on whether keyboard enhancement is active.
+    pub fn new(keyboard_enhanced: bool) -> Self {
+        if keyboard_enhanced {
+            Self::Tracking(HeldPanMask::default())
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    /// Records a press/repeat of `dir` and returns the resulting [`PanVector`].
+    pub fn on_press(&mut self, dir: PanDirection) -> PanVector {
+        match self {
+            Self::Unsupported => PanVector::from_direction(dir),
+            Self::Tracking(mask) => {
+                mask.press(dir);
+                mask.vector()
+            }
+        }
+    }
+
+    /// Records a release of `dir` when tracking is active.
+    pub fn on_release(&mut self, dir: PanDirection) {
+        if let Self::Tracking(mask) = self {
+            mask.release(dir);
+        }
+    }
+
+    /// Clears all tracked held keys when tracking is active.
+    pub fn clear(&mut self) {
+        if let Self::Tracking(mask) = self {
+            mask.clear();
+        }
+    }
+}
 
 impl App {
     /// Calculates the size of the viewport area, subtracting the infobar height if configured.
@@ -501,48 +668,49 @@ impl App {
         self.pan_offset.clamp(self.img_width, self.img_height);
     }
 
-    /// Pans the image viewport to the left.
-    pub fn pan_left(&mut self) {
-        if self.original_image.is_none() || self.is_loading() {
+    /// Pans the image viewport along the given [`PanVector`].
+    pub fn pan_by(&mut self, vec: PanVector) {
+        if vec.is_zero() || self.original_image.is_none() || self.is_loading() {
             return;
         }
-        let step = self.pan_step_x();
-        self.pan_offset.x = self.pan_offset.x.saturating_sub(step);
+        let step_x = self.pan_step_x();
+        let step_y = self.pan_step_y();
+        self.pan_offset.x = self
+            .pan_offset
+            .x
+            .saturating_add(vec.dx.signum().saturating_mul(step_x));
+        self.pan_offset.y = self
+            .pan_offset
+            .y
+            .saturating_add(vec.dy.signum().saturating_mul(step_y));
         self.clamp_pan();
         self.resize_state.mark_dirty();
+    }
+
+    /// Handles a keyboard pan press or repeat event using [`HeldPanState`].
+    pub fn handle_pan_press(&mut self, dir: PanDirection) {
+        let vec = self.held_pan.on_press(dir);
+        self.pan_by(vec);
+    }
+
+    /// Pans the image viewport to the left.
+    pub fn pan_left(&mut self) {
+        self.pan_by(PanVector::from_direction(PanDirection::Left));
     }
 
     /// Pans the image viewport to the right.
     pub fn pan_right(&mut self) {
-        if self.original_image.is_none() || self.is_loading() {
-            return;
-        }
-        let step = self.pan_step_x();
-        self.pan_offset.x = self.pan_offset.x.saturating_add(step);
-        self.clamp_pan();
-        self.resize_state.mark_dirty();
+        self.pan_by(PanVector::from_direction(PanDirection::Right));
     }
 
     /// Pans the image viewport upwards.
     pub fn pan_up(&mut self) {
-        if self.original_image.is_none() || self.is_loading() {
-            return;
-        }
-        let step = self.pan_step_y();
-        self.pan_offset.y = self.pan_offset.y.saturating_sub(step);
-        self.clamp_pan();
-        self.resize_state.mark_dirty();
+        self.pan_by(PanVector::from_direction(PanDirection::Up));
     }
 
     /// Pans the image viewport downwards.
     pub fn pan_down(&mut self) {
-        if self.original_image.is_none() || self.is_loading() {
-            return;
-        }
-        let step = self.pan_step_y();
-        self.pan_offset.y = self.pan_offset.y.saturating_add(step);
-        self.clamp_pan();
-        self.resize_state.mark_dirty();
+        self.pan_by(PanVector::from_direction(PanDirection::Down));
     }
 
     /// Calculates the horizontal panning step delta based on viewport cell width and zoom level.

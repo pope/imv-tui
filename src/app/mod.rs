@@ -20,6 +20,7 @@ pub use cache::PrefetchCache;
 pub use classifications::{Classification, ViewMode};
 pub use palette::{PaletteMode, PromptType};
 pub use queue::ImageQueue;
+pub use viewport::HeldPanState;
 
 use image::DynamicImage;
 use std::collections::HashMap;
@@ -389,12 +390,18 @@ pub use crate::imaging::ResizeResponse;
 /// Configuration parameters for app components.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    /// Image scaling filter algorithm.
     pub filter_type: FilterType,
+    /// Viewport image scaling behavior.
     pub scale_mode: ScaleMode,
+    /// Disable EXIF thumbnail extraction and preview.
     pub disable_thumbnail: bool,
+    /// Position of the status infobar.
     pub infobar: InfoBarPosition,
     /// Active graphics protocol used by the app.
     pub active_protocol: crate::config::ActiveProtocol,
+    /// Whether the terminal supports Kitty keyboard enhancement event types.
+    pub keyboard_enhanced: bool,
 }
 
 impl Default for AppConfig {
@@ -405,6 +412,7 @@ impl Default for AppConfig {
             disable_thumbnail: false,
             infobar: InfoBarPosition::Bottom,
             active_protocol: crate::config::ActiveProtocol::Halfblocks,
+            keyboard_enhanced: false,
         }
     }
 }
@@ -541,6 +549,8 @@ pub struct App {
     pub scroll_cadence: ScrollCadence,
     /// Active runtime terminal graphics protocol and its protocol-specific options.
     pub active_protocol: crate::config::ActiveProtocol,
+    /// Tracks currently held pan keys when Kitty keyboard enhancement is active.
+    pub held_pan: HeldPanState,
 }
 
 impl App {
@@ -653,6 +663,7 @@ impl App {
             active_sequence,
             scroll_cadence: ScrollCadence::Idle,
             active_protocol: config.active_protocol,
+            held_pan: HeldPanState::new(config.keyboard_enhanced),
         }
     }
 
@@ -1132,6 +1143,7 @@ impl App {
                         self.last_info_toggle = Some(std::time::Instant::now());
                     }
                 } else {
+                    self.held_pan.clear();
                     self.palette_mode = PaletteMode::Info;
                     self.palette_height = 23;
                     self.screen_clear.request_now();
@@ -1189,6 +1201,7 @@ impl App {
 
     /// Opens an overlay palette (Command, File, etc.) and clears previous query state.
     pub fn open_palette(&mut self, mode: PaletteMode) {
+        self.held_pan.clear();
         self.palette_mode = mode;
         self.palette_query.clear();
         self.palette_selected_index = match mode {
@@ -1222,6 +1235,7 @@ impl App {
 
     /// Opens a single-line input prompt for value entry.
     pub fn open_prompt(&mut self, prompt_type: PromptType) {
+        self.held_pan.clear();
         self.palette_mode = PaletteMode::Prompt(prompt_type);
         self.palette_query.clear();
         self.palette_selected_index = 0;
@@ -1370,6 +1384,7 @@ pub fn setup_test_app_with_channels() -> (App, MockChannels) {
         disable_thumbnail: false,
         infobar: InfoBarPosition::Bottom,
         active_protocol: crate::config::ActiveProtocol::Halfblocks,
+        keyboard_enhanced: false,
     };
     let scan_config = ScanConfig::Directory {
         path: std::path::PathBuf::from("."),

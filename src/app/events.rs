@@ -11,7 +11,17 @@ impl App {
     pub fn apply_action(&mut self, action: InputAction, terminal_height: u16) {
         match action {
             InputAction::Command(cmd) => {
-                self.execute_command(cmd);
+                if let Some(dir) = cmd.pan_direction() {
+                    self.handle_pan_press(dir);
+                } else {
+                    self.execute_command(cmd);
+                }
+            }
+            InputAction::PanRelease(dir) => {
+                self.held_pan.on_release(dir);
+            }
+            InputAction::ClearHeldKeys => {
+                self.held_pan.clear();
             }
             InputAction::Editor(edit) => {
                 if self.palette_query.apply_action(edit) {
@@ -410,5 +420,189 @@ mod tests {
         app.apply_action(InputAction::Overlay(OverlayAction::Confirm), 24);
         // PaletteMode should transition to Prompt(PromptType::GoToImage) and NOT close
         assert_eq!(app.palette_mode, PaletteMode::Prompt(PromptType::GoToImage));
+    }
+
+    #[test]
+    fn test_held_pan_state_tracking_and_unsupported() {
+        use crate::app::HeldPanState;
+        use crate::app::viewport::{AxisStep, PanVector};
+        use crate::commands::PanDirection;
+
+        // 1. Tracking mode: all four diagonals
+        let mut state = HeldPanState::new(true);
+        assert_eq!(
+            state.on_press(PanDirection::Up),
+            PanVector {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Neg,
+            }
+        );
+        assert_eq!(
+            state.on_press(PanDirection::Left),
+            PanVector {
+                dx: AxisStep::Neg,
+                dy: AxisStep::Neg,
+            }
+        );
+        // Release Left -> only Up remains
+        state.on_release(PanDirection::Left);
+        assert_eq!(
+            state.on_press(PanDirection::Up),
+            PanVector {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Neg,
+            }
+        );
+        // Up + Right
+        assert_eq!(
+            state.on_press(PanDirection::Right),
+            PanVector {
+                dx: AxisStep::Pos,
+                dy: AxisStep::Neg,
+            }
+        );
+        // Opposing keys Left + Right cancel on X while Up remains on Y
+        assert_eq!(
+            state.on_press(PanDirection::Left),
+            PanVector {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Neg,
+            }
+        );
+        // Opposing keys Up + Down cancel on both axes
+        assert_eq!(
+            state.on_press(PanDirection::Down),
+            PanVector {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Zero,
+            }
+        );
+        assert!(state.on_press(PanDirection::Down).is_zero());
+
+        // Clear resets all held keys
+        state.clear();
+        assert_eq!(
+            state.on_press(PanDirection::Down),
+            PanVector {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Pos,
+            }
+        );
+        assert_eq!(
+            state.on_press(PanDirection::Left),
+            PanVector {
+                dx: AxisStep::Neg,
+                dy: AxisStep::Pos,
+            }
+        );
+        state.on_release(PanDirection::Left);
+        assert_eq!(
+            state.on_press(PanDirection::Right),
+            PanVector {
+                dx: AxisStep::Pos,
+                dy: AxisStep::Pos,
+            }
+        );
+
+        // 2. Unsupported mode: never sticks keys across presses without release
+        let mut legacy = HeldPanState::new(false);
+        assert_eq!(
+            legacy.on_press(PanDirection::Up),
+            PanVector {
+                dx: AxisStep::Zero,
+                dy: AxisStep::Neg,
+            }
+        );
+        assert_eq!(
+            legacy.on_press(PanDirection::Left),
+            PanVector {
+                dx: AxisStep::Neg,
+                dy: AxisStep::Zero,
+            }
+        );
+        legacy.on_release(PanDirection::Up);
+        legacy.clear();
+        assert_eq!(
+            legacy.on_press(PanDirection::Right),
+            PanVector {
+                dx: AxisStep::Pos,
+                dy: AxisStep::Zero,
+            }
+        );
+    }
+
+    #[test]
+    fn test_diagonal_panning_via_app_events() {
+        let mut app = setup_test_app();
+        app.held_pan = crate::app::HeldPanState::new(true);
+        app.original_image = Some(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+            image::RgbImage::new(2000, 2000),
+        )));
+        app.initial_load = crate::app::InitialLoadState::Idle;
+        app.img_width = 2000;
+        app.img_height = 2000;
+        app.last_widget_size = (80, 24);
+        app.zoom_factor = crate::imaging::ZoomFactor::new(4.0);
+
+        let step_x = app.pan_step_x();
+        let step_y = app.pan_step_y();
+        assert!(step_x > 0 && step_y > 0);
+
+        let key_with_kind = |code: KeyCode, kind: KeyEventKind| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind,
+                state: KeyEventState::NONE,
+            })
+        };
+
+        // Hold Down + Right -> first Down moves (0, +step_y), then Right moves (+step_x, +step_y)
+        app.handle_event(key_with_kind(KeyCode::Down, KeyEventKind::Press), 24);
+        assert_eq!((app.pan_offset.x, app.pan_offset.y), (0, step_y));
+
+        app.handle_event(key_with_kind(KeyCode::Right, KeyEventKind::Press), 24);
+        assert_eq!((app.pan_offset.x, app.pan_offset.y), (step_x, 2 * step_y));
+
+        // Repeat on Right while Down is still held continues diagonal motion
+        app.handle_event(key_with_kind(KeyCode::Right, KeyEventKind::Repeat), 24);
+        assert_eq!(
+            (app.pan_offset.x, app.pan_offset.y),
+            (2 * step_x, 3 * step_y)
+        );
+
+        // Release Down -> repeat on Right now pans purely horizontally
+        app.handle_event(key_with_kind(KeyCode::Down, KeyEventKind::Release), 24);
+        app.handle_event(key_with_kind(KeyCode::Right, KeyEventKind::Repeat), 24);
+        assert_eq!(
+            (app.pan_offset.x, app.pan_offset.y),
+            (3 * step_x, 3 * step_y)
+        );
+
+        // FocusLost clears remaining held Right key
+        app.handle_event(Event::FocusLost, 24);
+        app.handle_event(key_with_kind(KeyCode::Char('k'), KeyEventKind::Press), 24);
+        assert_eq!(
+            (app.pan_offset.x, app.pan_offset.y),
+            (3 * step_x, 2 * step_y)
+        );
+
+        // Diagonal with hjkl: 'k' is held, press 'h' -> moves (-step_x, -step_y)
+        app.handle_event(key_with_kind(KeyCode::Char('h'), KeyEventKind::Press), 24);
+        assert_eq!((app.pan_offset.x, app.pan_offset.y), (2 * step_x, step_y));
+
+        // Opening palette clears held keys
+        app.open_palette(PaletteMode::Command);
+        app.close_palette();
+        app.handle_event(key_with_kind(KeyCode::Char('l'), KeyEventKind::Press), 24);
+        assert_eq!((app.pan_offset.x, app.pan_offset.y), (3 * step_x, step_y));
+        app.handle_event(key_with_kind(KeyCode::Char('l'), KeyEventKind::Release), 24);
+
+        // Legacy mode (Unsupported) never pans diagonally without releases
+        app.held_pan = crate::app::HeldPanState::new(false);
+        app.pan_offset = crate::imaging::PanOffset::ZERO;
+        app.handle_event(key_with_kind(KeyCode::Down, KeyEventKind::Press), 24);
+        app.handle_event(key_with_kind(KeyCode::Right, KeyEventKind::Press), 24);
+        assert_eq!((app.pan_offset.x, app.pan_offset.y), (step_x, step_y));
     }
 }
