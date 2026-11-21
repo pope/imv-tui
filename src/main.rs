@@ -290,6 +290,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut was_showing_spinner = false;
     let mut last_loop_tick = std::time::Instant::now();
     let mut events = Vec::with_capacity(16);
+    let mut term_size = terminal.size().unwrap_or_default();
 
     // Main event loop
     while app.running {
@@ -306,7 +307,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         app.tick();
 
-        let mut term_size = terminal.size().unwrap_or_default();
         let (widget_w, widget_h) = app.get_viewport_size(term_size.width, term_size.height);
         if app.last_widget_size != (widget_w, widget_h) {
             draw_needed = true;
@@ -338,6 +338,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     clear_fullscreen_without_query(terminal)?;
                 }
                 terminal.draw(|f| {
+                    term_size = f.area().as_size();
                     let mut model = app.ui_model();
                     ui(f, &mut model);
                 })?;
