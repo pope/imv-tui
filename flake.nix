@@ -3,17 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    llm-agents = {
-      url = "github:numtide/llm-agents.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    jailed-agents = {
-      url = "github:andersonjoseph/jailed-agents";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-        llm-agents.follows = "llm-agents";
-      };
-    };
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -22,9 +11,7 @@
 
   outputs =
     {
-      jailed-agents,
       nixpkgs,
-      llm-agents,
       self,
       treefmt-nix,
       ...
@@ -74,21 +61,6 @@
               "target/*"
             ];
           });
-          packages = with pkgs; [
-            cargo
-            cargo-flamegraph
-            cargo-nextest
-            cargo-tarpaulin
-            cargo-watch
-            clang
-            clippy
-            llvmPackages.bintools
-            rust-analyzer
-            rustc
-            rustfmt
-            samply
-            self.formatter.${system}
-          ];
         in
         {
           packages.${system} = rec {
@@ -102,13 +74,20 @@
             inherit (pkgs) imv-tui-static-aarch64;
           };
           devShells.${system}.default = pkgs.mkShell {
-            packages = packages ++ [
-              (jailed-agents.lib.${system}.makeJailedAgent {
-                name = "agy";
-                pkg = llm-agents.packages.${system}.antigravity-cli;
-                configPaths = [ "~/.gemini" ];
-                extraPkgs = packages;
-              })
+            packages = with pkgs; [
+              cargo
+              cargo-flamegraph
+              cargo-nextest
+              cargo-tarpaulin
+              cargo-watch
+              clang
+              clippy
+              llvmPackages.bintools
+              rust-analyzer
+              rustc
+              rustfmt
+              samply
+              self.formatter.${system}
             ];
           };
           formatter.${system} = treefmt-eval.config.build.wrapper;
