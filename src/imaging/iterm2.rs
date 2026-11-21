@@ -104,13 +104,18 @@ impl Iterm2Protocol {
     }
 }
 
-/// Encodes `source` into either JPEG (q90, opaque only) or fast lossless PNG (Fast + Paeth).
+/// Encodes `source` into either JPEG (q90, opaque only) or fast lossless PNG (`Sub` locally, `Paeth` when compressed).
 fn encode_image_payload(
     source: &DynamicImage,
     width: u32,
     height: u32,
     use_jpeg_for_opaque: bool,
 ) -> Result<Vec<u8>, String> {
+    let png_filter = if use_jpeg_for_opaque {
+        PngFilter::Paeth
+    } else {
+        PngFilter::Sub
+    };
     let pixel_count = (width as usize).saturating_mul(height as usize);
     let initial_cap = if use_jpeg_for_opaque {
         (pixel_count / 4).max(4096)
@@ -139,6 +144,7 @@ fn encode_image_payload(
                     width,
                     height,
                     ExtendedColorType::Rgba8,
+                    png_filter,
                     &mut encoded,
                 )?;
             }
@@ -154,6 +160,7 @@ fn encode_image_payload(
                     width,
                     height,
                     ExtendedColorType::Rgba8,
+                    png_filter,
                     &mut encoded,
                 )?;
             }
@@ -163,7 +170,7 @@ fn encode_image_payload(
     Ok(encoded)
 }
 
-/// Encodes opaque RGB8 pixel data as JPEG q90 or lossless PNG (`Fast` + `Paeth`).
+/// Encodes opaque RGB8 pixel data as JPEG q90 or lossless PNG (`Fast` + `Sub`).
 fn encode_opaque_rgb8(
     rgb: &[u8],
     width: u32,
@@ -177,19 +184,27 @@ fn encode_opaque_rgb8(
             .encode(rgb, width, height, ExtendedColorType::Rgb8)
             .map_err(|e| format!("JPEG encode failed: {e}"))
     } else {
-        encode_png_fast(rgb, width, height, ExtendedColorType::Rgb8, out)
+        encode_png_fast(
+            rgb,
+            width,
+            height,
+            ExtendedColorType::Rgb8,
+            PngFilter::Sub,
+            out,
+        )
     }
 }
 
-/// Encodes raw pixel bytes as PNG using `CompressionType::Fast` and `FilterType::Paeth`.
+/// Encodes raw pixel bytes as PNG using `CompressionType::Fast` and the given PNG row filter.
 fn encode_png_fast(
     raw: &[u8],
     width: u32,
     height: u32,
     color_type: ExtendedColorType,
+    filter: PngFilter,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let encoder = PngEncoder::new_with_quality(out, CompressionType::Fast, PngFilter::Paeth);
+    let encoder = PngEncoder::new_with_quality(out, CompressionType::Fast, filter);
     encoder
         .write_image(raw, width, height, color_type)
         .map_err(|e| format!("PNG encode failed: {e}"))
