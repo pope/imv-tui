@@ -39,6 +39,70 @@ use ratatui::{
 
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
+/// Size of the userspace write buffer wrapping raw stdout (256 KiB).
+///
+/// Coalesces ratatui frames and Kitty/Sixel graphics payloads into fewer
+/// `write(2)` syscalls while avoiding `std::io::Stdout`'s `LineWriterShim`
+/// `memrchr('\n')` scan across multi-megabyte graphics payloads.
+const STDOUT_BUFFER_CAPACITY: usize = 256 * 1024;
+
+/// Unbuffered writer for standard output that bypasses `std::io::Stdout`'s
+/// internal `LineWriterShim` (`memrchr('\n')` scan).
+///
+/// On Unix, this borrows `STDOUT_FILENO` via `ManuallyDrop<File>` so fd 1 is
+/// never closed on drop. Intended to be wrapped in `io::BufWriter`.
+struct RawStdout {
+    #[cfg(unix)]
+    inner: std::mem::ManuallyDrop<std::fs::File>,
+    #[cfg(not(unix))]
+    inner: io::Stdout,
+}
+
+impl RawStdout {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::FromRawFd;
+            // SAFETY: `STDOUT_FILENO` (fd 1) remains open for the lifetime of
+            // the process, and `ManuallyDrop` ensures it is never closed.
+            let file = unsafe { std::fs::File::from_raw_fd(libc::STDOUT_FILENO) };
+            Self {
+                inner: std::mem::ManuallyDrop::new(file),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                inner: io::stdout(),
+            }
+        }
+    }
+}
+
+impl io::Write for RawStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            (&*self.inner).write(buf)
+        }
+        #[cfg(not(unix))]
+        {
+            self.inner.write(buf)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            (&*self.inner).flush()
+        }
+        #[cfg(not(unix))]
+        {
+            self.inner.flush()
+        }
+    }
+}
+
 struct TerminalGuard {
     keyboard_enhanced: bool,
 }
@@ -248,8 +312,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let shm_ok = crate::imaging::probe_kitty_shm_support(picker.tmux_detected());
         active_protocol = active_protocol.with_kitty_shm(shm_ok);
     }
-    let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
+    let writer = io::BufWriter::with_capacity(STDOUT_BUFFER_CAPACITY, RawStdout::new());
+    let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend)?;
 
     let app_config = crate::app::AppConfig {
@@ -387,6 +451,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    drop(terminal);
     drop(guard);
 
     if let Some(ref path) = options.export_path {
@@ -573,6 +638,50 @@ mod tests {
         assert!(
             out.ends_with(END_SYNC),
             "expected EndSynchronizedUpdate to be written on error via Drop, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn synchronized_update_flushes_buf_writer() {
+        let capture = CaptureWriter::default();
+        let buffered = io::BufWriter::with_capacity(STDOUT_BUFFER_CAPACITY, capture.clone());
+        let backend = CrosstermBackend::new(buffered);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .expect("fixed-viewport terminal creation should not fail");
+
+        run_synchronized_update(&mut terminal, |terminal| {
+            clear_fullscreen_without_query(terminal)?;
+            terminal.draw(|f| {
+                f.render_widget(Paragraph::new("buffered"), f.area());
+            })?;
+            Ok(())
+        })
+        .expect("synchronized update with BufWriter should succeed");
+
+        let out = capture.bytes();
+        assert!(
+            capture.flushes() > 0,
+            "expected underlying writer to be flushed through BufWriter"
+        );
+        assert!(
+            out.starts_with(BEGIN_SYNC),
+            "expected output to start with BeginSynchronizedUpdate, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.ends_with(END_SYNC),
+            "expected output to end with EndSynchronizedUpdate, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.windows(b"buffered".len()).any(|w| w == b"buffered"),
+            "expected drawn frame content to be flushed through BufWriter, got: {:?}",
             String::from_utf8_lossy(&out)
         );
     }
