@@ -35,10 +35,20 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
+      overlay = final: _prev: {
+        imv-tui = final.callPackage ./nix/imv-tui.nix { };
+        imv-tui-static = final.pkgsStatic.callPackage ./nix/imv-tui.nix { };
+        imv-tui-static-aarch64 =
+          final.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.callPackage ./nix/imv-tui.nix
+            { };
+      };
       sys-config =
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ overlay ];
+          };
           treefmt-eval = treefmt-nix.lib.evalModule pkgs (_: {
             projectRootFile = "flake.nix";
             programs = {
@@ -79,32 +89,17 @@
             samply
             self.formatter.${system}
           ];
-          commonArgs = {
-            pname = "imv-tui";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-            };
-          };
         in
         {
           packages.${system} = rec {
-            imv-tui = pkgs.rustPlatform.buildRustPackage (
-              commonArgs
-              // {
-                nativeBuildInputs = pkgs.lib.optionals (system == "x86_64-linux") [
-                  pkgs.llvmPackages.bintools
-                ];
-              }
-            );
+            inherit (pkgs) imv-tui;
             default = imv-tui;
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            imv-tui-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage commonArgs;
+            inherit (pkgs) imv-tui-static;
           }
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-            imv-tui-static-aarch64 = pkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.rustPlatform.buildRustPackage commonArgs;
+            inherit (pkgs) imv-tui-static-aarch64;
           };
           devShells.${system}.default = pkgs.mkShell {
             packages = packages ++ [
@@ -123,5 +118,7 @@
           };
         };
     in
-    builtins.foldl' nixpkgs.lib.recursiveUpdate { } (map sys-config systems);
+    builtins.foldl' nixpkgs.lib.recursiveUpdate {
+      overlays.default = overlay;
+    } (map sys-config systems);
 }
