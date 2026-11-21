@@ -1,8 +1,390 @@
 //! Low-level image file range loading, RAW metadata parsing, and EXIF processing.
 
-use std::io::{Read, Seek};
+use std::collections::HashMap;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::SystemTime;
 
 use super::types::ImageSource;
+
+/// Maximum number of CBZ central-directory indexes retained in the process-wide cache.
+const CBZ_INDEX_CACHE_CAP: usize = 8;
+
+/// Cap on initial `Vec::with_capacity` allocations derived from untrusted ZIP metadata (64MB).
+const MAX_CBZ_INITIAL_CAPACITY: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CbzCompression {
+    Stored,
+    Deflated,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CbzEntryMeta {
+    data_start: u64,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    compression: CbzCompression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CbzCacheKey {
+    path: PathBuf,
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
+struct CachedCbzIndex {
+    key: CbzCacheKey,
+    entries: Arc<HashMap<String, CbzEntryMeta>>,
+}
+
+fn cbz_index_cache() -> &'static RwLock<Vec<CachedCbzIndex>> {
+    static CACHE: OnceLock<RwLock<Vec<CachedCbzIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(Vec::with_capacity(CBZ_INDEX_CACHE_CAP)))
+}
+
+fn get_or_load_cbz_index(
+    zip_path: &Path,
+    file: &mut std::fs::File,
+) -> Result<Arc<HashMap<String, CbzEntryMeta>>, String> {
+    let key = file.metadata().ok().map(|meta| CbzCacheKey {
+        path: zip_path.to_path_buf(),
+        len: meta.len(),
+        mtime: meta.modified().ok(),
+    });
+
+    if let Some(ref k) = key {
+        let guard = cbz_index_cache().read().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = guard.iter().find(|c| c.key == *k) {
+            return Ok(Arc::clone(&cached.entries));
+        }
+    }
+
+    let reader = BufReader::new(&mut *file);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
+
+    let mut entries = HashMap::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i).map_err(|e| {
+            format!(
+                "Failed to read zip entry {} in {}: {}",
+                i,
+                zip_path.display(),
+                e
+            )
+        })?;
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let data_start = entry.data_start();
+        let compression = if entry.encrypted() || data_start.is_none() {
+            CbzCompression::Other
+        } else {
+            match entry.compression() {
+                zip::CompressionMethod::Stored => CbzCompression::Stored,
+                zip::CompressionMethod::Deflated => CbzCompression::Deflated,
+                _ => CbzCompression::Other,
+            }
+        };
+        entries.insert(
+            name.into_owned(),
+            CbzEntryMeta {
+                data_start: data_start.unwrap_or(0),
+                compressed_size: entry.compressed_size(),
+                uncompressed_size: entry.size(),
+                compression,
+            },
+        );
+    }
+
+    let index = Arc::new(entries);
+    if let Some(k) = key {
+        let mut guard = cbz_index_cache().write().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|c| c.key.path != k.path);
+        if guard.len() >= CBZ_INDEX_CACHE_CAP {
+            guard.remove(0);
+        }
+        guard.push(CachedCbzIndex {
+            key: k,
+            entries: Arc::clone(&index),
+        });
+    }
+
+    Ok(index)
+}
+
+fn read_cbz_entry_full(zip_path: &Path, file_in_zip: &str) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
+    let index = get_or_load_cbz_index(zip_path, &mut file)?;
+    let meta = index.get(file_in_zip).copied().ok_or_else(|| {
+        format!(
+            "Failed to locate page {} in {}: entry not found",
+            file_in_zip,
+            zip_path.display()
+        )
+    })?;
+
+    let map_read_err = |e: std::io::Error| {
+        format!(
+            "Failed to read page data {} from {}: {}",
+            file_in_zip,
+            zip_path.display(),
+            e
+        )
+    };
+
+    match meta.compression {
+        CbzCompression::Stored => {
+            let payload_len = meta.compressed_size.min(meta.uncompressed_size);
+            file.seek(SeekFrom::Start(meta.data_start))
+                .map_err(map_read_err)?;
+            let mut buffer = Vec::with_capacity(payload_len.min(MAX_CBZ_INITIAL_CAPACITY) as usize);
+            file.take(payload_len)
+                .read_to_end(&mut buffer)
+                .map_err(map_read_err)?;
+            Ok(buffer)
+        }
+        CbzCompression::Deflated => {
+            file.seek(SeekFrom::Start(meta.data_start))
+                .map_err(map_read_err)?;
+            let mut decoder =
+                flate2::read::DeflateDecoder::new(BufReader::new(file.take(meta.compressed_size)));
+            let mut buffer =
+                Vec::with_capacity(meta.uncompressed_size.min(MAX_CBZ_INITIAL_CAPACITY) as usize);
+            decoder.read_to_end(&mut buffer).map_err(map_read_err)?;
+            Ok(buffer)
+        }
+        CbzCompression::Other => {
+            file.seek(SeekFrom::Start(0)).map_err(map_read_err)?;
+            let mut archive = zip::ZipArchive::new(BufReader::new(file))
+                .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
+            let mut zip_entry = archive.by_name(file_in_zip).map_err(|e| {
+                format!(
+                    "Failed to locate page {} in {}: {}",
+                    file_in_zip,
+                    zip_path.display(),
+                    e
+                )
+            })?;
+            let mut buffer =
+                Vec::with_capacity(zip_entry.size().min(MAX_CBZ_INITIAL_CAPACITY) as usize);
+            zip_entry.read_to_end(&mut buffer).map_err(map_read_err)?;
+            Ok(buffer)
+        }
+    }
+}
+
+fn read_cbz_entry_limited(
+    zip_path: &Path,
+    file_in_zip: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
+    let index = get_or_load_cbz_index(zip_path, &mut file)?;
+    let meta = index.get(file_in_zip).copied().ok_or_else(|| {
+        format!(
+            "Failed to locate page {} in {}: entry not found",
+            file_in_zip,
+            zip_path.display()
+        )
+    })?;
+
+    let map_read_err = |e: std::io::Error| {
+        format!(
+            "Failed to read page data {} from {}: {}",
+            file_in_zip,
+            zip_path.display(),
+            e
+        )
+    };
+
+    match meta.compression {
+        CbzCompression::Stored => {
+            let payload_len = meta.compressed_size.min(meta.uncompressed_size);
+            let to_read = payload_len.min(limit as u64);
+            file.seek(SeekFrom::Start(meta.data_start))
+                .map_err(map_read_err)?;
+            let mut buffer = Vec::with_capacity(to_read.min(MAX_CBZ_INITIAL_CAPACITY) as usize);
+            file.take(to_read)
+                .read_to_end(&mut buffer)
+                .map_err(map_read_err)?;
+            Ok(buffer)
+        }
+        CbzCompression::Deflated => {
+            file.seek(SeekFrom::Start(meta.data_start))
+                .map_err(map_read_err)?;
+            let decoder =
+                flate2::read::DeflateDecoder::new(BufReader::new(file.take(meta.compressed_size)));
+            let cap = meta
+                .uncompressed_size
+                .min(limit as u64)
+                .min(MAX_CBZ_INITIAL_CAPACITY) as usize;
+            let mut buffer = Vec::with_capacity(cap);
+            decoder
+                .take(limit as u64)
+                .read_to_end(&mut buffer)
+                .map_err(map_read_err)?;
+            Ok(buffer)
+        }
+        CbzCompression::Other => {
+            file.seek(SeekFrom::Start(0)).map_err(map_read_err)?;
+            let mut archive = zip::ZipArchive::new(BufReader::new(file))
+                .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
+            let zip_entry = archive.by_name(file_in_zip).map_err(|e| {
+                format!(
+                    "Failed to locate page {} in {}: {}",
+                    file_in_zip,
+                    zip_path.display(),
+                    e
+                )
+            })?;
+            let mut buffer = Vec::new();
+            zip_entry
+                .take(limit as u64)
+                .read_to_end(&mut buffer)
+                .map_err(map_read_err)?;
+            Ok(buffer)
+        }
+    }
+}
+
+fn read_cbz_entry_range(
+    zip_path: &Path,
+    file_in_zip: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, String> {
+    let _total_len = offset
+        .checked_add(length)
+        .ok_or_else(|| "Offset + length calculation overflowed u64".to_string())?;
+    let mut file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Failed to open zip file: {}", e))?;
+    let index = get_or_load_cbz_index(zip_path, &mut file)?;
+    let meta = index
+        .get(file_in_zip)
+        .copied()
+        .ok_or_else(|| format!("Failed to locate zip entry: {} not found", file_in_zip))?;
+
+    match meta.compression {
+        CbzCompression::Stored => {
+            let payload_len = meta.compressed_size.min(meta.uncompressed_size);
+            let seek_pos = meta
+                .data_start
+                .checked_add(offset)
+                .ok_or_else(|| "Zip entry offset overflowed u64".to_string())?;
+            file.seek(SeekFrom::Start(seek_pos))
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let available = payload_len.saturating_sub(offset);
+            let mut buffer = vec![0u8; length as usize];
+            file.take(available)
+                .read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+        CbzCompression::Deflated => {
+            file.seek(SeekFrom::Start(meta.data_start))
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut decoder =
+                flate2::read::DeflateDecoder::new(BufReader::new(file.take(meta.compressed_size)));
+            std::io::copy(&mut decoder.by_ref().take(offset), &mut std::io::sink())
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut buffer = vec![0u8; length as usize];
+            decoder
+                .read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+        CbzCompression::Other => {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| format!("Failed to seek zip file: {}", e))?;
+            let mut archive = zip::ZipArchive::new(BufReader::new(file))
+                .map_err(|e| format!("Failed to read zip archive: {}", e))?;
+            let mut zip_entry = archive
+                .by_name(file_in_zip)
+                .map_err(|e| format!("Failed to locate zip entry: {}", e))?;
+            std::io::copy(&mut zip_entry.by_ref().take(offset), &mut std::io::sink())
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut buffer = vec![0u8; length as usize];
+            zip_entry
+                .read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+    }
+}
+
+fn read_cbz_entry_range_up_to(
+    zip_path: &Path,
+    file_in_zip: &str,
+    offset: u64,
+    max_length: usize,
+) -> Result<Vec<u8>, String> {
+    let mut file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Failed to open zip file: {}", e))?;
+    let index = get_or_load_cbz_index(zip_path, &mut file)?;
+    let meta = index
+        .get(file_in_zip)
+        .copied()
+        .ok_or_else(|| format!("Failed to locate zip entry: {} not found", file_in_zip))?;
+
+    match meta.compression {
+        CbzCompression::Stored => {
+            let payload_len = meta.compressed_size.min(meta.uncompressed_size);
+            if offset >= payload_len {
+                return Ok(Vec::new());
+            }
+            let seek_pos = meta
+                .data_start
+                .checked_add(offset)
+                .ok_or_else(|| "Zip entry offset overflowed u64".to_string())?;
+            file.seek(SeekFrom::Start(seek_pos))
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let to_read = (payload_len - offset).min(max_length as u64);
+            let mut buffer = Vec::with_capacity(to_read.min(MAX_CBZ_INITIAL_CAPACITY) as usize);
+            file.take(to_read)
+                .read_to_end(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+        CbzCompression::Deflated => {
+            file.seek(SeekFrom::Start(meta.data_start))
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut decoder =
+                flate2::read::DeflateDecoder::new(BufReader::new(file.take(meta.compressed_size)));
+            std::io::copy(&mut decoder.by_ref().take(offset), &mut std::io::sink())
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut buffer = Vec::new();
+            decoder
+                .take(max_length as u64)
+                .read_to_end(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+        CbzCompression::Other => {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| format!("Failed to seek zip file: {}", e))?;
+            let mut archive = zip::ZipArchive::new(BufReader::new(file))
+                .map_err(|e| format!("Failed to read zip archive: {}", e))?;
+            let mut zip_entry = archive
+                .by_name(file_in_zip)
+                .map_err(|e| format!("Failed to locate zip entry: {}", e))?;
+            std::io::copy(&mut zip_entry.by_ref().take(offset), &mut std::io::sink())
+                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
+            let mut buffer = Vec::new();
+            zip_entry
+                .take(max_length as u64)
+                .read_to_end(&mut buffer)
+                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
+            Ok(buffer)
+        }
+    }
+}
 
 /// Maximum probe limit in bytes for RAW EXIF metadata and preview extraction (2MB).
 /// RAW files often store IFD tags and JPEG preview offsets past 256KB while we
@@ -344,31 +726,7 @@ pub fn read_source_bytes_with_header(
         ImageSource::Cbz {
             zip_path,
             file_in_zip,
-        } => {
-            let file = std::fs::File::open(zip_path)
-                .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
-            let reader = std::io::BufReader::new(file);
-            let mut archive = zip::ZipArchive::new(reader)
-                .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
-            let mut zip_entry = archive.by_name(file_in_zip).map_err(|e| {
-                format!(
-                    "Failed to locate page {} in {}: {}",
-                    file_in_zip,
-                    zip_path.display(),
-                    e
-                )
-            })?;
-            let mut buffer = Vec::with_capacity(zip_entry.size() as usize);
-            zip_entry.read_to_end(&mut buffer).map_err(|e| {
-                format!(
-                    "Failed to read page data {} from {}: {}",
-                    file_in_zip,
-                    zip_path.display(),
-                    e
-                )
-            })?;
-            Ok(buffer)
-        }
+        } => read_cbz_entry_full(zip_path, file_in_zip),
     }
 }
 
@@ -394,34 +752,7 @@ pub fn read_source_bytes_limited(source: &ImageSource, limit: usize) -> Result<V
         ImageSource::Cbz {
             zip_path,
             file_in_zip,
-        } => {
-            let file = std::fs::File::open(zip_path)
-                .map_err(|e| format!("Failed to open zip file {}: {}", zip_path.display(), e))?;
-            let reader = std::io::BufReader::new(file);
-            let mut archive = zip::ZipArchive::new(reader)
-                .map_err(|e| format!("Failed to read zip archive {}: {}", zip_path.display(), e))?;
-            let zip_entry = archive.by_name(file_in_zip).map_err(|e| {
-                format!(
-                    "Failed to locate page {} in {}: {}",
-                    file_in_zip,
-                    zip_path.display(),
-                    e
-                )
-            })?;
-            let mut buffer = Vec::new();
-            zip_entry
-                .take(limit as u64)
-                .read_to_end(&mut buffer)
-                .map_err(|e| {
-                    format!(
-                        "Failed to read page data {} from {}: {}",
-                        file_in_zip,
-                        zip_path.display(),
-                        e
-                    )
-                })?;
-            Ok(buffer)
-        }
+        } => read_cbz_entry_limited(zip_path, file_in_zip, limit),
     }
 }
 
@@ -451,26 +782,7 @@ pub fn read_source_range(
         ImageSource::Cbz {
             zip_path,
             file_in_zip,
-        } => {
-            let file = std::fs::File::open(zip_path)
-                .map_err(|e| format!("Failed to open zip file: {}", e))?;
-            let reader = std::io::BufReader::new(file);
-            let mut archive = zip::ZipArchive::new(reader)
-                .map_err(|e| format!("Failed to read zip archive: {}", e))?;
-            let mut zip_entry = archive
-                .by_name(file_in_zip)
-                .map_err(|e| format!("Failed to locate zip entry: {}", e))?;
-            let _total_len = offset
-                .checked_add(length)
-                .ok_or_else(|| "Offset + length calculation overflowed u64".to_string())?;
-            std::io::copy(&mut zip_entry.by_ref().take(offset), &mut std::io::sink())
-                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
-            let mut buffer = vec![0u8; length as usize];
-            zip_entry
-                .read_exact(&mut buffer)
-                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
-            Ok(buffer)
-        }
+        } => read_cbz_entry_range(zip_path, file_in_zip, offset, length),
     }
 }
 
@@ -502,24 +814,7 @@ pub fn read_source_range_up_to(
         ImageSource::Cbz {
             zip_path,
             file_in_zip,
-        } => {
-            let file = std::fs::File::open(zip_path)
-                .map_err(|e| format!("Failed to open zip file: {}", e))?;
-            let reader = std::io::BufReader::new(file);
-            let mut archive = zip::ZipArchive::new(reader)
-                .map_err(|e| format!("Failed to read zip archive: {}", e))?;
-            let mut zip_entry = archive
-                .by_name(file_in_zip)
-                .map_err(|e| format!("Failed to locate zip entry: {}", e))?;
-            std::io::copy(&mut zip_entry.by_ref().take(offset), &mut std::io::sink())
-                .map_err(|e| format!("Failed to seek zip entry offset: {}", e))?;
-            let mut buffer = Vec::new();
-            zip_entry
-                .take(max_length as u64)
-                .read_to_end(&mut buffer)
-                .map_err(|e| format!("Failed to read zip entry segment: {}", e))?;
-            Ok(buffer)
-        }
+        } => read_cbz_entry_range_up_to(zip_path, file_in_zip, offset, max_length),
     }
 }
 
@@ -1614,4 +1909,232 @@ pub fn get_dimensions_from_exif(exif: &exif::Exif) -> Option<(u32, u32)> {
         })?;
 
     Some((w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    struct TempFileGuard(PathBuf);
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write_test_cbz(path: &Path, entries: &[(&str, &[u8], zip::CompressionMethod)]) {
+        let file = std::fs::File::create(path).expect("create test cbz");
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, data, method) in entries {
+            let options = SimpleFileOptions::default().compression_method(*method);
+            writer.start_file(*name, options).expect("start zip entry");
+            writer.write_all(data).expect("write zip entry payload");
+        }
+        writer.finish().expect("finish zip archive");
+    }
+
+    fn unique_cbz_path(label: &str) -> TempFileGuard {
+        let path = std::env::temp_dir().join(format!(
+            "imv_tui_raw_cbz_{}_{}.cbz",
+            std::process::id(),
+            label
+        ));
+        TempFileGuard(path)
+    }
+
+    #[test]
+    fn test_cbz_index_cache_hit_and_fast_path_metadata() {
+        let guard = unique_cbz_path("fast_path");
+        let stored_payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let deflated_payload: Vec<u8> = (0..2048).map(|i| ((i / 16) % 256) as u8).collect();
+        write_test_cbz(
+            &guard.0,
+            &[
+                (
+                    "stored.jpg",
+                    &stored_payload,
+                    zip::CompressionMethod::Stored,
+                ),
+                (
+                    "deflated.jpg",
+                    &deflated_payload,
+                    zip::CompressionMethod::Deflated,
+                ),
+            ],
+        );
+
+        let mut f1 = std::fs::File::open(&guard.0).expect("open cbz");
+        let idx1 = get_or_load_cbz_index(&guard.0, &mut f1).expect("load index 1");
+        let stored_meta = idx1.get("stored.jpg").expect("stored meta");
+        assert_eq!(stored_meta.compression, CbzCompression::Stored);
+        assert!(stored_meta.data_start > 0);
+        assert_eq!(stored_meta.uncompressed_size, stored_payload.len() as u64);
+
+        let deflated_meta = idx1.get("deflated.jpg").expect("deflated meta");
+        assert_eq!(deflated_meta.compression, CbzCompression::Deflated);
+        assert!(deflated_meta.data_start > 0);
+        assert_eq!(
+            deflated_meta.uncompressed_size,
+            deflated_payload.len() as u64
+        );
+
+        let mut f2 = std::fs::File::open(&guard.0).expect("reopen cbz");
+        let idx2 = get_or_load_cbz_index(&guard.0, &mut f2).expect("load index 2");
+        assert!(
+            Arc::ptr_eq(&idx1, &idx2),
+            "second load of unchanged CBZ should hit cached Arc index"
+        );
+    }
+
+    #[test]
+    fn test_cbz_stored_and_deflated_full_limited_and_range_reads() {
+        let guard = unique_cbz_path("reads");
+        let stored_payload: Vec<u8> = (0..4096).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let deflated_payload: Vec<u8> = (0..8192).map(|i| ((i / 8 + i % 13) % 256) as u8).collect();
+        write_test_cbz(
+            &guard.0,
+            &[
+                (
+                    "01_stored.jpg",
+                    &stored_payload,
+                    zip::CompressionMethod::Stored,
+                ),
+                (
+                    "02_deflated.jpg",
+                    &deflated_payload,
+                    zip::CompressionMethod::Deflated,
+                ),
+            ],
+        );
+
+        for (name, expected) in [
+            ("01_stored.jpg", &stored_payload),
+            ("02_deflated.jpg", &deflated_payload),
+        ] {
+            let src = ImageSource::Cbz {
+                zip_path: guard.0.clone(),
+                file_in_zip: name.to_string(),
+            };
+
+            let full = read_source_bytes_with_header(&src, None).expect("full read");
+            assert_eq!(full, *expected, "full read mismatch for {name}");
+
+            let limited = read_source_bytes_limited(&src, 128).expect("limited read");
+            assert_eq!(limited, expected[..128], "limited read mismatch for {name}");
+
+            let over_limited =
+                read_source_bytes_limited(&src, expected.len() + 256).expect("over-limited read");
+            assert_eq!(
+                over_limited, *expected,
+                "over-limited read mismatch for {name}"
+            );
+
+            let range = read_source_range(&src, 37, 256).expect("range read");
+            assert_eq!(
+                range,
+                expected[37..37 + 256],
+                "range read mismatch for {name}"
+            );
+
+            let past_end = read_source_range(&src, expected.len() as u64 - 10, 20);
+            assert!(
+                past_end.is_err(),
+                "range read past entry EOF should fail for {name}"
+            );
+
+            let range_up_to = read_source_range_up_to(&src, 50, 100).expect("range_up_to read");
+            assert_eq!(
+                range_up_to,
+                expected[50..150],
+                "range_up_to mismatch for {name}"
+            );
+
+            let tail_up_to = read_source_range_up_to(&src, expected.len() as u64 - 10, 100)
+                .expect("tail range_up_to");
+            assert_eq!(
+                tail_up_to,
+                expected[expected.len() - 10..],
+                "tail range_up_to mismatch for {name}"
+            );
+
+            let beyond_up_to = read_source_range_up_to(&src, expected.len() as u64 + 50, 100)
+                .expect("beyond EOF range_up_to");
+            assert!(
+                beyond_up_to.is_empty(),
+                "beyond EOF range_up_to should be empty for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cbz_cache_invalidation_on_file_update() {
+        let guard = unique_cbz_path("invalidation");
+        let v1_payload = b"version-1-stored-payload";
+        write_test_cbz(
+            &guard.0,
+            &[("page1.jpg", v1_payload, zip::CompressionMethod::Stored)],
+        );
+
+        let src1 = ImageSource::Cbz {
+            zip_path: guard.0.clone(),
+            file_in_zip: "page1.jpg".to_string(),
+        };
+        assert_eq!(
+            read_source_bytes_with_header(&src1, None).expect("read v1"),
+            v1_payload
+        );
+        let mut f1 = std::fs::File::open(&guard.0).expect("open v1");
+        let idx1 = get_or_load_cbz_index(&guard.0, &mut f1).expect("idx v1");
+
+        // Overwrite CBZ on disk with updated content and different file length
+        let v2_payload = b"version-2-deflated-updated-payload-with-different-length";
+        let v2_page2 = b"brand-new-second-page";
+        write_test_cbz(
+            &guard.0,
+            &[
+                ("page1.jpg", v2_payload, zip::CompressionMethod::Deflated),
+                ("page2.jpg", v2_page2, zip::CompressionMethod::Stored),
+            ],
+        );
+
+        let src2 = ImageSource::Cbz {
+            zip_path: guard.0.clone(),
+            file_in_zip: "page2.jpg".to_string(),
+        };
+        assert_eq!(
+            read_source_bytes_with_header(&src1, None).expect("read v2 page1"),
+            v2_payload
+        );
+        assert_eq!(
+            read_source_bytes_with_header(&src2, None).expect("read v2 page2"),
+            v2_page2
+        );
+        let mut f2 = std::fs::File::open(&guard.0).expect("open v2");
+        let idx2 = get_or_load_cbz_index(&guard.0, &mut f2).expect("idx v2");
+        assert!(
+            !Arc::ptr_eq(&idx1, &idx2),
+            "updating CBZ file on disk must invalidate cached index"
+        );
+    }
+
+    #[test]
+    fn test_cbz_missing_entry_returns_error() {
+        let guard = unique_cbz_path("missing");
+        write_test_cbz(
+            &guard.0,
+            &[("page1.jpg", b"hello", zip::CompressionMethod::Stored)],
+        );
+
+        let missing = ImageSource::Cbz {
+            zip_path: guard.0.clone(),
+            file_in_zip: "does_not_exist.jpg".to_string(),
+        };
+        assert!(read_source_bytes_with_header(&missing, None).is_err());
+        assert!(read_source_bytes_limited(&missing, 64).is_err());
+        assert!(read_source_range(&missing, 0, 4).is_err());
+        assert!(read_source_range_up_to(&missing, 0, 64).is_err());
+    }
 }
