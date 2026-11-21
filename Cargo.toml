@@ -31,9 +31,9 @@ opt-level = 3
 opt-level = 0
 
 [profile.release]
-debug = true            # Enable debug symbols for profiling
-opt-level = 3           # Maximum optimizations for speed
-lto = "fat"             # Enables aggressive whole-program link-time optimizations
-codegen-units = 1       # Optimizes whole-program at the expense of longer compile times
-panic = "abort"         # Removes panic unwinding, reducing binary size and runtime checks
-overflow-checks = false # Disables integer overflow runtime checks (use only if safe)
+debug = "line-tables-only" # Full function/file/line/inline symbols for profiling without heavy DWARF types
+opt-level = 3              # Maximum optimizations for speed
+lto = "thin"               # Parallel cross-crate LTO for fast release builds with near-identical runtime speed
+codegen-units = 16         # Enables parallel LLVM codegen
+panic = "abort"            # Removes panic unwinding, reducing binary size and runtime checks
+overflow-checks = false    # Disables integer overflow runtime checks (use only if safe)
