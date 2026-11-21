@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::Compression;
@@ -32,7 +33,7 @@ const PARALLEL_CHUNK_THRESHOLD: usize = 16;
 
 /// Parallel `rayon`-accelerated inline Kitty graphics protocol (`t=d` / `o=z,t=d`) state.
 pub struct KittyDirectProtocol {
-    transmit_str: String,
+    transmit_bytes: Vec<u8>,
     transmitted: AtomicBool,
     size: Size,
     id_extra: u16,
@@ -109,7 +110,7 @@ impl KittyDirectProtocol {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let fg = Color::Rgb(id_r, id_g, id_b);
 
-        let transmit_str = format_kitty_direct_chunks(
+        let transmit_bytes = format_kitty_direct_chunks(
             &payload,
             id,
             pixel_fmt,
@@ -121,7 +122,7 @@ impl KittyDirectProtocol {
         );
 
         Ok(Self {
-            transmit_str,
+            transmit_bytes,
             transmitted: AtomicBool::new(false),
             size,
             id_extra: u16::from(id_extra),
@@ -132,7 +133,7 @@ impl KittyDirectProtocol {
     /// Returns a reference to the formatted Kitty direct transmission escape sequence.
     #[cfg(test)]
     pub fn transmit_str(&self) -> &str {
-        &self.transmit_str
+        std::str::from_utf8(&self.transmit_bytes).expect("Kitty direct chunk output is valid ASCII")
     }
 
     /// Writes the one-shot Kitty direct transmission escape sequence directly to `writer`
@@ -145,7 +146,7 @@ impl KittyDirectProtocol {
         if self.transmitted.load(Ordering::Acquire) {
             return Ok(false);
         }
-        writer.write_all(self.transmit_str.as_bytes())?;
+        writer.write_all(&self.transmit_bytes)?;
         self.transmitted.store(true, Ordering::Release);
         Ok(true)
     }
@@ -155,7 +156,7 @@ impl KittyDirectProtocol {
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let is_first_render = !self.transmitted.swap(true, Ordering::SeqCst);
         let transmit = if is_first_render {
-            Some(self.transmit_str.as_str())
+            std::str::from_utf8(&self.transmit_bytes).ok()
         } else {
             None
         };
@@ -166,28 +167,35 @@ impl KittyDirectProtocol {
 /// Encodes `src` into RFC 4648 standard Base64 directly into `dst` using runtime-dispatched SIMD.
 ///
 /// Caller must ensure `dst.len() == src.len().div_ceil(3) * 4`.
+/// Initializes every byte of `dst`.
 #[inline]
-fn encode_base64_slice(src: &[u8], dst: &mut [u8]) {
+fn encode_base64_slice(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
     if src.is_empty() {
+        debug_assert!(dst.is_empty());
         return;
     }
-    let _ = base64_simd::STANDARD.encode(src, base64_simd::Out::from_slice(dst));
+    let encoded = base64_simd::STANDARD.encode(src, base64_simd::Out::from_uninit_slice(dst));
+    debug_assert_eq!(encoded.len(), dst.len());
 }
 
-/// Writes a single formatted Kitty direct chunk (`header + base64(src) + trailer`) into `dst`.
+/// Writes a single formatted Kitty direct chunk (`header + base64(src) + trailer`) into `dst`,
+/// initializing every byte of `dst`.
+///
+/// Panics if `dst.len() != header.len() + src.len().div_ceil(3) * 4 + trailer.len()`.
 #[inline]
-fn write_kitty_chunk(header: &[u8], src: &[u8], trailer: &[u8], dst: &mut [u8]) {
+fn write_kitty_chunk(header: &[u8], src: &[u8], trailer: &[u8], dst: &mut [MaybeUninit<u8>]) {
     let h_len = header.len();
     let b64_len = src.len().div_ceil(3) * 4;
-    dst[..h_len].copy_from_slice(header);
+    assert_eq!(dst.len(), h_len + b64_len + trailer.len());
+    dst[..h_len].write_copy_of_slice(header);
     encode_base64_slice(src, &mut dst[h_len..h_len + b64_len]);
-    dst[h_len + b64_len..].copy_from_slice(trailer);
+    dst[h_len + b64_len..].write_copy_of_slice(trailer);
 }
 
 /// Formats `payload` into Kitty direct (`t=d`) Base64 chunks of at most 4096 Base64 characters.
 ///
-/// Allocates a single exact-size output buffer and formats middle chunks in parallel across
-/// `rayon` workers when `chunk_count >= parallel_threshold`.
+/// Allocates a single exact-size uninitialized output buffer and formats middle chunks in parallel
+/// across `rayon` workers when `chunk_count >= parallel_threshold`. Returns pure ASCII bytes.
 #[allow(clippy::too_many_arguments)]
 fn format_kitty_direct_chunks(
     payload: &[u8],
@@ -198,7 +206,7 @@ fn format_kitty_direct_chunks(
     is_tmux: bool,
     compress: bool,
     parallel_threshold: usize,
-) -> String {
+) -> Vec<u8> {
     let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
     let compression = if compress { "o=z," } else { "" };
     let trailer = format!("{escape}\\{end}");
@@ -211,9 +219,15 @@ fn format_kitty_direct_chunks(
         );
         let b64_len = payload.len().div_ceil(3) * 4;
         let total_len = header0.len() + b64_len + trailer_bytes.len();
-        let mut out = vec![0u8; total_len];
-        write_kitty_chunk(header0.as_bytes(), payload, trailer_bytes, &mut out);
-        return String::from_utf8(out).expect("Kitty direct chunk output is valid ASCII");
+        let mut out = Vec::with_capacity(total_len);
+        let dst = &mut out.spare_capacity_mut()[..total_len];
+        write_kitty_chunk(header0.as_bytes(), payload, trailer_bytes, dst);
+        // SAFETY: `write_kitty_chunk` initialized every byte of `dst[..total_len]`,
+        // and `out` was allocated with capacity >= `total_len`.
+        unsafe {
+            out.set_len(total_len);
+        }
+        return out;
     }
 
     let header0 = format!(
@@ -232,21 +246,24 @@ fn format_kitty_direct_chunks(
     let last_chunk_len = last_header.len() + last_b64_len + trailer_bytes.len();
 
     let total_len = chunk0_len + mid_total_len + last_chunk_len;
-    let mut out = vec![0u8; total_len];
+    assert_eq!(chunk0_len + mid_total_len + last_chunk_len, total_len);
+    let mut out = Vec::with_capacity(total_len);
+    let dst = &mut out.spare_capacity_mut()[..total_len];
 
     // Chunk 0
     write_kitty_chunk(
         header0.as_bytes(),
         &payload[..CHUNK_SIZE],
         trailer_bytes,
-        &mut out[..chunk0_len],
+        &mut dst[..chunk0_len],
     );
 
     // Middle chunks (1..chunk_count - 1)
     if mid_count > 0 {
         let mid_src = &payload[CHUNK_SIZE..(chunk_count - 1) * CHUNK_SIZE];
-        let mid_dst = &mut out[chunk0_len..chunk0_len + mid_total_len];
+        let mid_dst = &mut dst[chunk0_len..chunk0_len + mid_total_len];
         let mid_header_bytes = mid_header.as_bytes();
+        assert_eq!(mid_src.len(), mid_count * CHUNK_SIZE);
 
         if chunk_count >= parallel_threshold {
             mid_src
@@ -270,10 +287,20 @@ fn format_kitty_direct_chunks(
         last_header.as_bytes(),
         last_src,
         trailer_bytes,
-        &mut out[chunk0_len + mid_total_len..],
+        &mut dst[chunk0_len + mid_total_len..],
     );
 
-    String::from_utf8(out).expect("Kitty direct chunk output is valid ASCII")
+    // SAFETY: `dst[..total_len]` is partitioned exhaustively into:
+    // - `dst[..chunk0_len]` (initialized by chunk 0 `write_kitty_chunk`),
+    // - `dst[chunk0_len..chunk0_len + mid_total_len]` (initialized by `mid_count` exact
+    //   `mid_chunk_len` `write_kitty_chunk` calls when `mid_count > 0`, or empty when `mid_count == 0`),
+    // - `dst[chunk0_len + mid_total_len..total_len]` (initialized by final chunk `write_kitty_chunk`).
+    // Every byte of `out.spare_capacity_mut()[..total_len]` is therefore initialized, and
+    // `out.capacity() >= total_len`.
+    unsafe {
+        out.set_len(total_len);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -502,6 +529,7 @@ mod tests {
             format_kitty_direct_chunks(&rgb_raw, 555, 24, width, height, false, false, 16);
         let sequential_out =
             format_kitty_direct_chunks(&rgb_raw, 555, 24, width, height, false, false, usize::MAX);
+        assert!(parallel_out.is_ascii());
         assert_eq!(parallel_out, sequential_out);
     }
 
@@ -591,7 +619,9 @@ mod tests {
     #[test]
     fn test_kitty_direct_empty_payload_defensive() {
         let seq = format_kitty_direct_chunks(&[], 42, 24, 1, 1, false, false, 16);
-        let chunks = parse_kitty_chunks(&seq, false);
+        assert!(seq.is_ascii());
+        let seq_str = std::str::from_utf8(&seq).expect("Kitty direct output must be valid ASCII");
+        let chunks = parse_kitty_chunks(seq_str, false);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].0, "q=2,i=42,a=T,U=1,f=24,t=d,s=1,v=1,m=0");
         assert!(chunks[0].1.is_empty());
@@ -609,10 +639,17 @@ mod tests {
             (b"foobar", "Zm9vYmFy"),
         ];
         for &(input, expected) in cases {
-            let mut dst = vec![0u8; input.len().div_ceil(3) * 4];
+            let len = input.len().div_ceil(3) * 4;
+            let mut dst = vec![MaybeUninit::uninit(); len];
             encode_base64_slice(input, &mut dst);
+            // SAFETY: `encode_base64_slice` initialized all `len` bytes of `dst`.
+            let initialized: Vec<u8> = dst
+                .into_iter()
+                .map(|b| unsafe { b.assume_init() })
+                .collect();
+            assert!(initialized.is_ascii());
             assert_eq!(
-                std::str::from_utf8(&dst).unwrap(),
+                std::str::from_utf8(&initialized).unwrap(),
                 expected,
                 "Mismatch for input len {}",
                 input.len()
@@ -624,11 +661,15 @@ mod tests {
     #[test]
     fn test_kitty_direct_chunk_boundaries_and_parallel_threshold() {
         // Covers:
+        // - 1 partial chunk with Base64 remainder cases (1, 2, 3 bytes)
         // - exact 1 chunk (3072 bytes)
         // - 2 chunks with mid_count == 0 (3073 bytes with == padding, 3074 bytes with = padding, exact 6144 bytes)
         // - 15 chunks (just below PARALLEL_CHUNK_THRESHOLD = 16, sequential middle path)
         // - 16 chunks (at PARALLEL_CHUNK_THRESHOLD = 16, parallel middle path, both exact multiple and partial)
         let sizes = [
+            1,
+            2,
+            3,
             CHUNK_SIZE,
             CHUNK_SIZE + 1,
             CHUNK_SIZE + 2,
@@ -657,8 +698,14 @@ mod tests {
                 actual, reference,
                 "Parallel/threshold output diverged from sequential reference for len={len}"
             );
+            assert!(
+                actual.is_ascii(),
+                "Kitty direct output must be valid ASCII for len={len}"
+            );
 
-            let chunks = parse_kitty_chunks(&actual, false);
+            let actual_str =
+                std::str::from_utf8(&actual).expect("Kitty direct output must be valid UTF-8");
+            let chunks = parse_kitty_chunks(actual_str, false);
             let expected_chunks = len.div_ceil(CHUNK_SIZE);
             assert_eq!(
                 chunks.len(),
