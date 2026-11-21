@@ -844,13 +844,15 @@ pub struct LoaderResponse {
     pub thumbnail_source: Option<ThumbnailSource>,
 }
 
-/// Unpacks packed 24-bit RGB (`[R, G, B]`) bytes into 32-bit RGBA (`[R, G, B, 255]`) bytes
-/// using 4-pixel (12-byte -> 16-byte) unrolled block unpacking for SIMD auto-vectorization.
-pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
-    let num_pixels = rgb.len() / 3;
-    let mut rgba = vec![0u8; num_pixels * 4];
+/// Unpacks packed 24-bit RGB (`[R, G, B]`) bytes into a pre-allocated 32-bit RGBA
+/// (`[R, G, B, 255]`) destination slice using 4-pixel (12-byte -> 16-byte) unrolled
+/// block unpacking for SIMD auto-vectorization.
+///
+/// Unpacks `min(rgb.len() / 3, rgba.len() / 4)` complete pixels.
+pub fn unpack_rgb24_into_rgba32(rgb: &[u8], rgba: &mut [u8]) {
+    let num_pixels = (rgb.len() / 3).min(rgba.len() / 4);
     let (in_chunks, in_rem) = rgb[..num_pixels * 3].as_chunks::<12>();
-    let (out_chunks, out_rem) = rgba.as_chunks_mut::<16>();
+    let (out_chunks, out_rem) = rgba[..num_pixels * 4].as_chunks_mut::<16>();
 
     for (src, dst) in in_chunks.iter().zip(out_chunks.iter_mut()) {
         *dst = [
@@ -867,7 +869,14 @@ pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
     {
         *dst = [src[0], src[1], src[2], 0xFF];
     }
+}
 
+/// Unpacks packed 24-bit RGB (`[R, G, B]`) bytes into 32-bit RGBA (`[R, G, B, 255]`) bytes
+/// using 4-pixel (12-byte -> 16-byte) unrolled block unpacking for SIMD auto-vectorization.
+pub fn unpack_rgb24_to_rgba32(rgb: &[u8]) -> Vec<u8> {
+    let num_pixels = rgb.len() / 3;
+    let mut rgba = vec![0u8; num_pixels * 4];
+    unpack_rgb24_into_rgba32(rgb, &mut rgba);
     rgba
 }
 

@@ -919,18 +919,14 @@ pub fn fast_resize(
             resizer.resize(rgb_src, &mut dst_image, Some(&options))?;
             maybe_reclaim_resizer_scratch(resizer, src_img.width(), src_img.height(), dst_w, dst_h);
 
-            let rgb_dst = image::RgbImage::from_raw(dst_w, dst_h, dst_image.into_vec())
+            let mut rgb_dst = image::RgbImage::from_raw(dst_w, dst_h, dst_image.into_vec())
                 .ok_or("Failed to construct RgbImage from resized buffer")?;
 
-            let rgba_raw = unpack_rgb24_to_rgba32(&rgb_dst);
-            let mut rgba_dst = image::RgbaImage::from_raw(dst_w, dst_h, rgba_raw)
-                .ok_or("Failed to construct RgbaImage from unpacked buffer")?;
-
             if needs_anti_ringing {
-                clamp_anti_ringing_rgb(&mut rgba_dst, rgb_src, crop_rect);
+                clamp_anti_ringing_rgb_in_place(&mut rgb_dst, rgb_src, crop_rect);
             }
 
-            Ok(DynamicImage::ImageRgba8(rgba_dst))
+            Ok(DynamicImage::ImageRgb8(rgb_dst))
         }
         _ => {
             let rgba_src = to_rgba8_fast(src_img);
@@ -1014,12 +1010,22 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
             req.filter_type,
         );
 
-        if let Some(rgba_canvas) = canvas.as_mut_rgba8() {
-            apply_adjustments_lut(
-                rgba_canvas.as_mut(),
-                req.brightness.value(),
-                req.contrast.value(),
-            );
+        match &mut canvas {
+            DynamicImage::ImageRgb8(rgb_canvas) => {
+                apply_adjustments_lut_rgb(
+                    rgb_canvas.as_mut(),
+                    req.brightness.value(),
+                    req.contrast.value(),
+                );
+            }
+            DynamicImage::ImageRgba8(rgba_canvas) => {
+                apply_adjustments_lut(
+                    rgba_canvas.as_mut(),
+                    req.brightness.value(),
+                    req.contrast.value(),
+                );
+            }
+            _ => {}
         }
         canvas
     } else {
@@ -1054,28 +1060,56 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
             let copy_h = target_inter_h.min(req.target_h.saturating_sub(paste_y));
 
             if copy_w > 0 && copy_h > 0 {
-                let mut src_rgba = match resized_part {
-                    DynamicImage::ImageRgba8(rgba) => rgba,
-                    other => into_rgba8_fast(other),
-                };
-                let src_stride = (src_rgba.width() as usize) * 4;
-                let row_bytes = (copy_w as usize) * 4;
-                let active_src_len = ((copy_h as usize) - 1) * src_stride + row_bytes;
-                apply_adjustments_lut(
-                    &mut src_rgba.as_mut()[..active_src_len],
-                    req.brightness.value(),
-                    req.contrast.value(),
-                );
-                let src_raw = src_rgba.as_raw();
                 let dest_stride = (req.target_w as usize) * 4;
                 let dest_raw = screen_canvas.as_mut();
 
-                for y in 0..(copy_h as usize) {
-                    let src_start = y * src_stride;
-                    let src_slice = &src_raw[src_start..src_start + row_bytes];
-                    let dest_start =
-                        ((paste_y as usize) + y) * dest_stride + (paste_x as usize) * 4;
-                    dest_raw[dest_start..dest_start + row_bytes].copy_from_slice(src_slice);
+                match resized_part {
+                    DynamicImage::ImageRgb8(mut src_rgb) => {
+                        let src_stride = (src_rgb.width() as usize) * 3;
+                        let src_row_bytes = (copy_w as usize) * 3;
+                        let dest_row_bytes = (copy_w as usize) * 4;
+                        let active_src_len = ((copy_h as usize) - 1) * src_stride + src_row_bytes;
+                        apply_adjustments_lut_rgb(
+                            &mut src_rgb.as_mut()[..active_src_len],
+                            req.brightness.value(),
+                            req.contrast.value(),
+                        );
+                        let src_raw = src_rgb.as_raw();
+
+                        for y in 0..(copy_h as usize) {
+                            let src_start = y * src_stride;
+                            let src_slice = &src_raw[src_start..src_start + src_row_bytes];
+                            let dest_start =
+                                ((paste_y as usize) + y) * dest_stride + (paste_x as usize) * 4;
+                            unpack_rgb24_into_rgba32(
+                                src_slice,
+                                &mut dest_raw[dest_start..dest_start + dest_row_bytes],
+                            );
+                        }
+                    }
+                    other => {
+                        let mut src_rgba = match other {
+                            DynamicImage::ImageRgba8(rgba) => rgba,
+                            non_rgba => into_rgba8_fast(non_rgba),
+                        };
+                        let src_stride = (src_rgba.width() as usize) * 4;
+                        let row_bytes = (copy_w as usize) * 4;
+                        let active_src_len = ((copy_h as usize) - 1) * src_stride + row_bytes;
+                        apply_adjustments_lut(
+                            &mut src_rgba.as_mut()[..active_src_len],
+                            req.brightness.value(),
+                            req.contrast.value(),
+                        );
+                        let src_raw = src_rgba.as_raw();
+
+                        for y in 0..(copy_h as usize) {
+                            let src_start = y * src_stride;
+                            let src_slice = &src_raw[src_start..src_start + row_bytes];
+                            let dest_start =
+                                ((paste_y as usize) + y) * dest_stride + (paste_x as usize) * 4;
+                            dest_raw[dest_start..dest_start + row_bytes].copy_from_slice(src_slice);
+                        }
+                    }
                 }
             }
         }
@@ -1201,6 +1235,37 @@ pub fn apply_brightness_simd(pixels: &mut [u8], value: i32) {
     }
 }
 
+/// Applies brightness adjustment to a tightly packed RGB8 pixel buffer in-place.
+///
+/// Processes 32-byte contiguous SIMD chunks (`vpaddusb`/`vpsubusb` on AVX2,
+/// `paddusb`/`psubusb` on SSE2) since all bytes in RGB8 are color channels.
+pub fn apply_brightness_simd_rgb(pixels: &mut [u8], value: i32) {
+    if value == 0 {
+        return;
+    }
+    let delta = value.unsigned_abs().min(255) as u8;
+    let (chunks32, tail) = pixels.as_chunks_mut::<32>();
+    if value > 0 {
+        for chunk in chunks32 {
+            for b in chunk.iter_mut() {
+                *b = b.saturating_add(delta);
+            }
+        }
+        for b in tail {
+            *b = b.saturating_add(delta);
+        }
+    } else {
+        for chunk in chunks32 {
+            for b in chunk.iter_mut() {
+                *b = b.saturating_sub(delta);
+            }
+        }
+        for b in tail {
+            *b = b.saturating_sub(delta);
+        }
+    }
+}
+
 /// Computes the dynamic soft-knee compression threshold based on the maximum highlight peak.
 ///
 /// Matches `peng`'s `mix(1.0, 0.75, min(overshoot * 0.75, 1.0))` (`image.frag.glsl:746-757`):
@@ -1239,18 +1304,9 @@ pub fn soft_knee_highlight(x: f32) -> f32 {
     soft_knee_highlight_with_knee(x, 0.75)
 }
 
-/// Applies fused brightness and contrast adjustments to an RGBA pixel buffer in a single memory pass
-/// using a 256-byte stack LUT, incorporating `peng`'s dynamic soft-knee highlight compression while
-/// strictly preserving Alpha.
-pub fn apply_adjustments_lut(pixels: &mut [u8], brightness: i32, contrast: f32) {
-    if brightness == 0 && contrast == 0.0 {
-        return;
-    }
-    if contrast == 0.0 {
-        apply_brightness_simd(pixels, brightness);
-        return;
-    }
-
+/// Builds a 256-byte brightness/contrast lookup table incorporating `peng`'s dynamic
+/// soft-knee highlight compression curve.
+fn build_adjustments_lut(brightness: i32, contrast: f32) -> [u8; 256] {
     let b_offset = brightness as f32 / 255.0;
     let factor = ((100.0 + contrast) / 100.0).max(0.0);
     let factor = factor * factor;
@@ -1270,11 +1326,43 @@ pub fn apply_adjustments_lut(pixels: &mut [u8], brightness: i32, contrast: f32) 
         }
         *slot = (val.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
+    lut
+}
 
+/// Applies fused brightness and contrast adjustments to an RGBA pixel buffer in a single memory pass
+/// using a 256-byte stack LUT, incorporating `peng`'s dynamic soft-knee highlight compression while
+/// strictly preserving Alpha.
+pub fn apply_adjustments_lut(pixels: &mut [u8], brightness: i32, contrast: f32) {
+    if brightness == 0 && contrast == 0.0 {
+        return;
+    }
+    if contrast == 0.0 {
+        apply_brightness_simd(pixels, brightness);
+        return;
+    }
+
+    let lut = build_adjustments_lut(brightness, contrast);
     for chunk in pixels.as_chunks_mut::<4>().0 {
         chunk[0] = lut[chunk[0] as usize];
         chunk[1] = lut[chunk[1] as usize];
         chunk[2] = lut[chunk[2] as usize];
+    }
+}
+
+/// Applies fused brightness and contrast adjustments to an RGB8 pixel buffer in a single memory pass
+/// using a 256-byte stack LUT, incorporating `peng`'s dynamic soft-knee highlight compression.
+pub fn apply_adjustments_lut_rgb(pixels: &mut [u8], brightness: i32, contrast: f32) {
+    if brightness == 0 && contrast == 0.0 {
+        return;
+    }
+    if contrast == 0.0 {
+        apply_brightness_simd_rgb(pixels, brightness);
+        return;
+    }
+
+    let lut = build_adjustments_lut(brightness, contrast);
+    for b in pixels.iter_mut() {
+        *b = lut[*b as usize];
     }
 }
 
@@ -1292,9 +1380,32 @@ pub fn clamp_anti_ringing_rgba(
     src: &image::RgbaImage,
     crop_rect: Option<(f64, f64, f64, f64)>,
 ) {
-    clamp_anti_ringing_span_cached::<4>(
-        dst,
+    let (dst_w, dst_h) = (dst.width(), dst.height());
+    clamp_anti_ringing_span_cached::<4, 4>(
+        dst.as_mut(),
+        dst_w,
+        dst_h,
         src.as_raw().as_chunks::<4>().0,
+        src.width(),
+        src.height(),
+        crop_rect,
+    );
+}
+
+/// Clamps destination RGB8 pixel colors in-place to the min/max bounding envelope of the
+/// corresponding 2x2 source texel neighborhood of an RGB8 source image to eliminate Gibbs
+/// ringing/overshoot artifacts from lobed filters.
+pub fn clamp_anti_ringing_rgb_in_place(
+    dst: &mut image::RgbImage,
+    src: &image::RgbImage,
+    crop_rect: Option<(f64, f64, f64, f64)>,
+) {
+    let (dst_w, dst_h) = (dst.width(), dst.height());
+    clamp_anti_ringing_span_cached::<3, 3>(
+        dst.as_mut(),
+        dst_w,
+        dst_h,
+        src.as_raw().as_chunks::<3>().0,
         src.width(),
         src.height(),
         crop_rect,
@@ -1303,13 +1414,17 @@ pub fn clamp_anti_ringing_rgba(
 
 /// Clamps destination pixel colors to the min/max bounding envelope of the corresponding
 /// 2x2 source texel neighborhood of an RGB source image to eliminate Gibbs ringing/overshoot artifacts.
+#[cfg(test)]
 pub fn clamp_anti_ringing_rgb(
     dst: &mut image::RgbaImage,
     src: &image::RgbImage,
     crop_rect: Option<(f64, f64, f64, f64)>,
 ) {
-    clamp_anti_ringing_span_cached::<3>(
-        dst,
+    let (dst_w, dst_h) = (dst.width(), dst.height());
+    clamp_anti_ringing_span_cached::<3, 4>(
+        dst.as_mut(),
+        dst_w,
+        dst_h,
         src.as_raw().as_chunks::<3>().0,
         src.width(),
         src.height(),
@@ -1317,16 +1432,15 @@ pub fn clamp_anti_ringing_rgb(
     );
 }
 
-fn clamp_anti_ringing_span_cached<const N: usize>(
-    dst: &mut image::RgbaImage,
-    src_pixels: &[[u8; N]],
+fn clamp_anti_ringing_span_cached<const SRC_N: usize, const DST_N: usize>(
+    dst_raw: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    src_pixels: &[[u8; SRC_N]],
     src_w: u32,
     src_h: u32,
     crop_rect: Option<(f64, f64, f64, f64)>,
 ) {
-    let dst_w = dst.width();
-    let dst_h = dst.height();
-
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
     }
@@ -1362,24 +1476,24 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
     }
 
     // Separable 2x2 neighborhood scratch buffers covering only the active source slice.
-    // Allocating one extra pixel slot at the end of `v_min`/`v_max` guarantees `i + N`
+    // Allocating one extra pixel slot at the end of `v_min`/`v_max` guarantees `i + SRC_N`
     // is always in-bounds during the horizontal SIMD pass even when `x_max == src_w - 1`.
     let active_w = x_max - x_min + 1;
     let src_end_incl = (x_max + 1).min(src_w_usize - 1);
     let src_slice_len = src_end_incl - x_min + 1;
-    let v_len = (active_w + 1) * N;
+    let v_len = (active_w + 1) * SRC_N;
     let mut v_min = vec![0u8; v_len];
     let mut v_max = vec![0u8; v_len];
-    let mut h_min = vec![[0u8; N]; active_w];
-    let mut h_max = vec![[0u8; N]; active_w];
+    let mut h_min = vec![[0u8; SRC_N]; active_w];
+    let mut h_max = vec![[0u8; SRC_N]; active_w];
 
-    // Expanded per-row RGBA bounds reused across consecutive destination rows sharing `y0`.
-    // Storing `[min_r, min_g, min_b, 0]` and `[max_r, max_g, max_b, 255]` preserves Alpha
+    // Expanded per-row bounds reused across consecutive destination rows sharing `y0`.
+    // For RGBA destinations (`DST_N == 4`), initializing channel 3 to `0`/`255` preserves Alpha
     // identically while keeping the hot clamping loop a contiguous branchless byte SIMD pass.
-    let mut row_min = vec![[0u8; 4]; dst_w_usize];
-    let mut row_max = vec![[255u8; 4]; dst_w_usize];
+    let mut row_min = vec![[0u8; DST_N]; dst_w_usize];
+    let mut row_max = vec![[255u8; DST_N]; dst_w_usize];
     let mut prev_y0 = usize::MAX;
-    let dst_pixels = dst.as_mut().as_chunks_mut::<4>().0;
+    let dst_pixels = dst_raw.as_chunks_mut::<DST_N>().0;
 
     for (y, dst_row) in dst_pixels.chunks_exact_mut(dst_w_usize).enumerate() {
         let src_y_f = crop_top + (y as f64 + 0.5) * scale_y - 0.5;
@@ -1396,7 +1510,7 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
             // 1. Vertical 2-row min/max pass over contiguous flat source bytes (SIMD).
             let r0 = row0.as_flattened();
             let r1 = row1.as_flattened();
-            let v_bytes = src_slice_len * N;
+            let v_bytes = src_slice_len * SRC_N;
             for (((vm, vx), &a), &b) in v_min[..v_bytes]
                 .iter_mut()
                 .zip(&mut v_max[..v_bytes])
@@ -1408,20 +1522,20 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
             }
             if src_slice_len == active_w {
                 // Duplicate rightmost source column so `x1 = x0` at the image right edge.
-                let last = (active_w - 1) * N;
-                for c in 0..N {
-                    v_min[last + N + c] = v_min[last + c];
-                    v_max[last + N + c] = v_max[last + c];
+                let last = (active_w - 1) * SRC_N;
+                for c in 0..SRC_N {
+                    v_min[last + SRC_N + c] = v_min[last + c];
+                    v_max[last + SRC_N + c] = v_max[last + c];
                 }
             }
 
             // 2. Horizontal 2-column min/max pass over contiguous flat bytes (SIMD).
-            let h_bytes = active_w * N;
+            let h_bytes = active_w * SRC_N;
             for ((hm, &a), &b) in h_min
                 .as_flattened_mut()
                 .iter_mut()
                 .zip(&v_min[..h_bytes])
-                .zip(&v_min[N..N + h_bytes])
+                .zip(&v_min[SRC_N..SRC_N + h_bytes])
             {
                 *hm = a.min(b);
             }
@@ -1429,18 +1543,22 @@ fn clamp_anti_ringing_span_cached<const N: usize>(
                 .as_flattened_mut()
                 .iter_mut()
                 .zip(&v_max[..h_bytes])
-                .zip(&v_max[N..N + h_bytes])
+                .zip(&v_max[SRC_N..SRC_N + h_bytes])
             {
                 *hx = a.max(b);
             }
 
-            // 3. Gather 2x2 RGB bounds into destination-width RGBA row buffers.
+            // 3. Gather 2x2 RGB bounds into destination-width row buffers.
             for ((rmn, rmx), &idx) in row_min.iter_mut().zip(&mut row_max).zip(&rel_x0) {
                 let idx = idx as usize;
                 let mn = h_min[idx];
                 let mx = h_max[idx];
-                *rmn = [mn[0], mn[1], mn[2], 0];
-                *rmx = [mx[0], mx[1], mx[2], 255];
+                rmn[0] = mn[0];
+                rmn[1] = mn[1];
+                rmn[2] = mn[2];
+                rmx[0] = mx[0];
+                rmx[1] = mx[1];
+                rmx[2] = mx[2];
             }
         }
 
@@ -3850,6 +3968,249 @@ mod tests {
                     "Extreme 1x1 zoom ({x1},{y1}) with {filter:?} sampled unexpected color"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_fast_resize_rgb8_preserves_variant_and_matches_rgba8_pixels() {
+        let mut resizer = fir::Resizer::new();
+
+        // High-contrast checkerboard + gradient pattern to trigger Gibbs ringing on lobed filters.
+        let rgb_src = image::RgbImage::from_fn(48, 36, |x, y| {
+            if ((x / 4) + (y / 4)) % 2 == 0 {
+                image::Rgb([240, ((x * 5) % 256) as u8, 16])
+            } else {
+                image::Rgb([12, ((y * 7) % 256) as u8, 245])
+            }
+        });
+        let rgba_src = image::RgbaImage::from_fn(48, 36, |x, y| {
+            let p = rgb_src.get_pixel(x, y);
+            Rgba([p[0], p[1], p[2], 255])
+        });
+        let dyn_rgb = DynamicImage::ImageRgb8(rgb_src);
+        let dyn_rgba = DynamicImage::ImageRgba8(rgba_src);
+
+        let filters = [
+            FilterType::Nearest,
+            FilterType::Box,
+            FilterType::Linear,
+            FilterType::Mitchell,
+            FilterType::Lanczos,
+        ];
+        let cases = [
+            (20, 15, None),                         // downscale
+            (113, 89, None),                        // magnified upscale (anti-ringing)
+            (73, 61, Some((6.0, 5.0, 22.0, 18.0))), // cropped magnified upscale
+            (17, 13, Some((4.0, 4.0, 32.0, 24.0))), // cropped downscale
+        ];
+
+        for filter in filters {
+            for (dst_w, dst_h, crop) in cases {
+                let res_rgb = fast_resize(&mut resizer, &dyn_rgb, dst_w, dst_h, filter, crop)
+                    .expect("RGB8 fast_resize failed");
+                let res_rgba = fast_resize(&mut resizer, &dyn_rgba, dst_w, dst_h, filter, crop)
+                    .expect("RGBA8 fast_resize failed");
+
+                let out_rgb = match res_rgb {
+                    DynamicImage::ImageRgb8(img) => img,
+                    other => panic!(
+                        "Expected fast_resize on ImageRgb8 to return ImageRgb8 for {filter:?} ({dst_w}x{dst_h}), got {:?}",
+                        other.color()
+                    ),
+                };
+                let out_rgba = res_rgba
+                    .as_rgba8()
+                    .expect("RGBA8 fast_resize returns RGBA8");
+
+                assert_eq!(out_rgb.dimensions(), (dst_w, dst_h));
+                assert_eq!(
+                    out_rgb.as_raw(),
+                    &pack_rgba32_to_rgb24(out_rgba.as_raw()),
+                    "RGB8 output diverged from RGBA8 output for {filter:?} ({dst_w}x{dst_h}, crop={crop:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_adjustments_lut_rgb_matches_rgba_bit_exact() {
+        let pixel_counts = [0usize, 1, 2, 3, 10, 11, 15, 16, 32, 33, 64, 100];
+        let cases: &[(i32, f32)] = &[
+            (0, 0.0),
+            (40, 0.0),
+            (-75, 0.0),
+            (255, 0.0),
+            (-255, 0.0),
+            (0, 35.0),
+            (0, -45.0),
+            (50, 40.0),
+            (-30, 60.0),
+            (80, -25.0),
+        ];
+
+        for &count in &pixel_counts {
+            let mut base_rgb = Vec::with_capacity(count * 3);
+            let mut base_rgba = Vec::with_capacity(count * 4);
+            for i in 0..count {
+                let r = ((i * 37 + 11) % 256) as u8;
+                let g = ((i * 73 + 29) % 256) as u8;
+                let b = ((i * 113 + 53) % 256) as u8;
+                base_rgb.extend_from_slice(&[r, g, b]);
+                base_rgba.extend_from_slice(&[r, g, b, 180]);
+            }
+
+            for &(brightness, contrast) in cases {
+                let mut rgb = base_rgb.clone();
+                let mut rgba = base_rgba.clone();
+
+                apply_adjustments_lut_rgb(&mut rgb, brightness, contrast);
+                apply_adjustments_lut(&mut rgba, brightness, contrast);
+
+                assert_eq!(
+                    rgb,
+                    pack_rgba32_to_rgb24(&rgba),
+                    "RGB8 adjustments diverged from RGBA8 for count={count}, brightness={brightness}, contrast={contrast}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_resize_canvas_rgb8_full_viewport_and_letterboxed() {
+        let mut resizer = fir::Resizer::new();
+        let picker = Picker::halfblocks();
+
+        let rgb_img = image::RgbImage::from_fn(80, 60, |x, y| {
+            image::Rgb([
+                ((x * 3 + 20) % 256) as u8,
+                ((y * 4 + 30) % 256) as u8,
+                (((x + y) * 2 + 40) % 256) as u8,
+            ])
+        });
+        let rgba_img = image::RgbaImage::from_fn(80, 60, |x, y| {
+            let p = rgb_img.get_pixel(x, y);
+            Rgba([p[0], p[1], p[2], 255])
+        });
+        let src_rgb = Arc::new(DynamicImage::ImageRgb8(rgb_img));
+        let src_rgba = Arc::new(DynamicImage::ImageRgba8(rgba_img));
+
+        let adj_cases = [
+            (Brightness::ZERO, Contrast::ZERO),
+            (Brightness::new(35), Contrast::ZERO),
+            (Brightness::new(-30), Contrast::new(25.0)),
+        ];
+
+        // 1. Full-viewport branch (intersection == crop) returns ImageRgb8 and matches RGBA8 RGB bytes.
+        for (brightness, contrast) in adj_cases {
+            let req_rgb = ResizeRequest {
+                img: Arc::clone(&src_rgb),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(0, 0, 80, 60),
+                intersection: ImageIntersection::new(0, 0, 80, 60),
+                target_w: 40,
+                target_h: 30,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness,
+                contrast,
+                rendered_size_cells: (5, 3),
+                sequence: 1,
+                protocol: ActiveProtocol::Halfblocks,
+            };
+            let req_rgba = ResizeRequest {
+                img: Arc::clone(&src_rgba),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(0, 0, 80, 60),
+                intersection: ImageIntersection::new(0, 0, 80, 60),
+                target_w: 40,
+                target_h: 30,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness,
+                contrast,
+                rendered_size_cells: (5, 3),
+                sequence: 1,
+                protocol: ActiveProtocol::Halfblocks,
+            };
+
+            let canvas_rgb = render_resize_canvas(&req_rgb, &mut resizer);
+            let canvas_rgba = render_resize_canvas(&req_rgba, &mut resizer);
+
+            let out_rgb = match canvas_rgb {
+                DynamicImage::ImageRgb8(img) => img,
+                other => panic!(
+                    "Expected full-viewport RGB8 canvas to stay ImageRgb8, got {:?}",
+                    other.color()
+                ),
+            };
+            let out_rgba = canvas_rgba
+                .as_rgba8()
+                .expect("RGBA8 full-viewport canvas returns RGBA8");
+            assert_eq!(out_rgb.dimensions(), (40, 30));
+            assert_eq!(out_rgb.as_raw(), &pack_rgba32_to_rgb24(out_rgba.as_raw()));
+        }
+
+        // 2. Letterboxed/panned branch (intersection != crop): transparent margins (alpha == 0)
+        // and exact opaque RGB pixels (alpha == 255) matching RGBA8 path.
+        for (brightness, contrast) in adj_cases {
+            let req_rgb = ResizeRequest {
+                img: Arc::clone(&src_rgb),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(-20, -10, 100, 70),
+                intersection: ImageIntersection::new(0, 0, 80, 60),
+                target_w: 60,
+                target_h: 40,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness,
+                contrast,
+                rendered_size_cells: (6, 4),
+                sequence: 2,
+                protocol: ActiveProtocol::Halfblocks,
+            };
+            let req_rgba = ResizeRequest {
+                img: Arc::clone(&src_rgba),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(-20, -10, 100, 70),
+                intersection: ImageIntersection::new(0, 0, 80, 60),
+                target_w: 60,
+                target_h: 40,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness,
+                contrast,
+                rendered_size_cells: (6, 4),
+                sequence: 2,
+                protocol: ActiveProtocol::Halfblocks,
+            };
+
+            let canvas_rgb = render_resize_canvas(&req_rgb, &mut resizer);
+            let canvas_rgba = render_resize_canvas(&req_rgba, &mut resizer);
+
+            let out_from_rgb = canvas_rgb
+                .as_rgba8()
+                .expect("Letterboxed RGB8 canvas returns RGBA8 with transparent margins");
+            let out_from_rgba = canvas_rgba
+                .as_rgba8()
+                .expect("Letterboxed RGBA8 canvas returns RGBA8");
+
+            assert_eq!(out_from_rgb.dimensions(), (60, 40));
+            assert_eq!(
+                out_from_rgb.as_raw(),
+                out_from_rgba.as_raw(),
+                "Letterboxed RGB8 canvas diverged from RGBA8 for brightness={brightness:?}, contrast={contrast:?}"
+            );
+
+            // Top-left and bottom-right margins must be fully transparent.
+            assert_eq!(*out_from_rgb.get_pixel(0, 0), Rgba([0, 0, 0, 0]));
+            assert_eq!(*out_from_rgb.get_pixel(59, 39), Rgba([0, 0, 0, 0]));
+            // Active pasted region (paste_x = 10, paste_y = 5, 40x30) must be fully opaque.
+            assert_eq!(out_from_rgb.get_pixel(10, 5)[3], 255);
+            assert_eq!(out_from_rgb.get_pixel(49, 34)[3], 255);
         }
     }
 }
