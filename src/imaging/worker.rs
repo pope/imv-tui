@@ -3,6 +3,7 @@
 use super::picker::Picker;
 use fast_image_resize as fir;
 use image::DynamicImage;
+use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1090,12 +1091,20 @@ fn prepare_letterbox_part(
     }
 }
 
+/// Minimum active pixel count (`65,536` pixels, e.g. 256×256) before
+/// `composite_resized_into_rgba_slice` parallelizes row-band compositing across `rayon` workers.
+const PARALLEL_COMPOSITE_MIN_PIXELS: usize = 65_536;
+
 /// Composites an already-resized and adjusted letterbox image into a zero-initialized RGBA8
 /// destination slice of dimensions `(dest_w, dest_h)`.
 ///
 /// Clamps the copied region against both `geom.(copy_w, copy_h)` (bounded by `req.target_w/h`)
 /// and `(dest_w, dest_h)` so direct-to-SHM compositing matches `normalize_canvas_to_cells`
 /// crop/pad semantics byte-for-byte.
+///
+/// When the active region contains at least [`PARALLEL_COMPOSITE_MIN_PIXELS`] pixels and at least
+/// 2 rows, horizontal bands of active rows are composited in parallel via `rayon` so fresh `mmap`
+/// SHM page faults and RGB24→RGBA32 unpacking scale across cores without touching margins.
 fn composite_resized_into_rgba_slice(
     resized_part: &DynamicImage,
     geom: LetterboxGeometry,
@@ -1113,50 +1122,87 @@ fn composite_resized_into_rgba_slice(
         return;
     }
 
+    let copy_w_usize = copy_w as usize;
+    let copy_h_usize = copy_h as usize;
+    let paste_x_bytes = (geom.paste_x as usize) * 4;
+    let paste_y_usize = geom.paste_y as usize;
     let dest_stride = (dest_w as usize) * 4;
-    let dest_row_bytes = (copy_w as usize) * 4;
+    let dest_row_bytes = copy_w_usize * 4;
+    let use_parallel = copy_w_usize.saturating_mul(copy_h_usize) >= PARALLEL_COMPOSITE_MIN_PIXELS
+        && copy_h_usize >= 2;
+
+    let copy_rgba_rows = |src_raw: &[u8], src_stride: usize, dest_raw: &mut [u8]| {
+        if use_parallel {
+            let active_dest = &mut dest_raw
+                [paste_y_usize * dest_stride..(paste_y_usize + copy_h_usize) * dest_stride];
+            let target_bands = rayon::current_num_threads().max(1) * 4;
+            let band_rows = copy_h_usize.div_ceil(target_bands).max(1);
+            active_dest
+                .par_chunks_mut(band_rows * dest_stride)
+                .enumerate()
+                .for_each(|(band_idx, band_dest)| {
+                    let start_y = band_idx * band_rows;
+                    let rows_in_band = band_dest.len() / dest_stride;
+                    for local_y in 0..rows_in_band {
+                        let src_start = (start_y + local_y) * src_stride;
+                        let dst_start = local_y * dest_stride + paste_x_bytes;
+                        band_dest[dst_start..dst_start + dest_row_bytes]
+                            .copy_from_slice(&src_raw[src_start..src_start + dest_row_bytes]);
+                    }
+                });
+        } else {
+            for y in 0..copy_h_usize {
+                let src_start = y * src_stride;
+                let dest_start = (paste_y_usize + y) * dest_stride + paste_x_bytes;
+                dest_raw[dest_start..dest_start + dest_row_bytes]
+                    .copy_from_slice(&src_raw[src_start..src_start + dest_row_bytes]);
+            }
+        }
+    };
 
     match resized_part {
         DynamicImage::ImageRgb8(src_rgb) => {
             let src_stride = (src_rgb.width() as usize) * 3;
-            let src_row_bytes = (copy_w as usize) * 3;
+            let src_row_bytes = copy_w_usize * 3;
             let src_raw = src_rgb.as_raw();
 
-            for y in 0..(copy_h as usize) {
-                let src_start = y * src_stride;
-                let src_slice = &src_raw[src_start..src_start + src_row_bytes];
-                let dest_start =
-                    ((geom.paste_y as usize) + y) * dest_stride + (geom.paste_x as usize) * 4;
-                unpack_rgb24_into_rgba32(
-                    src_slice,
-                    &mut dest_raw[dest_start..dest_start + dest_row_bytes],
-                );
+            if use_parallel {
+                let active_dest = &mut dest_raw
+                    [paste_y_usize * dest_stride..(paste_y_usize + copy_h_usize) * dest_stride];
+                let target_bands = rayon::current_num_threads().max(1) * 4;
+                let band_rows = copy_h_usize.div_ceil(target_bands).max(1);
+                active_dest
+                    .par_chunks_mut(band_rows * dest_stride)
+                    .enumerate()
+                    .for_each(|(band_idx, band_dest)| {
+                        let start_y = band_idx * band_rows;
+                        let rows_in_band = band_dest.len() / dest_stride;
+                        for local_y in 0..rows_in_band {
+                            let src_start = (start_y + local_y) * src_stride;
+                            let dst_start = local_y * dest_stride + paste_x_bytes;
+                            unpack_rgb24_into_rgba32(
+                                &src_raw[src_start..src_start + src_row_bytes],
+                                &mut band_dest[dst_start..dst_start + dest_row_bytes],
+                            );
+                        }
+                    });
+            } else {
+                for y in 0..copy_h_usize {
+                    let src_start = y * src_stride;
+                    let dest_start = (paste_y_usize + y) * dest_stride + paste_x_bytes;
+                    unpack_rgb24_into_rgba32(
+                        &src_raw[src_start..src_start + src_row_bytes],
+                        &mut dest_raw[dest_start..dest_start + dest_row_bytes],
+                    );
+                }
             }
         }
         DynamicImage::ImageRgba8(src_rgba) => {
-            let src_stride = (src_rgba.width() as usize) * 4;
-            let src_raw = src_rgba.as_raw();
-
-            for y in 0..(copy_h as usize) {
-                let src_start = y * src_stride;
-                let src_slice = &src_raw[src_start..src_start + dest_row_bytes];
-                let dest_start =
-                    ((geom.paste_y as usize) + y) * dest_stride + (geom.paste_x as usize) * 4;
-                dest_raw[dest_start..dest_start + dest_row_bytes].copy_from_slice(src_slice);
-            }
+            copy_rgba_rows(src_rgba.as_raw(), (src_rgba.width() as usize) * 4, dest_raw);
         }
         other => {
             let src_rgba = to_rgba8_fast(other);
-            let src_stride = (src_rgba.width() as usize) * 4;
-            let src_raw = src_rgba.as_raw();
-
-            for y in 0..(copy_h as usize) {
-                let src_start = y * src_stride;
-                let src_slice = &src_raw[src_start..src_start + dest_row_bytes];
-                let dest_start =
-                    ((geom.paste_y as usize) + y) * dest_stride + (geom.paste_x as usize) * 4;
-                dest_raw[dest_start..dest_start + dest_row_bytes].copy_from_slice(src_slice);
-            }
+            copy_rgba_rows(src_rgba.as_raw(), (src_rgba.width() as usize) * 4, dest_raw);
         }
     }
 }
@@ -4582,6 +4628,93 @@ mod tests {
         assert!(
             full_shm.transmit_str().contains("f=24"),
             "Full-viewport RGB8 must preserve f=24"
+        );
+    }
+
+    #[test]
+    fn test_composite_resized_into_rgba_slice_parallel_rgb8_and_rgba8_exact() {
+        let src_w = 400u32;
+        let src_h = 300u32;
+        let dest_w = 512u32;
+        let dest_h = 400u32;
+        let paste_x = 57u32;
+        let paste_y = 43u32;
+
+        assert!(
+            (src_w as usize) * (src_h as usize) >= PARALLEL_COMPOSITE_MIN_PIXELS,
+            "Test dimensions must exercise the parallel rayon composite path"
+        );
+
+        let geom = LetterboxGeometry {
+            src_crop: SourceCropRect::map_from_original(
+                ImageIntersection::new(0, 0, src_w, src_h),
+                PixelDimensions::new(src_w, src_h),
+                PixelDimensions::new(src_w, src_h),
+            )
+            .expect("valid source crop"),
+            target_inter_w: src_w,
+            target_inter_h: src_h,
+            paste_x,
+            paste_y,
+            copy_w: src_w,
+            copy_h: src_h,
+        };
+
+        // 1. ImageRgb8 -> RGBA32 unpack with alpha=255 and untouched [0, 0, 0, 0] margins.
+        let mut rgb = image::RgbImage::new(src_w, src_h);
+        let mut expected_rgb = vec![0u8; (dest_w as usize) * (dest_h as usize) * 4];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let r = ((x.wrapping_mul(13) + y.wrapping_mul(7)) & 0xFF) as u8;
+                let g = ((x.wrapping_mul(5) + y.wrapping_mul(19) + 41) & 0xFF) as u8;
+                let b = ((x.wrapping_mul(23) + y.wrapping_mul(3) + 97) & 0xFF) as u8;
+                rgb.put_pixel(x, y, image::Rgb([r, g, b]));
+
+                let dst_idx = (((paste_y + y) * dest_w + (paste_x + x)) as usize) * 4;
+                expected_rgb[dst_idx..dst_idx + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+
+        let mut actual_rgb = vec![0u8; (dest_w as usize) * (dest_h as usize) * 4];
+        composite_resized_into_rgba_slice(
+            &DynamicImage::ImageRgb8(rgb),
+            geom,
+            &mut actual_rgb,
+            dest_w,
+            dest_h,
+        );
+        assert_eq!(
+            actual_rgb, expected_rgb,
+            "Parallel RGB8 composite must match reference bit-for-bit including untouched margins"
+        );
+
+        // 2. ImageRgba8 -> RGBA32 copy preserving per-pixel alpha and untouched [0, 0, 0, 0] margins.
+        let mut rgba = image::RgbaImage::new(src_w, src_h);
+        let mut expected_rgba = vec![0u8; (dest_w as usize) * (dest_h as usize) * 4];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let r = ((x.wrapping_mul(17) + y.wrapping_mul(11)) & 0xFF) as u8;
+                let g = ((x.wrapping_mul(9) + y.wrapping_mul(29) + 13) & 0xFF) as u8;
+                let b = ((x.wrapping_mul(31) + y.wrapping_mul(5) + 71) & 0xFF) as u8;
+                let a = ((x + y.wrapping_mul(3) + 1) & 0xFF) as u8;
+                rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
+
+                let dst_idx = (((paste_y + y) * dest_w + (paste_x + x)) as usize) * 4;
+                expected_rgba[dst_idx..dst_idx + 4].copy_from_slice(&[r, g, b, a]);
+            }
+        }
+
+        let mut actual_rgba = vec![0u8; (dest_w as usize) * (dest_h as usize) * 4];
+        composite_resized_into_rgba_slice(
+            &DynamicImage::ImageRgba8(rgba),
+            geom,
+            &mut actual_rgba,
+            dest_w,
+            dest_h,
+        );
+        assert_eq!(
+            actual_rgba, expected_rgba,
+            "Parallel RGBA8 composite must match reference bit-for-bit including untouched margins"
         );
     }
 }
