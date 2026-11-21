@@ -5,6 +5,7 @@ use crate::ui::ThumbnailState;
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 /// A cached low-resolution thumbnail image and its associated provenance and decode timing.
 #[derive(Debug, Clone)]
@@ -50,11 +51,41 @@ pub const MAX_PREFETCH_CACHE_CAPACITY: usize = 16;
 /// Initial capacity allocated for the prefetch cache.
 const INITIAL_PREFETCH_CACHE_CAPACITY: usize = 8;
 
+/// Sends an evicted full-resolution image to a lazily spawned background thread for deallocation.
+///
+/// Dropping multi-megabyte decoded image buffers synchronously on the main thread can trigger
+/// `madvise` / `munmap` TLB shootdowns across threads. Offloading the drop keeps the main UI
+/// loop responsive; if spawning or sending fails, the image is dropped inline.
+fn offload_image_drop(
+    drop_tx: &mut Option<mpsc::Sender<Arc<DynamicImage>>>,
+    image: Arc<DynamicImage>,
+) {
+    if drop_tx.is_none() {
+        let (tx, rx) = mpsc::channel::<Arc<DynamicImage>>();
+        if std::thread::Builder::new()
+            .name("imv-dropper".into())
+            .spawn(move || {
+                for img in rx {
+                    drop(img);
+                }
+            })
+            .is_ok()
+        {
+            *drop_tx = Some(tx);
+        }
+    }
+
+    if let Some(tx) = drop_tx.as_ref() {
+        let _ = tx.send(image);
+    }
+}
+
 /// Lock-free, main-thread prefetch cache storing decoded images and thumbnails for the visible sliding window.
 #[derive(Default)]
 pub struct PrefetchCache {
     entries: HashMap<usize, CachedImage>,
     min_valid_sequence: u64,
+    drop_tx: Option<mpsc::Sender<Arc<DynamicImage>>>,
 }
 
 impl PrefetchCache {
@@ -63,6 +94,7 @@ impl PrefetchCache {
         Self {
             entries: HashMap::with_capacity(INITIAL_PREFETCH_CACHE_CAPACITY),
             min_valid_sequence: 0,
+            drop_tx: None,
         }
     }
 
@@ -115,17 +147,34 @@ impl PrefetchCache {
         self.entries.is_empty()
     }
 
-    /// Clears all cached entries, shrinking capacity if it exceeded `MAX_PREFETCH_CACHE_CAPACITY`.
+    /// Clears all cached entries, offloading full-resolution image drops off the main thread
+    /// and shrinking capacity if it exceeded `MAX_PREFETCH_CACHE_CAPACITY`.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        let drop_tx = &mut self.drop_tx;
+        for (_, entry) in self.entries.drain() {
+            if let Some(full) = entry.full {
+                offload_image_drop(drop_tx, full.image);
+            }
+        }
         if self.entries.capacity() > MAX_PREFETCH_CACHE_CAPACITY {
             self.entries.shrink_to(INITIAL_PREFETCH_CACHE_CAPACITY);
         }
     }
 
-    /// Retains only the entries present in the visible window, shrinking capacity if it exceeded `MAX_PREFETCH_CACHE_CAPACITY`.
+    /// Retains only the entries present in the visible window, offloading evicted full-resolution
+    /// image drops off the main thread and shrinking capacity if it exceeded `MAX_PREFETCH_CACHE_CAPACITY`.
     pub fn retain_window(&mut self, window: &VisibleWindow) {
-        self.entries.retain(|idx, _| window.contains(*idx));
+        let drop_tx = &mut self.drop_tx;
+        self.entries.retain(|idx, entry| {
+            if window.contains(*idx) {
+                true
+            } else {
+                if let Some(full) = entry.full.take() {
+                    offload_image_drop(drop_tx, full.image);
+                }
+                false
+            }
+        });
         if self.entries.capacity() > MAX_PREFETCH_CACHE_CAPACITY {
             self.entries.shrink_to(INITIAL_PREFETCH_CACHE_CAPACITY);
         }
@@ -177,7 +226,9 @@ impl PrefetchCache {
             } else if !is_prefetch && cached.thumbnail.is_skipped() {
                 cached.thumbnail = ThumbnailState::Absent;
             }
-            cached.full = Some(full);
+            if let Some(old_full) = cached.full.replace(full) {
+                offload_image_drop(&mut self.drop_tx, old_full.image);
+            }
             cached.width = width;
             cached.height = height;
             cached.raw_dimensions = raw_dimensions;
@@ -762,5 +813,111 @@ mod cache_sliding_window_tests {
         cache.invalidate(42);
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.min_valid_sequence(), 42);
+    }
+
+    fn wait_for_arc_drop<T>(weak: &std::sync::Weak<T>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while weak.strong_count() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "evicted Arc was not dropped within timeout"
+        );
+    }
+
+    #[test]
+    fn test_retain_window_and_clear_release_evicted_full_images() {
+        let mut cache = PrefetchCache::new();
+        assert!(cache.drop_tx.is_none());
+
+        let mut weaks = Vec::new();
+        for idx in [0usize, 1, 2, 5, 6] {
+            let img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(16, 16)));
+            weaks.push((idx, Arc::downgrade(&img)));
+            cache.upsert_full(
+                idx,
+                CachedFullImage {
+                    image: img,
+                    decode_duration: std::time::Duration::ZERO,
+                    format: image::ImageFormat::Png,
+                    disk_size: 256,
+                },
+                16,
+                16,
+                None,
+                false,
+            );
+        }
+
+        // Window retains indices 0, 1, 2 and evicts 5, 6
+        let sources: Vec<ImageSource> = (0..3)
+            .map(|i| ImageSource::Local(PathBuf::from(format!("{}.png", i))))
+            .collect();
+        let queue = MediaList::new(sources, 0).unwrap();
+        let window = VisibleWindow::compute(&queue, ViewMode::All);
+        cache.retain_window(&window);
+
+        assert!(cache.drop_tx.is_some());
+        for (idx, weak) in &weaks {
+            if *idx <= 2 {
+                assert!(cache.contains_key(*idx));
+                assert_eq!(weak.strong_count(), 1);
+            } else {
+                assert!(!cache.contains_key(*idx));
+                wait_for_arc_drop(weak);
+            }
+        }
+
+        // Clearing releases the remaining retained full images
+        cache.clear();
+        assert!(cache.is_empty());
+        for (_, weak) in &weaks {
+            wait_for_arc_drop(weak);
+        }
+    }
+
+    #[test]
+    fn test_upsert_full_replacement_releases_previous_image() {
+        let mut cache = PrefetchCache::new();
+
+        let old_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(16, 16)));
+        let old_weak = Arc::downgrade(&old_img);
+        cache.upsert_full(
+            0,
+            CachedFullImage {
+                image: old_img,
+                decode_duration: std::time::Duration::ZERO,
+                format: image::ImageFormat::Png,
+                disk_size: 256,
+            },
+            16,
+            16,
+            None,
+            false,
+        );
+        assert_eq!(old_weak.strong_count(), 1);
+
+        let new_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::new(32, 32)));
+        let new_weak = Arc::downgrade(&new_img);
+        cache.upsert_full(
+            0,
+            CachedFullImage {
+                image: new_img,
+                decode_duration: std::time::Duration::ZERO,
+                format: image::ImageFormat::Png,
+                disk_size: 512,
+            },
+            32,
+            32,
+            None,
+            false,
+        );
+
+        assert!(cache.drop_tx.is_some());
+        wait_for_arc_drop(&old_weak);
+        assert_eq!(new_weak.strong_count(), 1);
+        assert!(cache.has_full_image(0));
     }
 }
