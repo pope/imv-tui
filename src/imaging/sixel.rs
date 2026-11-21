@@ -514,12 +514,63 @@ fn build_rgb555_lut(palette: &[[u8; 3]]) -> Vec<u8> {
     lut
 }
 
-/// Reusable per-worker scratch buffers for zero-allocation 6-row band encoding.
+/// Unsorted sparse sixel cell recorded during column-first band scanning.
+#[derive(Clone, Copy)]
+struct RawSixelCell {
+    slot: u8,
+    mask: u8,
+    x: u32,
+}
+
+/// Sparse sixel cell grouped by color slot in strictly ascending `x` order.
+#[derive(Clone, Copy, Default)]
+struct SortedSixelCell {
+    x: u32,
+    mask: u8,
+}
+
+/// Emits a single Sixel RLE run of `ch` repeated `run` times.
+#[inline]
+fn emit_rle_run(out: &mut Vec<u8>, ch: u8, run: usize) {
+    if run > 3 {
+        out.push(b'!');
+        push_u32(out, run as u32);
+        out.push(ch);
+    } else {
+        for _ in 0..run {
+            out.push(ch);
+        }
+    }
+}
+
+/// Accumulates one quantized pixel `(color, bit)` into the stack-local 6-row column table.
+#[inline]
+fn record_column_pixel(
+    col_colors: &mut [u8; 6],
+    col_masks: &mut [u8; 6],
+    col_len: &mut usize,
+    color: u8,
+    bit: u8,
+) {
+    for i in 0..*col_len {
+        if col_colors[i] == color {
+            col_masks[i] |= bit;
+            return;
+        }
+    }
+    col_colors[*col_len] = color;
+    col_masks[*col_len] = bit;
+    *col_len += 1;
+}
+
+/// Reusable per-worker scratch buffers for sparse 6-row band encoding.
 struct BandScratch {
     color_to_slot: [u16; MAX_PALETTE_COLORS],
     used_colors: Vec<u8>,
-    max_x: [usize; MAX_PALETTE_COLORS],
-    masks: Vec<u8>,
+    slot_counts: [usize; MAX_PALETTE_COLORS],
+    slot_offsets: [usize; MAX_PALETTE_COLORS],
+    raw_cells: Vec<RawSixelCell>,
+    sorted_cells: Vec<SortedSixelCell>,
 }
 
 impl BandScratch {
@@ -527,13 +578,15 @@ impl BandScratch {
         Self {
             color_to_slot: [u16::MAX; MAX_PALETTE_COLORS],
             used_colors: Vec::with_capacity(64),
-            max_x: [0; MAX_PALETTE_COLORS],
-            masks: vec![0u8; width * 16],
+            slot_counts: [0; MAX_PALETTE_COLORS],
+            slot_offsets: [0; MAX_PALETTE_COLORS],
+            raw_cells: Vec::with_capacity(width * 2),
+            sorted_cells: Vec::with_capacity(width * 2),
         }
     }
 
     #[inline]
-    fn ensure_slot(&mut self, color: u8, width: usize) -> usize {
+    fn ensure_slot(&mut self, color: u8) -> usize {
         let existing = self.color_to_slot[usize::from(color)];
         if existing != u16::MAX {
             return usize::from(existing);
@@ -541,11 +594,27 @@ impl BandScratch {
         let slot = self.used_colors.len();
         self.color_to_slot[usize::from(color)] = slot as u16;
         self.used_colors.push(color);
-        let needed = (slot + 1) * width;
-        if self.masks.len() < needed {
-            self.masks.resize(needed, 0);
-        }
         slot
+    }
+
+    #[inline]
+    fn push_column_cells(
+        &mut self,
+        x: usize,
+        col_colors: &[u8; 6],
+        col_masks: &[u8; 6],
+        col_len: usize,
+    ) {
+        let x = x as u32;
+        for i in 0..col_len {
+            let slot = self.ensure_slot(col_colors[i]);
+            self.raw_cells.push(RawSixelCell {
+                slot: slot as u8,
+                mask: col_masks[i],
+                x,
+            });
+            self.slot_counts[slot] += 1;
+        }
     }
 
     /// Encodes one 6-row band into ASCII Sixel bytes, trimming trailing blank sixels per color.
@@ -560,49 +629,84 @@ impl BandScratch {
         let y_start = band_idx * 6;
         let rows_in_band = (height - y_start).min(6);
 
+        let mut bayer_rows = [&BAYER_OFFSET_4X4[0]; 6];
+        for (dy, bayer_row) in bayer_rows.iter_mut().enumerate().take(rows_in_band) {
+            *bayer_row = &BAYER_OFFSET_4X4[(y_start + dy) & 3];
+        }
+
         match pixels {
             PixelBuffer::Rgba(raw) => {
                 let row_stride = width * 4;
-                for dy in 0..rows_in_band {
+                let mut rows: [&[[u8; 4]]; 6] = [&[]; 6];
+                for (dy, row_slot) in rows.iter_mut().enumerate().take(rows_in_band) {
                     let y = y_start + dy;
-                    let bit = 1u8 << dy;
-                    let bayer_row = &BAYER_OFFSET_4X4[y & 3];
-                    let row = &raw[y * row_stride..(y + 1) * row_stride];
-                    for (x, &[pr, pg, pb, pa]) in row.as_chunks::<4>().0.iter().enumerate() {
+                    *row_slot = raw[y * row_stride..(y + 1) * row_stride].as_chunks::<4>().0;
+                }
+                for x in 0..width {
+                    let bx = x & 3;
+                    let mut col_colors = [0u8; 6];
+                    let mut col_masks = [0u8; 6];
+                    let mut col_len = 0usize;
+                    for (dy, (&row, &bayer_row)) in rows[..rows_in_band]
+                        .iter()
+                        .zip(&bayer_rows[..rows_in_band])
+                        .enumerate()
+                    {
+                        let [pr, pg, pb, pa] = row[x];
                         if pa < ALPHA_OPAQUE_THRESHOLD {
                             continue;
                         }
-                        let d = bayer_row[x & 3];
+                        let d = bayer_row[bx];
                         let r = (i16::from(pr) + d).clamp(0, 255) as u8;
                         let g = (i16::from(pg) + d).clamp(0, 255) as u8;
                         let b = (i16::from(pb) + d).clamp(0, 255) as u8;
                         let color = lut[rgb555_index(r, g, b)];
-                        let slot = self.ensure_slot(color, width);
-                        self.masks[slot * width + x] |= bit;
-                        if x + 1 > self.max_x[slot] {
-                            self.max_x[slot] = x + 1;
-                        }
+                        record_column_pixel(
+                            &mut col_colors,
+                            &mut col_masks,
+                            &mut col_len,
+                            color,
+                            1u8 << dy,
+                        );
+                    }
+                    if col_len > 0 {
+                        self.push_column_cells(x, &col_colors, &col_masks, col_len);
                     }
                 }
             }
             PixelBuffer::Rgb(raw) => {
                 let row_stride = width * 3;
-                for dy in 0..rows_in_band {
+                let mut rows: [&[[u8; 3]]; 6] = [&[]; 6];
+                for (dy, row_slot) in rows.iter_mut().enumerate().take(rows_in_band) {
                     let y = y_start + dy;
-                    let bit = 1u8 << dy;
-                    let bayer_row = &BAYER_OFFSET_4X4[y & 3];
-                    let row = &raw[y * row_stride..(y + 1) * row_stride];
-                    for (x, &[pr, pg, pb]) in row.as_chunks::<3>().0.iter().enumerate() {
-                        let d = bayer_row[x & 3];
+                    *row_slot = raw[y * row_stride..(y + 1) * row_stride].as_chunks::<3>().0;
+                }
+                for x in 0..width {
+                    let bx = x & 3;
+                    let mut col_colors = [0u8; 6];
+                    let mut col_masks = [0u8; 6];
+                    let mut col_len = 0usize;
+                    for (dy, (&row, &bayer_row)) in rows[..rows_in_band]
+                        .iter()
+                        .zip(&bayer_rows[..rows_in_band])
+                        .enumerate()
+                    {
+                        let [pr, pg, pb] = row[x];
+                        let d = bayer_row[bx];
                         let r = (i16::from(pr) + d).clamp(0, 255) as u8;
                         let g = (i16::from(pg) + d).clamp(0, 255) as u8;
                         let b = (i16::from(pb) + d).clamp(0, 255) as u8;
                         let color = lut[rgb555_index(r, g, b)];
-                        let slot = self.ensure_slot(color, width);
-                        self.masks[slot * width + x] |= bit;
-                        if x + 1 > self.max_x[slot] {
-                            self.max_x[slot] = x + 1;
-                        }
+                        record_column_pixel(
+                            &mut col_colors,
+                            &mut col_masks,
+                            &mut col_len,
+                            color,
+                            1u8 << dy,
+                        );
+                    }
+                    if col_len > 0 {
+                        self.push_column_cells(x, &col_colors, &col_masks, col_len);
                     }
                 }
             }
@@ -612,12 +716,35 @@ impl BandScratch {
             return Vec::new();
         }
 
-        let mut out = Vec::with_capacity(self.used_colors.len() * 16 + width);
-        for slot in 0..self.used_colors.len() {
+        let num_slots = self.used_colors.len();
+        let mut total = 0usize;
+        for slot in 0..num_slots {
+            self.slot_offsets[slot] = total;
+            total += self.slot_counts[slot];
+        }
+
+        let total_cells = self.raw_cells.len();
+        if self.sorted_cells.len() < total_cells {
+            self.sorted_cells
+                .resize(total_cells, SortedSixelCell::default());
+        }
+        for &cell in &self.raw_cells {
+            let slot = usize::from(cell.slot);
+            let dst = self.slot_offsets[slot];
+            self.sorted_cells[dst] = SortedSixelCell {
+                x: cell.x,
+                mask: cell.mask,
+            };
+            self.slot_offsets[slot] = dst + 1;
+        }
+
+        let mut out = Vec::with_capacity(num_slots * 16 + total_cells);
+        for slot in 0..num_slots {
             let color = self.used_colors[slot];
-            let len = self.max_x[slot];
-            let base = slot * width;
-            let row_masks = &mut self.masks[base..base + len];
+            let count = self.slot_counts[slot];
+            let end = self.slot_offsets[slot];
+            let start = end - count;
+            let cells = &self.sorted_cells[start..end];
 
             if slot > 0 {
                 out.push(b'$');
@@ -625,31 +752,31 @@ impl BandScratch {
             out.push(b'#');
             push_u32(&mut out, u32::from(color));
 
-            let mut i = 0;
-            while i < len {
-                let val = row_masks[i];
+            let mut prev_x = 0usize;
+            let mut i = 0usize;
+            while i < cells.len() {
+                let x = cells[i].x as usize;
+                if x > prev_x {
+                    emit_rle_run(&mut out, b'?', x - prev_x);
+                }
+                let mask = cells[i].mask;
                 let mut run = 1usize;
-                while i + run < len && row_masks[i + run] == val {
+                while i + run < cells.len()
+                    && cells[i + run].x as usize == x + run
+                    && cells[i + run].mask == mask
+                {
                     run += 1;
                 }
-                let ch = val + 63;
-                if run > 3 {
-                    out.push(b'!');
-                    push_u32(&mut out, run as u32);
-                    out.push(ch);
-                } else {
-                    for _ in 0..run {
-                        out.push(ch);
-                    }
-                }
+                emit_rle_run(&mut out, mask + 63, run);
+                prev_x = x + run;
                 i += run;
             }
 
-            row_masks.fill(0);
             self.color_to_slot[usize::from(color)] = u16::MAX;
-            self.max_x[slot] = 0;
+            self.slot_counts[slot] = 0;
         }
         self.used_colors.clear();
+        self.raw_cells.clear();
 
         out
     }
@@ -1185,5 +1312,160 @@ mod tests {
                 "build_rgb555_lut mismatch for {pal_len}-color palette"
             );
         }
+    }
+
+    #[test]
+    fn test_band_scratch_sparse_rle_gaps_transparency_and_256_colors() {
+        /// Computes the exact expected quantized palette index for every pixel.
+        fn expected_quantized_pixels(
+            pixels: PixelBuffer<'_>,
+            width: usize,
+            height: usize,
+            lut: &[u8],
+        ) -> Vec<Option<usize>> {
+            let mut out = vec![None; width * height];
+            match pixels {
+                PixelBuffer::Rgba(raw) => {
+                    for y in 0..height {
+                        let bayer_row = &BAYER_OFFSET_4X4[y & 3];
+                        for x in 0..width {
+                            let idx = (y * width + x) * 4;
+                            let (pr, pg, pb, pa) =
+                                (raw[idx], raw[idx + 1], raw[idx + 2], raw[idx + 3]);
+                            if pa < ALPHA_OPAQUE_THRESHOLD {
+                                continue;
+                            }
+                            let d = bayer_row[x & 3];
+                            let r = (i16::from(pr) + d).clamp(0, 255) as u8;
+                            let g = (i16::from(pg) + d).clamp(0, 255) as u8;
+                            let b = (i16::from(pb) + d).clamp(0, 255) as u8;
+                            out[y * width + x] = Some(usize::from(lut[rgb555_index(r, g, b)]));
+                        }
+                    }
+                }
+                PixelBuffer::Rgb(raw) => {
+                    for y in 0..height {
+                        let bayer_row = &BAYER_OFFSET_4X4[y & 3];
+                        for x in 0..width {
+                            let idx = (y * width + x) * 3;
+                            let (pr, pg, pb) = (raw[idx], raw[idx + 1], raw[idx + 2]);
+                            let d = bayer_row[x & 3];
+                            let r = (i16::from(pr) + d).clamp(0, 255) as u8;
+                            let g = (i16::from(pg) + d).clamp(0, 255) as u8;
+                            let b = (i16::from(pb) + d).clamp(0, 255) as u8;
+                            out[y * width + x] = Some(usize::from(lut[rgb555_index(r, g, b)]));
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        fn wrap_bands_for_decode(
+            width: usize,
+            height: usize,
+            num_colors: usize,
+            bands: &[Vec<u8>],
+        ) -> String {
+            let mut s = format!("\x1bP0;1;0q\"1;1;{width};{height}");
+            for idx in 0..num_colors {
+                s.push_str(&format!("#{idx};2;0;0;0"));
+            }
+            for (i, band) in bands.iter().enumerate() {
+                if i > 0 {
+                    s.push('-');
+                }
+                s.push_str(std::str::from_utf8(band).unwrap());
+            }
+            s.push_str("\x1b\\");
+            s
+        }
+
+        // 1. Explicit RLE gap lengths (1, 2, 3, 4, 105), mixed runs, transparent pixels,
+        //    empty transparent band, and partial trailing band (height = 15 -> 6 + 6 + 3).
+        let width = 140usize;
+        let height = 15usize;
+        let mut rgba = RgbaImage::from_pixel(width as u32, height as u32, Rgba([0, 0, 0, 0]));
+        // Band 0 (y = 0..6):
+        // Place opaque white pixels on row 0 at:
+        // x=0 (run 1), gap 1 -> x=2 (run 2: 2..4), gap 2 -> x=6 (run 3: 6..9),
+        // gap 3 -> x=12 (run 4: 12..16), gap 4 -> x=20 (run 1), gap 105 -> x=126 (run 5: 126..131).
+        for &x in &[
+            0u32, 2, 3, 6, 7, 8, 12, 13, 14, 15, 20, 126, 127, 128, 129, 130,
+        ] {
+            rgba.put_pixel(x, 0, Rgba([255, 255, 255, 255]));
+        }
+        // Band 1 (y = 6..12): completely transparent (alpha < ALPHA_OPAQUE_THRESHOLD).
+        rgba.put_pixel(5, 7, Rgba([255, 0, 0, ALPHA_OPAQUE_THRESHOLD - 1]));
+        // Band 2 (y = 12..15, partial 3-row band): two colors sharing columns.
+        for x in 10..15 {
+            rgba.put_pixel(x, 12, Rgba([255, 255, 255, 255]));
+            rgba.put_pixel(x, 14, Rgba([0, 0, 0, 255]));
+        }
+
+        let palette = vec![[255, 255, 255], [0, 0, 0]];
+        let lut = build_rgb555_lut(&palette);
+        let buf = PixelBuffer::Rgba(rgba.as_raw());
+        let mut scratch = BandScratch::new(width);
+        let bands: Vec<Vec<u8>> = (0..height.div_ceil(6))
+            .map(|b| scratch.encode_band(buf, width, height, b, &lut))
+            .collect();
+
+        // Exact RLE sequence check for band 0:
+        // bit 0 -> mask 1 -> '@' (64).
+        assert_eq!(
+            std::str::from_utf8(&bands[0]).unwrap(),
+            "#0@?@@??@@@???!4@!4?@!105?!5@",
+            "Unexpected RLE encoding for gaps 1/2/3/4/105 and runs 1/2/3/4/5"
+        );
+        // Band 1 is completely transparent -> empty band bytes.
+        assert!(
+            bands[1].is_empty(),
+            "Empty transparent band must emit 0 bytes"
+        );
+
+        let wrapped = wrap_bands_for_decode(width, height, palette.len(), &bands);
+        let (dw, dh, _, decoded) = decode_sixel_body(&wrapped);
+        assert_eq!((dw as usize, dh as usize), (width, height));
+        assert_eq!(
+            decoded,
+            expected_quantized_pixels(buf, width, height, &lut),
+            "Decoded RGBA pixels must match exact quantized reference"
+        );
+
+        // 2. High 256-color band (all 256 palette entries in a single band + partial band)
+        //    exercising both RGB and RGBA paths and scratch reuse.
+        let mut pal256 = Vec::with_capacity(MAX_PALETTE_COLORS);
+        for i in 0..MAX_PALETTE_COLORS {
+            let r = ((i & 0x07) * 36) as u8;
+            let g = (((i >> 3) & 0x07) * 36) as u8;
+            let b = (((i >> 6) & 0x03) * 85) as u8;
+            pal256.push([r, g, b]);
+        }
+        let lut256 = build_rgb555_lut(&pal256);
+
+        let w256 = 256usize;
+        let h256 = 10usize; // 1 full band + 1 partial 4-row band
+        let mut rgb256 = RgbImage::new(w256 as u32, h256 as u32);
+        for y in 0..h256 {
+            for x in 0..w256 {
+                let c = pal256[(x + y * 13) & 0xFF];
+                rgb256.put_pixel(x as u32, y as u32, Rgb(c));
+            }
+        }
+        let rgb_buf = PixelBuffer::Rgb(rgb256.as_raw());
+        let mut scratch256 = BandScratch::new(w256);
+        let rgb_bands: Vec<Vec<u8>> = (0..h256.div_ceil(6))
+            .map(|b| scratch256.encode_band(rgb_buf, w256, h256, b, &lut256))
+            .collect();
+
+        let wrapped256 = wrap_bands_for_decode(w256, h256, pal256.len(), &rgb_bands);
+        let (dw256, dh256, _, decoded256) = decode_sixel_body(&wrapped256);
+        assert_eq!((dw256 as usize, dh256 as usize), (w256, h256));
+        assert_eq!(
+            decoded256,
+            expected_quantized_pixels(rgb_buf, w256, h256, &lut256),
+            "Decoded 256-color RGB pixels must match exact quantized reference"
+        );
     }
 }
