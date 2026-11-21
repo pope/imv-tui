@@ -22,12 +22,17 @@ description: Guidelines and learnings for foot/sixel/kitty terminal graphic rend
   - `ScreenClear::None`: No clear required.
   - `ScreenClear::OnProtocolReceive`: Scheduled clear deferred until the next graphic protocol response arrives from the worker, avoiding blank flashes.
   - `ScreenClear::Pending`: Immediate clear required before drawing (e.g. upon closing dialog overlays or rotating images).
-- **Protocol-Gated Execution**: Screen clearing is only executed on Sixel terminals where cell persistence requires resetting underlying raster buffers:
+- **Protocol-Gated Execution**: Screen clearing is executed on Sixel and iTerm2 terminals where raster persistence requires resetting underlying buffers:
   ```rust
   pub fn should_clear_on_update(&self) -> bool {
-      matches!(self.picker.protocol_type(), ProtocolType::Sixel)
+      matches!(
+          self.picker.protocol_type(),
+          ProtocolType::Sixel | ProtocolType::Iterm2
+      )
   }
   ```
+- **DEC Mode 2026 Synchronized Output**: Wrap clear + `terminal.draw(...)` in `run_synchronized_update` (`\x1b[?2026h` / `\x1b[?2026l`) so terminals present frames atomically without tearing.
+- **Cached Terminal Size**: Query `terminal.size()` once before the main event loop and keep `term_size` updated via `Event::Resize(w, h)` (plus `term_size = f.area().as_size()` inside `terminal.draw`) rather than invoking `crossterm::terminal::size()` (`open("/dev/tty")` + `ioctl` + `close`) on every loop tick.
 
 ### 3. Input Repeat Coalescing
 

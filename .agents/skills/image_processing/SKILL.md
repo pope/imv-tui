@@ -21,38 +21,23 @@ description: Guidelines on aspect ratio crop mapping, high-performance resizing,
 - **Zoom > 1:1**: Crop the viewport in original space, then scale in-memory to screen-pixel size using the high-speed Nearest Neighbor filter (`FilterType::Nearest`).
 - **Panning**: Crop the visible intersection of the crop box and original image, scale it, and paint/overlay onto a transparent screen-resolution canvas at computed offsets.
 - **Panning Limits**: Clamp `PanOffset` boundaries to `img_width / 2` and `img_height / 2` (ensuring at least 25% of the image remains visible).
-- **Direct Row-Slice Canvas Copying**: Avoid per-pixel copy loops. Copy contiguous horizontal rows using direct slice copies into the screen canvas:
-  ```rust
-  screen_canvas[dest_start..dest_end].copy_from_slice(&src_rgba[src_start..src_end]);
-  ```
-- **5-Filter SIMD Scaling Lineup**: Cycle scaling filters in monotonic order of support radius: `Nearest -> Box -> Linear -> Mitchell -> Lanczos -> Nearest`. Mapped via `to_fir_resize_alg` to `fir::ResizeAlg::Nearest` and pure SIMD `fir::ResizeAlg::Convolution(...)` (using custom analytical kernels for Mitchell and Lanczos with $2\\times2$ neighborhood anti-ringing clamping on magnification).
+- **RGB8 End-to-End Preservation**: Keep opaque images in `DynamicImage::ImageRgb8` through `fast_resize` (using `clamp_anti_ringing_rgb_in_place` when magnified and `apply_adjustments_lut_rgb` for brightness/contrast) so full-viewport Kitty SHM/Direct/iTerm2 encoders transmit `f=24` without intermediate RGBA32 unpacking.
+- **Direct-to-SHM Parallel Compositing**: For letterboxed/panned frames under `ActiveProtocol::Kitty(KittyTransferMode::SharedMemory)`, composite active rows directly into the OS-zero-filled `mmap`'d `/dev/shm` buffer via `KittyShmProtocol::from_rgba_writer` + `composite_resized_into_rgba_slice` (parallelized across horizontal bands via `rayon` above `PARALLEL_COMPOSITE_MIN_PIXELS = 65_536`), leaving transparent margins as untouched tmpfs zero pages.
+- **5-Filter SIMD Scaling Lineup**: Cycle scaling filters in monotonic order of support radius: `Nearest -> Box -> Linear -> Mitchell -> Lanczos -> Nearest`. Mapped via `to_fir_resize_alg` to `fir::ResizeAlg::Nearest` and pure SIMD `fir::ResizeAlg::Convolution(...)` (using custom analytical kernels for Mitchell and Lanczos with $2\\times2$ separable SIMD anti-ringing clamping on magnification).
 
 ### 3. Lock-Free Prefetch Caching ($2N+1$ Sliding Window)
 
 - **Sliding Window Bounds**: Maintain a sliding window around `current_index` of size $N=2$ (caches the current image + 2 preceding + 2 succeeding visible indices).
-- **Dynamic Pruning**: Call `cache.retain_window(&window_indices)` on every navigation to discard entries outside the active window while preserving active allocations.
+- **Dynamic Pruning & Off-Thread Deallocation**: Call `cache.retain_window(&window_indices)` on every navigation to discard entries outside the active window while preserving active allocations. Evicted `CachedFullImage` `Arc<DynamicImage>` buffers are sent to a lazily spawned `"imv-dropper"` background thread so synchronous `madvise`/`munmap` calls never hitch the main UI loop.
 - **No Eviction on Hit**: Never evict cached images on hit; return shared references wrapped in `Arc<DecodedImage>`.
 - **Encapsulated `CachedThumbnail`**: Store `CachedImage` containing `full: Option<CachedFullImage>` and `thumbnail: ThumbnailState<CachedThumbnail>`.
 - **Thumbnail Placeholders**: If a cache entry contains `thumbnail: ThumbnailState::Loaded(CachedThumbnail)`, display it immediately as a fast low-resolution placeholder while the background worker decodes the full-resolution image.
 
 ### 4. SIMD Adjustments & Precomputed LUTs
 
-- **16-Byte Contiguous SIMD Chunking**: In `apply_brightness_simd`, process 16 bytes (4 RGBA pixels) per step using saturating arithmetic with a mask that zeros out the 4th (Alpha) lane:
-  ```rust
-  let mask: [u8; 16] = [
-      delta, delta, delta, 0,
-      delta, delta, delta, 0,
-      delta, delta, delta, 0,
-      delta, delta, delta, 0,
-  ];
-  let (chunks16, tail) = pixels.as_chunks_mut::<16>();
-  for chunk in chunks16 {
-      for i in 0..16 {
-          chunk[i] = chunk[i].saturating_add(mask[i]);
-      }
-  }
-  ```
-- **Hoisted 256-Entry LUT**: For contrast adjustments, construct the 256-entry lookup table once via `apply_adjustments_lut` and execute it across all active rows *before* copying into the canvas, avoiding re-generating tables inside row loops.
+- **32-Byte Contiguous SIMD Chunking**: In `apply_brightness_simd` (RGBA8, using an opaque `black_box` 4-byte pixel mask to preserve Alpha and prevent LLVM strided scatter stores) and `apply_brightness_simd_rgb` (RGB8), process 32-byte AVX2 chunks with saturating arithmetic.
+- **Hoisted 256-Entry LUT**: For contrast adjustments, construct the 256-entry lookup table once via `build_adjustments_lut` (`apply_adjustments_lut` / `apply_adjustments_lut_rgb`) and execute it across active rows *before* compositing, avoiding re-generating tables inside row loops.
+- **Cached CBZ Central-Directory Offsets**: Cache per-archive `(PathBuf, len, mtime) -> Arc<HashMap<String, CbzEntryMeta>>` entry offsets (`data_start`, `compressed_size`, `uncompressed_size`, `CbzCompression`) in `src/imaging/raw.rs` so loader workers seek directly to `Stored`/`Deflated` payloads without re-parsing the ZIP central directory per page.
 - **Direct EXIF Metadata**: Read EXIF metadata directly from the source buffer via `kamadak-exif` with `checked_add` bounds checks to prevent slicing panics on corrupted headers.
 - **Zero-Copy Conversion**: Convert `DynamicImage` buffers to RGBA8 via `into_rgba8_fast()`, avoiding buffer reallocations when the underlying container is already `ImageRgba8`.
 

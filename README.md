@@ -4,7 +4,7 @@
 
 ![imv-tui Screenshot](https://p0.pe/my-git-repos/imv-tui.git/plain/screenshots/01.png)
 
-It is built on top of [`ratatui`](https://crates.io/crates/ratatui) and [`ratatui-image`](https://crates.io/crates/ratatui-image).
+It is built on top of [`ratatui`](https://crates.io/crates/ratatui) with native, SIMD/Rayon-accelerated terminal graphics encoders for Kitty (including POSIX shared memory `t=s`), Sixel, iTerm2, and Unicode Halfblocks.
 
 ______________________________________________________________________
 
@@ -24,49 +24,49 @@ ______________________________________________________________________
 - **Dynamic Parameter Value Prompts**: Adjust brightness, contrast, or jump directly to a specific image index (via `Go to Image`, `Set Brightness`, and `Set Contrast` commands in the command palette) using absolute numbers or relative offsets (e.g. `+10` or `-5`).
 - **Slideshow Mode**: Play a slideshow of images with configurable delays, adjustable dynamically via keyboard shortcuts (`t`/`T`), CLI parameters, or from the command palette.
 - **Image Classification & Filtered Views**: Flag images as Picks (⭐), Rejects (❌), or Unflagged (⚪) in memory. Filter the navigation queue and file list dynamically using five view modes (Unflagged + Picks, Unflagged Only, Picks Only, Rejects Only, All Files) to easily sort, select, or hide images.
-- **Graphics & Fallbacks**: Auto-detects terminal capabilities. Uses high-performance Kitty graphics protocol or Sixel if supported, falling back gracefully to ANSI **Half-blocks** on standard terminals.
+- **Graphics & Fallbacks**: Auto-detects terminal capabilities. Uses native Kitty graphics protocol (with zero-copy POSIX shared memory `t=s` when supported), Sixel, or iTerm2 inline images, falling back gracefully to SIMD Unicode **Half-blocks** on standard terminals.
 
 ______________________________________________________________________
 
 ## Keyboard Shortcuts
 
-| Action                              | Primary Key | Alternative Keys            |
-| :---------------------------------- | :---------- | :-------------------------- |
-| **Quit**                            | `q`         | `Esc`                       |
-| **Next Image**                      | `n`         | `]`                         |
-| **Previous Image**                  | `p`         | `[`                         |
-| **Zoom In**                         | `i`         | `+` / `=` / Mouse Scroll Up |
-| **Zoom In (predefined levels)**     | `I`         |                             |
-| **Zoom Out**                        | `o`         | `-` / Mouse Scroll Down     |
-| **Zoom Out (predefined levels)**    | `O`         |                             |
-| **Actual Size (100% Zoom)**         | `a`         |                             |
-| **Reset View**                      | `r`         |                             |
-| **Reset Image**                     | `R`         |                             |
-| **Rotate Clockwise (90°)**          | `e`         | `>`                         |
-| **Rotate Counter-Clockwise (90°)**  | `E`         | `<`                         |
-| **Brightness Increase / Decrease**  | `b` / `B`   |                             |
-| **Contrast Increase / Decrease**    | `c` / `C`   |                             |
-| **Slideshow Increase / Decrease**   | `t` / `T`   |                             |
-| **Toggle Slideshow Pause**          | `Space`     |                             |
-| **Cycle Scaling Filter**            | `S`         |                             |
-| **Cycle Scale Mode**                | `s`         |                             |
-| **Pan Left / Right**                | `h` / `l`   | `Left` / `Right Arrow`      |
-| **Pan Up / Down**                   | `k` / `j`   | `Up` / `Down Arrow`         |
-| **Show Help / Command Palette**     | `?` / `:`   | `/`                         |
-| **File Search**                     | `f`         |                             |
-| **Toggle Thumbnail Mode**           | `m`         |                             |
-| **Show Image Details**              | `d`         |                             |
-| **Flag Pick**                       | `z`         |                             |
-| **Flag Reject**                     | `x`         |                             |
-| **Unflag Image**                    | `u`         |                             |
-| **Cycle View Filter**               | `v`         |                             |
-| **Cycle Infobar Position**          | `V`         |                             |
-| **Jump to View: Unflagged + Picks** | `1`         |                             |
-| **Jump to View: Unflagged Only**    | `2`         |                             |
-| **Jump to View: Picks Only**        | `3`         |                             |
-| **Jump to View: Rejects Only**      | `4`         |                             |
-| **Jump to View: All Files**         | `5`         |                             |
-| **Refresh Files**                   | `F5`        | `Ctrl+r`                    |
+| Action                              | Primary Key | Alternative Keys                                                                 |
+| :---------------------------------- | :---------- | :------------------------------------------------------------------------------- |
+| **Quit**                            | `q`         | `Esc`                                                                            |
+| **Next Image**                      | `n`         | `]`                                                                              |
+| **Previous Image**                  | `p`         | `[`                                                                              |
+| **Zoom In**                         | `i`         | `+` / `=` / Mouse Scroll Up                                                      |
+| **Zoom In (predefined levels)**     | `I`         |                                                                                  |
+| **Zoom Out**                        | `o`         | `-` / Mouse Scroll Down                                                          |
+| **Zoom Out (predefined levels)**    | `O`         |                                                                                  |
+| **Actual Size (100% Zoom)**         | `a`         |                                                                                  |
+| **Reset View**                      | `r`         |                                                                                  |
+| **Reset Image**                     | `R`         |                                                                                  |
+| **Rotate Clockwise (90°)**          | `e`         | `>`                                                                              |
+| **Rotate Counter-Clockwise (90°)**  | `E`         | `<`                                                                              |
+| **Brightness Increase / Decrease**  | `b` / `B`   |                                                                                  |
+| **Contrast Increase / Decrease**    | `c` / `C`   |                                                                                  |
+| **Slideshow Increase / Decrease**   | `t` / `T`   |                                                                                  |
+| **Toggle Slideshow Pause**          | `Space`     |                                                                                  |
+| **Cycle Scaling Filter**            | `S`         |                                                                                  |
+| **Cycle Scale Mode**                | `s`         |                                                                                  |
+| **Pan Left / Right**                | `h` / `l`   | `Left` / `Right Arrow` (diagonal panning supported with Kitty keyboard protocol) |
+| **Pan Up / Down**                   | `k` / `j`   | `Up` / `Down Arrow`                                                              |
+| **Show Help / Command Palette**     | `?` / `:`   | `/`                                                                              |
+| **File Search**                     | `f`         |                                                                                  |
+| **Toggle Thumbnail Mode**           | `m`         |                                                                                  |
+| **Show Image Details**              | `d`         |                                                                                  |
+| **Flag Pick**                       | `z`         |                                                                                  |
+| **Flag Reject**                     | `x`         |                                                                                  |
+| **Unflag Image**                    | `u`         |                                                                                  |
+| **Cycle View Filter**               | `v`         |                                                                                  |
+| **Cycle Infobar Position**          | `V`         |                                                                                  |
+| **Jump to View: Unflagged + Picks** | `1`         |                                                                                  |
+| **Jump to View: Unflagged Only**    | `2`         |                                                                                  |
+| **Jump to View: Picks Only**        | `3`         |                                                                                  |
+| **Jump to View: Rejects Only**      | `4`         |                                                                                  |
+| **Jump to View: All Files**         | `5`         |                                                                                  |
+| **Refresh Files**                   | `F5`        | `Ctrl+r`                                                                         |
 
 ### Text Input & Search Palette Shortcuts
 
@@ -111,8 +111,8 @@ The rotation keys (`e` and `E`) apply 90° clockwise/counter-clockwise operation
 
 To ensure stutter-free navigation under high key-repeat rates:
 
-- **Persistent Image Loader**: Offloads image decoding to a dedicated background thread. Image loader requests are sequenced; during fast navigation, the loader thread coalesces pending requests, processes the active viewport first, and discards stale sequence requests to prevent thread and disk contention.
-- **$2N+1$ Sliding Window Cache**: Caches the active image alongside 2 preceding and 2 succeeding images ($N=2$) in CPU memory. Prunes out-of-bounds cache items dynamically on navigation, providing instantaneous response times when cycling back and forth across pictures.
+- **Parallel 2-Stage Image Loader Pool**: Combines a fast-thumbnail coordinator (sub-millisecond EXIF/XDG thumbnails + cached CBZ ZIP entry offsets) with parallel background full-resolution decode workers. Requests are sequenced and cooperatively cancelled during rapid scrolling so the active viewport always takes priority.
+- **$2N+1$ Sliding Window Cache & Off-Thread Dropper**: Caches the active image alongside 2 preceding and 2 succeeding images ($N=2$) in CPU memory. Prunes out-of-bounds cache items dynamically on navigation and offloads deallocation to a dedicated background thread (`imv-dropper`) to prevent UI hitches.
 
 ______________________________________________________________________
 
@@ -152,7 +152,7 @@ If no path is specified, it scans and opens images from the current directory (`
 - `-m, --check-magic`: Check file magic bytes on startup (slower on network drives).
 - `-R, --recursive`: Scan directories recursively.
 - `--no-thumbnail`: Disable low-res EXIF thumbnail placeholder loading entirely.
-- `--kitty-compress <auto|always|never>`: Kitty zlib compression mode: auto, always, never (defaults to `auto`).
+- `--compress <auto|always|never>`: Payload compression mode (Kitty zlib / iTerm2 JPEG / Sixel 128-color; defaults to `auto`). `--kitty-compress` is accepted as a backwards-compatible alias.
 - `--no-kitty-shm`: Disable Kitty POSIX shared memory (t=s) image transmission.
 - `--infobar <top|bottom|none>`: Set the position of the status infobar (defaults to `bottom`).
 - `-i, --import <file>`: Import image classification/flagged states from a file (.json or prefix text).

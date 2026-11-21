@@ -22,11 +22,14 @@ We have updated [Cargo.toml](Cargo.toml) to include:
 
 ```toml
 [profile.release]
-debug = true
+debug = "line-tables-only" # Full function/file/line/inline symbols for profiling without heavy DWARF types
+opt-level = 3
+lto = "thin"
+codegen-units = 16
 ```
 
 > [!NOTE]
-> Setting `debug = true` keeps full debug symbols. If binary size is a concern, you can use `debug = 1` to include line tables only, which is sufficient for backtraces and basic profiling.
+> `debug = "line-tables-only"` (equivalent to `debug = 1`) preserves full function names, file paths, line numbers, and inline frames for `samply` and `flamegraph`, while compiling and linking significantly faster than `debug = true`.
 
 ______________________________________________________________________
 
@@ -71,6 +74,14 @@ ______________________________________________________________________
 
    ```bash
    samply record ./target/release/imv-tui <path-to-image>
+   ```
+
+   To save a presymbolicated profile file for offline or automated analysis without starting the local web server:
+
+   ```bash
+   samply record --save-only --unstable-presymbolicate --cswitch-markers \
+     -o profile.json.gz \
+     -- ./target/release/imv-tui <path-to-image>
    ```
 
 4. **Interact with the TUI**:
