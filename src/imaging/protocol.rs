@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use image::{DynamicImage, RgbaImage, imageops};
+use image::{DynamicImage, RgbImage, RgbaImage};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 
@@ -16,6 +16,58 @@ use super::kitty_direct::KittyDirectProtocol;
 use super::kitty_shm::KittyShmProtocol;
 use super::picker::FontSize;
 use super::sixel::SixelProtocol;
+
+/// Copies the top-left `dst_w x dst_h` region from a tightly packed `src_w`-wide pixel buffer
+/// (`BPP` bytes per pixel) without zero-initializing the destination buffer.
+fn crop_top_left_bytes<const BPP: usize>(
+    src: &[u8],
+    src_w: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let src_stride = src_w as usize * BPP;
+    let row_bytes = dst_w as usize * BPP;
+    let dst_h = dst_h as usize;
+    let total_bytes = row_bytes * dst_h;
+    let mut dst = Vec::with_capacity(total_bytes);
+    if total_bytes == 0 {
+        return dst;
+    }
+    if src_stride == row_bytes {
+        dst.extend_from_slice(&src[..total_bytes]);
+    } else {
+        for y in 0..dst_h {
+            let src_start = y * src_stride;
+            dst.extend_from_slice(&src[src_start..src_start + row_bytes]);
+        }
+    }
+    dst
+}
+
+/// Copies the top-left `copy_w x copy_h` RGBA8 pixels from `src` into `dst` (with row stride
+/// `dst_stride` bytes) using direct row-slice copies.
+fn copy_rgba_rows(
+    src: &RgbaImage,
+    dst: &mut [u8],
+    dst_stride: usize,
+    copy_w: usize,
+    copy_h: usize,
+) {
+    let src_raw = src.as_raw();
+    let src_stride = src.width() as usize * 4;
+    let row_bytes = copy_w * 4;
+    if src_stride == row_bytes && dst_stride == row_bytes {
+        let total_bytes = row_bytes * copy_h;
+        dst[..total_bytes].copy_from_slice(&src_raw[..total_bytes]);
+    } else {
+        for y in 0..copy_h {
+            let src_start = y * src_stride;
+            let dst_start = y * dst_stride;
+            dst[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&src_raw[src_start..src_start + row_bytes]);
+        }
+    }
+}
 
 /// Normalizes a rendered pixel canvas to the exact pixel dimensions of `size * font_size`.
 ///
@@ -38,13 +90,67 @@ pub fn normalize_canvas_to_cells<'a>(
         return Cow::Borrowed(canvas);
     }
 
-    let cropped = canvas.crop_imm(0, 0, target_px_w, target_px_h);
-    if cropped.width() == target_px_w && cropped.height() == target_px_h {
-        return Cow::Owned(cropped);
+    if canvas.width() >= target_px_w && canvas.height() >= target_px_h {
+        return match canvas {
+            DynamicImage::ImageRgb8(rgb) => {
+                let dst =
+                    crop_top_left_bytes::<3>(rgb.as_raw(), rgb.width(), target_px_w, target_px_h);
+                Cow::Owned(DynamicImage::ImageRgb8(
+                    RgbImage::from_raw(target_px_w, target_px_h, dst)
+                        .expect("valid RGB crop dimensions"),
+                ))
+            }
+            DynamicImage::ImageRgba8(rgba) => {
+                let dst =
+                    crop_top_left_bytes::<4>(rgba.as_raw(), rgba.width(), target_px_w, target_px_h);
+                Cow::Owned(DynamicImage::ImageRgba8(
+                    RgbaImage::from_raw(target_px_w, target_px_h, dst)
+                        .expect("valid RGBA crop dimensions"),
+                ))
+            }
+            other => Cow::Owned(other.crop_imm(0, 0, target_px_w, target_px_h)),
+        };
     }
 
+    let copy_w = canvas.width().min(target_px_w) as usize;
+    let copy_h = canvas.height().min(target_px_h) as usize;
     let mut padded = RgbaImage::new(target_px_w, target_px_h);
-    imageops::replace(&mut padded, &cropped, 0, 0);
+
+    if copy_w > 0 && copy_h > 0 {
+        let dst: &mut [u8] = padded.as_mut();
+        let dst_stride = target_px_w as usize * 4;
+        match canvas {
+            DynamicImage::ImageRgba8(rgba) => {
+                copy_rgba_rows(rgba, dst, dst_stride, copy_w, copy_h);
+            }
+            DynamicImage::ImageRgb8(rgb) => {
+                let src = rgb.as_raw();
+                let src_stride = rgb.width() as usize * 3;
+                let src_row_bytes = copy_w * 3;
+                let dst_row_bytes = copy_w * 4;
+                if src_stride == src_row_bytes && dst_stride == dst_row_bytes {
+                    super::types::unpack_rgb24_into_rgba32(
+                        &src[..src_row_bytes * copy_h],
+                        &mut dst[..dst_row_bytes * copy_h],
+                    );
+                } else {
+                    for y in 0..copy_h {
+                        let src_start = y * src_stride;
+                        let dst_start = y * dst_stride;
+                        super::types::unpack_rgb24_into_rgba32(
+                            &src[src_start..src_start + src_row_bytes],
+                            &mut dst[dst_start..dst_start + dst_row_bytes],
+                        );
+                    }
+                }
+            }
+            other => {
+                let rgba = super::types::to_rgba8_fast(other);
+                copy_rgba_rows(&rgba, dst, dst_stride, copy_w, copy_h);
+            }
+        }
+    }
+
     Cow::Owned(DynamicImage::ImageRgba8(padded))
 }
 
@@ -206,7 +312,7 @@ impl ViewportProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{Rgb, RgbImage, Rgba};
+    use image::{GrayImage, Luma, Rgb, Rgba};
 
     #[test]
     fn test_normalize_canvas_exact_borrows() {
@@ -217,10 +323,12 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_canvas_larger_crops_top_left() {
+    fn test_normalize_canvas_larger_crops_top_left_rgb8() {
         let mut rgb = RgbImage::from_pixel(20, 40, Rgb([1, 2, 3]));
         rgb.put_pixel(0, 0, Rgb([200, 100, 50]));
         rgb.put_pixel(15, 31, Rgb([40, 50, 60]));
+        rgb.put_pixel(16, 0, Rgb([255, 0, 0]));
+        rgb.put_pixel(0, 32, Rgb([0, 255, 0]));
         let img = DynamicImage::ImageRgb8(rgb);
 
         let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(2, 2));
@@ -229,6 +337,48 @@ mod tests {
         let cropped = out.as_rgb8().expect("crop preserves RGB8 format");
         assert_eq!(*cropped.get_pixel(0, 0), Rgb([200, 100, 50]));
         assert_eq!(*cropped.get_pixel(15, 31), Rgb([40, 50, 60]));
+        assert_eq!(*cropped.get_pixel(1, 0), Rgb([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_larger_crops_top_left_rgba8() {
+        let mut rgba = RgbaImage::from_pixel(20, 40, Rgba([7, 8, 9, 200]));
+        rgba.put_pixel(0, 0, Rgba([210, 110, 60, 128]));
+        rgba.put_pixel(15, 31, Rgba([41, 51, 61, 33]));
+        rgba.put_pixel(16, 0, Rgba([255, 0, 0, 255]));
+        let img = DynamicImage::ImageRgba8(rgba);
+
+        let out = normalize_canvas_to_cells(&img, FontSize::new(8, 16), Size::new(2, 2));
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!((out.width(), out.height()), (16, 32));
+        let cropped = out.as_rgba8().expect("crop preserves RGBA8 format");
+        assert_eq!(*cropped.get_pixel(0, 0), Rgba([210, 110, 60, 128]));
+        assert_eq!(*cropped.get_pixel(15, 31), Rgba([41, 51, 61, 33]));
+        assert_eq!(*cropped.get_pixel(1, 0), Rgba([7, 8, 9, 200]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_same_width_height_crop_and_pad() {
+        // Same width (16 == 16), taller height (40 > 32) -> contiguous crop.
+        let mut rgb_tall = RgbImage::from_pixel(16, 40, Rgb([11, 22, 33]));
+        rgb_tall.put_pixel(15, 31, Rgb([99, 88, 77]));
+        let img_tall = DynamicImage::ImageRgb8(rgb_tall);
+        let out_crop = normalize_canvas_to_cells(&img_tall, FontSize::new(8, 16), Size::new(2, 2));
+        let cropped = out_crop.as_rgb8().expect("crop preserves RGB8 format");
+        assert_eq!((cropped.width(), cropped.height()), (16, 32));
+        assert_eq!(*cropped.get_pixel(15, 31), Rgb([99, 88, 77]));
+
+        // Same width (16 == 16), shorter height (10 < 32) -> contiguous unpack + bottom pad.
+        let mut rgb_short = RgbImage::from_pixel(16, 10, Rgb([12, 34, 56]));
+        rgb_short.put_pixel(15, 9, Rgb([201, 102, 53]));
+        let img_short = DynamicImage::ImageRgb8(rgb_short);
+        let out_pad = normalize_canvas_to_cells(&img_short, FontSize::new(8, 16), Size::new(2, 2));
+        let padded = out_pad.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!((padded.width(), padded.height()), (16, 32));
+        assert_eq!(*padded.get_pixel(0, 0), Rgba([12, 34, 56, 255]));
+        assert_eq!(*padded.get_pixel(15, 9), Rgba([201, 102, 53, 255]));
+        assert_eq!(*padded.get_pixel(0, 10), Rgba([0, 0, 0, 0]));
+        assert_eq!(*padded.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
     }
 
     #[test]
@@ -245,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_canvas_mixed_crop_and_pad() {
+    fn test_normalize_canvas_mixed_crop_and_pad_rgb8() {
         // Wider than target (20 > 16) and shorter than target (10 < 32).
         let mut rgb = RgbImage::from_pixel(20, 10, Rgb([5, 10, 15]));
         rgb.put_pixel(15, 9, Rgb([200, 150, 100]));
@@ -260,6 +410,92 @@ mod tests {
         assert_eq!(*rgba.get_pixel(15, 9), Rgba([200, 150, 100, 255]));
         assert_eq!(*rgba.get_pixel(0, 10), Rgba([0, 0, 0, 0]));
         assert_eq!(*rgba.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
+
+        // Narrower than target (10 < 16) and taller than target (40 > 32).
+        let mut rgb_narrow = RgbImage::from_pixel(10, 40, Rgb([7, 14, 21]));
+        rgb_narrow.put_pixel(9, 31, Rgb([180, 120, 60]));
+        rgb_narrow.put_pixel(9, 32, Rgb([255, 0, 0])); // Outside target height; must be cropped away.
+        let img_narrow = DynamicImage::ImageRgb8(rgb_narrow);
+        let out_narrow =
+            normalize_canvas_to_cells(&img_narrow, FontSize::new(8, 16), Size::new(2, 2));
+        assert!(matches!(out_narrow, Cow::Owned(_)));
+        assert_eq!((out_narrow.width(), out_narrow.height()), (16, 32));
+        let rgba_narrow = out_narrow.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!(*rgba_narrow.get_pixel(0, 0), Rgba([7, 14, 21, 255]));
+        assert_eq!(*rgba_narrow.get_pixel(9, 31), Rgba([180, 120, 60, 255]));
+        assert_eq!(*rgba_narrow.get_pixel(10, 0), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba_narrow.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_mixed_crop_and_pad_rgba8() {
+        // Wider than target (20 > 16) and shorter than target (10 < 32).
+        let mut wide = RgbaImage::from_pixel(20, 10, Rgba([5, 10, 15, 180]));
+        wide.put_pixel(15, 9, Rgba([200, 150, 100, 77]));
+        wide.put_pixel(19, 9, Rgba([255, 0, 0, 255]));
+        let img_wide = DynamicImage::ImageRgba8(wide);
+        let out_wide = normalize_canvas_to_cells(&img_wide, FontSize::new(8, 16), Size::new(2, 2));
+        let rgba_wide = out_wide.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!((rgba_wide.width(), rgba_wide.height()), (16, 32));
+        assert_eq!(*rgba_wide.get_pixel(0, 0), Rgba([5, 10, 15, 180]));
+        assert_eq!(*rgba_wide.get_pixel(15, 9), Rgba([200, 150, 100, 77]));
+        assert_eq!(*rgba_wide.get_pixel(0, 10), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba_wide.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
+
+        // Narrower than target (10 < 16) and taller than target (40 > 32).
+        let mut narrow = RgbaImage::from_pixel(10, 40, Rgba([9, 18, 27, 90]));
+        narrow.put_pixel(9, 31, Rgba([111, 222, 33, 44]));
+        narrow.put_pixel(9, 35, Rgba([255, 0, 0, 255]));
+        let img_narrow = DynamicImage::ImageRgba8(narrow);
+        let out_narrow =
+            normalize_canvas_to_cells(&img_narrow, FontSize::new(8, 16), Size::new(2, 2));
+        let rgba_narrow = out_narrow.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!((rgba_narrow.width(), rgba_narrow.height()), (16, 32));
+        assert_eq!(*rgba_narrow.get_pixel(0, 0), Rgba([9, 18, 27, 90]));
+        assert_eq!(*rgba_narrow.get_pixel(9, 31), Rgba([111, 222, 33, 44]));
+        assert_eq!(*rgba_narrow.get_pixel(10, 0), Rgba([0, 0, 0, 0]));
+        assert_eq!(*rgba_narrow.get_pixel(15, 31), Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn test_normalize_canvas_zero_target_dimensions() {
+        let rgb = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 32, Rgb([1, 2, 3])));
+        let out_w0 = normalize_canvas_to_cells(&rgb, FontSize::new(8, 16), Size::new(0, 2));
+        assert!(matches!(out_w0, Cow::Owned(_)));
+        assert_eq!((out_w0.width(), out_w0.height()), (0, 32));
+        assert!(out_w0.as_rgb8().is_some());
+
+        let out_h0 = normalize_canvas_to_cells(&rgb, FontSize::new(8, 16), Size::new(2, 0));
+        assert!(matches!(out_h0, Cow::Owned(_)));
+        assert_eq!((out_h0.width(), out_h0.height()), (16, 0));
+        assert!(out_h0.as_rgb8().is_some());
+
+        let rgba = DynamicImage::ImageRgba8(RgbaImage::from_pixel(16, 32, Rgba([1, 2, 3, 4])));
+        let out_both0 = normalize_canvas_to_cells(&rgba, FontSize::new(8, 16), Size::new(0, 0));
+        assert!(matches!(out_both0, Cow::Owned(_)));
+        assert_eq!((out_both0.width(), out_both0.height()), (0, 0));
+        assert!(out_both0.as_rgba8().is_some());
+    }
+
+    #[test]
+    fn test_normalize_canvas_other_variant_fallback() {
+        let luma = DynamicImage::ImageLuma8(GrayImage::from_pixel(20, 40, Luma([77])));
+        let cropped = normalize_canvas_to_cells(&luma, FontSize::new(8, 16), Size::new(2, 2));
+        assert_eq!((cropped.width(), cropped.height()), (16, 32));
+        assert_eq!(
+            *cropped
+                .as_luma8()
+                .expect("crop preserves Luma8")
+                .get_pixel(0, 0),
+            Luma([77])
+        );
+
+        let small_luma = DynamicImage::ImageLuma8(GrayImage::from_pixel(6, 6, Luma([99])));
+        let padded = normalize_canvas_to_cells(&small_luma, FontSize::new(8, 16), Size::new(1, 1));
+        let rgba = padded.as_rgba8().expect("padded canvas is RGBA8");
+        assert_eq!((rgba.width(), rgba.height()), (8, 16));
+        assert_eq!(*rgba.get_pixel(5, 5), Rgba([99, 99, 99, 255]));
+        assert_eq!(*rgba.get_pixel(6, 5), Rgba([0, 0, 0, 0]));
     }
 
     #[test]
