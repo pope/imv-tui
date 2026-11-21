@@ -246,6 +246,19 @@ impl KittyShmSegment {
     pub fn is_transmitted(&self) -> bool {
         self.transmitted.load(Ordering::Acquire)
     }
+
+    /// Reads the raw bytes currently stored in this POSIX shared memory segment.
+    #[cfg(test)]
+    pub fn read_bytes(&self) -> Vec<u8> {
+        use std::io::Read;
+        let fd = unsafe { libc::shm_open(self.c_name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0, "Failed to open shm segment {}", self.shm_name());
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)
+            .expect("Failed to read shm segment bytes");
+        out
+    }
 }
 
 impl Drop for KittyShmSegment {
@@ -637,6 +650,35 @@ pub struct KittyShmProtocol {
 }
 
 impl KittyShmProtocol {
+    /// Assembles a [`KittyShmProtocol`] from an already-populated [`KittyShmSegment`].
+    fn from_segment(
+        segment: KittyShmSegment,
+        width: u32,
+        height: u32,
+        pixel_fmt: u8,
+        size: Size,
+        is_tmux: bool,
+    ) -> Self {
+        let id = next_kitty_id();
+        let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
+        let fg = Color::Rgb(id_r, id_g, id_b);
+
+        let b64_name = encode_base64_ascii(segment.shm_name().as_bytes());
+
+        let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
+        let transmit_str = format!(
+            "{start}{escape}_Gq=2,i={id},a=T,U=1,f={pixel_fmt},t=s,s={width},v={height},m=0;{b64_name}{escape}\\{end}",
+        );
+
+        Self {
+            segment,
+            transmit_str,
+            size,
+            id_extra: u16::from(id_extra),
+            fg,
+        }
+    }
+
     /// Creates a new `KittyShmProtocol` from a canvas image and target dimensions.
     ///
     /// Automatically selects `f=24` (RGB8) for opaque images (including zero-intermediate-allocation
@@ -680,30 +722,62 @@ impl KittyShmProtocol {
             }
         };
 
-        let id = next_kitty_id();
-        let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
-        let fg = Color::Rgb(id_r, id_g, id_b);
+        Ok(Self::from_segment(
+            segment, width, height, pixel_fmt, size, is_tmux,
+        ))
+    }
 
-        let b64_name = encode_base64_ascii(segment.shm_name().as_bytes());
+    /// Creates a new `f=32` (RGBA8) `KittyShmProtocol` by letting `fill` write directly into the
+    /// zero-initialized `mmap`'d `/dev/shm` pixel buffer.
+    ///
+    /// Eliminates intermediate full-viewport RGBA canvas allocations, zero-fills, and secondary
+    /// copies for letterboxed or panned frames: untouched margin bytes remain transparent zeros
+    /// (`[0, 0, 0, 0]`) as guaranteed by `shm_open` + `ftruncate`.
+    pub fn from_rgba_writer(
+        font_size: super::picker::FontSize,
+        size: Size,
+        is_tmux: bool,
+        fill: impl FnOnce(&mut [u8], u32, u32),
+    ) -> Result<Self, String> {
+        if size.width == 0 || size.height == 0 {
+            return Err("Target size has zero width or height".to_string());
+        }
 
-        let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
-        let transmit_str = format!(
-            "{start}{escape}_Gq=2,i={id},a=T,U=1,f={pixel_fmt},t=s,s={width},v={height},m=0;{b64_name}{escape}\\{end}",
-        );
+        let target_px_w = u32::from(size.width) * u32::from(font_size.width);
+        let target_px_h = u32::from(size.height) * u32::from(font_size.height);
+        if target_px_w == 0 || target_px_h == 0 {
+            return Err("Target pixel dimensions have zero width or height".to_string());
+        }
 
-        Ok(Self {
+        let byte_len = (target_px_w as usize)
+            .checked_mul(target_px_h as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "Target pixel buffer size overflow".to_string())?;
+
+        let segment = KittyShmSegment::create_and_fill(byte_len, |mapped| {
+            fill(mapped, target_px_w, target_px_h);
+        })?;
+
+        Ok(Self::from_segment(
             segment,
-            transmit_str,
+            target_px_w,
+            target_px_h,
+            32,
             size,
-            id_extra: u16::from(id_extra),
-            fg,
-        })
+            is_tmux,
+        ))
     }
 
     /// Returns a reference to the transmission escape sequence.
     #[cfg(test)]
     pub fn transmit_str(&self) -> &str {
         &self.transmit_str
+    }
+
+    /// Reads the raw pixel bytes stored in this protocol's POSIX shared memory segment.
+    #[cfg(test)]
+    pub fn read_shm_bytes(&self) -> Vec<u8> {
+        self.segment.read_bytes()
     }
 
     /// Renders the Kitty Unicode placeholder grid, prepending the transmission escape sequence
@@ -829,16 +903,9 @@ mod tests {
     use image::{GrayAlphaImage, GrayImage, RgbImage, RgbaImage};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
-    use std::io::Read;
 
     fn read_shm_bytes(segment: &KittyShmSegment) -> Vec<u8> {
-        let fd = unsafe { libc::shm_open(segment.c_name.as_ptr(), libc::O_RDONLY, 0) };
-        assert!(fd >= 0, "Failed to open shm segment {}", segment.shm_name());
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let mut out = Vec::new();
-        file.read_to_end(&mut out)
-            .expect("Failed to read shm segment bytes");
-        out
+        segment.read_bytes()
     }
 
     #[test]
@@ -1185,5 +1252,45 @@ mod tests {
         assert!(proto_lumaa.transmit_str().contains("f=32"));
         assert_eq!(read_shm_bytes(&proto_lumaa.segment), expected_rgba);
         drop(proto_lumaa);
+    }
+
+    #[test]
+    fn test_kitty_shm_from_rgba_writer_zero_margins_and_error_bounds() {
+        let font_size = FontSize::new(4, 3);
+        let size = Size::new(5, 4); // 20 x 12 pixels
+
+        // Zero cell or font dimensions must fail cleanly.
+        assert!(
+            KittyShmProtocol::from_rgba_writer(font_size, Size::new(0, 4), false, |_, _, _| {})
+                .is_err()
+        );
+        assert!(
+            KittyShmProtocol::from_rgba_writer(FontSize::new(0, 3), size, false, |_, _, _| {})
+                .is_err()
+        );
+
+        let proto = KittyShmProtocol::from_rgba_writer(
+            font_size,
+            size,
+            false,
+            |mapped, target_px_w, target_px_h| {
+                assert_eq!((target_px_w, target_px_h), (20, 12));
+                assert_eq!(mapped.len(), (20 * 12 * 4) as usize);
+                // Write a single opaque pixel at (5, 3); leave all other bytes untouched.
+                let offset = ((3 * 20 + 5) * 4) as usize;
+                mapped[offset..offset + 4].copy_from_slice(&[11, 22, 33, 255]);
+            },
+        )
+        .expect("from_rgba_writer should succeed");
+
+        assert!(proto.transmit_str().contains("t=s"));
+        assert!(proto.transmit_str().contains("f=32"));
+        assert!(proto.transmit_str().contains("s=20,v=12"));
+
+        let bytes = proto.read_shm_bytes();
+        let mut expected = vec![0u8; (20 * 12 * 4) as usize];
+        let offset = ((3 * 20 + 5) * 4) as usize;
+        expected[offset..offset + 4].copy_from_slice(&[11, 22, 33, 255]);
+        assert_eq!(bytes, expected);
     }
 }

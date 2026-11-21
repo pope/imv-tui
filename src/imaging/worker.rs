@@ -983,21 +983,194 @@ fn resize_cropped_source(
     }
 }
 
-/// Renders the scaled and panned image onto the destination canvas, applying
-/// offscreen boundary margins, centering, and brightness/contrast adjustments.
-pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> DynamicImage {
+/// Returns `true` when the visible image intersection exactly matches the requested crop box
+/// (no offscreen letterbox margins).
+#[inline]
+fn is_full_viewport_crop(req: &ResizeRequest) -> bool {
+    req.intersection.x1 as i64 == req.crop.x1
+        && req.intersection.x2 as i64 == req.crop.x2
+        && req.intersection.y1 as i64 == req.crop.y1
+        && req.intersection.y2 as i64 == req.crop.y2
+}
+
+/// Shared geometry for compositing a resized letterboxed/panned image region onto a destination
+/// RGBA8 viewport buffer.
+#[derive(Debug, Clone, Copy)]
+struct LetterboxGeometry {
+    src_crop: SourceCropRect,
+    target_inter_w: u32,
+    target_inter_h: u32,
+    paste_x: u32,
+    paste_y: u32,
+    copy_w: u32,
+    copy_h: u32,
+}
+
+/// Computes the source crop, resized intersection dimensions, and paste/copy bounds for a
+/// letterboxed or offscreen-panned [`ResizeRequest`].
+///
+/// Returns `None` when the intersection maps to an empty source region or zero visible pixels.
+fn compute_letterbox_geometry(req: &ResizeRequest) -> Option<LetterboxGeometry> {
     let img_to_resize: &DynamicImage = &req.img;
     let src_crop = SourceCropRect::map_from_original(
         req.intersection,
         PixelDimensions::new(req.original_size.0, req.original_size.1),
         PixelDimensions::new(img_to_resize.width(), img_to_resize.height()),
+    )?;
+
+    let target_inter_w = ((req.intersection.width() as f64 * req.scale).round() as u32).max(1);
+    let target_inter_h = ((req.intersection.height() as f64 * req.scale).round() as u32).max(1);
+
+    let paste_x = ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
+    let paste_y = ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
+
+    let paste_x = paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;
+    let paste_y = paste_y.clamp(0, (req.target_h as i64 - target_inter_h as i64).max(0)) as u32;
+
+    let copy_w = target_inter_w.min(req.target_w.saturating_sub(paste_x));
+    let copy_h = target_inter_h.min(req.target_h.saturating_sub(paste_y));
+    if copy_w == 0 || copy_h == 0 {
+        return None;
+    }
+
+    Some(LetterboxGeometry {
+        src_crop,
+        target_inter_w,
+        target_inter_h,
+        paste_x,
+        paste_y,
+        copy_w,
+        copy_h,
+    })
+}
+
+/// Resizes the active letterbox region and applies brightness/contrast adjustments in place,
+/// preserving `ImageRgb8` when the source is RGB8 and converting other formats to `ImageRgba8`.
+fn prepare_letterbox_part(
+    req: &ResizeRequest,
+    resizer: &mut fir::Resizer,
+    geom: LetterboxGeometry,
+) -> DynamicImage {
+    let resized_part = resize_cropped_source(
+        resizer,
+        &req.img,
+        geom.src_crop,
+        geom.target_inter_w,
+        geom.target_inter_h,
+        req.filter_type,
     );
 
-    if req.intersection.x1 as i64 == req.crop.x1
-        && req.intersection.x2 as i64 == req.crop.x2
-        && req.intersection.y1 as i64 == req.crop.y1
-        && req.intersection.y2 as i64 == req.crop.y2
-    {
+    match resized_part {
+        DynamicImage::ImageRgb8(mut src_rgb) => {
+            let src_stride = (src_rgb.width() as usize) * 3;
+            let src_row_bytes = (geom.copy_w as usize) * 3;
+            let active_src_len = ((geom.copy_h as usize) - 1) * src_stride + src_row_bytes;
+            apply_adjustments_lut_rgb(
+                &mut src_rgb.as_mut()[..active_src_len],
+                req.brightness.value(),
+                req.contrast.value(),
+            );
+            DynamicImage::ImageRgb8(src_rgb)
+        }
+        other => {
+            let mut src_rgba = match other {
+                DynamicImage::ImageRgba8(rgba) => rgba,
+                non_rgba => into_rgba8_fast(non_rgba),
+            };
+            let src_stride = (src_rgba.width() as usize) * 4;
+            let row_bytes = (geom.copy_w as usize) * 4;
+            let active_src_len = ((geom.copy_h as usize) - 1) * src_stride + row_bytes;
+            apply_adjustments_lut(
+                &mut src_rgba.as_mut()[..active_src_len],
+                req.brightness.value(),
+                req.contrast.value(),
+            );
+            DynamicImage::ImageRgba8(src_rgba)
+        }
+    }
+}
+
+/// Composites an already-resized and adjusted letterbox image into a zero-initialized RGBA8
+/// destination slice of dimensions `(dest_w, dest_h)`.
+///
+/// Clamps the copied region against both `geom.(copy_w, copy_h)` (bounded by `req.target_w/h`)
+/// and `(dest_w, dest_h)` so direct-to-SHM compositing matches `normalize_canvas_to_cells`
+/// crop/pad semantics byte-for-byte.
+fn composite_resized_into_rgba_slice(
+    resized_part: &DynamicImage,
+    geom: LetterboxGeometry,
+    dest_raw: &mut [u8],
+    dest_w: u32,
+    dest_h: u32,
+) {
+    if geom.paste_x >= dest_w || geom.paste_y >= dest_h {
+        return;
+    }
+
+    let copy_w = geom.copy_w.min(dest_w - geom.paste_x);
+    let copy_h = geom.copy_h.min(dest_h - geom.paste_y);
+    if copy_w == 0 || copy_h == 0 {
+        return;
+    }
+
+    let dest_stride = (dest_w as usize) * 4;
+    let dest_row_bytes = (copy_w as usize) * 4;
+
+    match resized_part {
+        DynamicImage::ImageRgb8(src_rgb) => {
+            let src_stride = (src_rgb.width() as usize) * 3;
+            let src_row_bytes = (copy_w as usize) * 3;
+            let src_raw = src_rgb.as_raw();
+
+            for y in 0..(copy_h as usize) {
+                let src_start = y * src_stride;
+                let src_slice = &src_raw[src_start..src_start + src_row_bytes];
+                let dest_start =
+                    ((geom.paste_y as usize) + y) * dest_stride + (geom.paste_x as usize) * 4;
+                unpack_rgb24_into_rgba32(
+                    src_slice,
+                    &mut dest_raw[dest_start..dest_start + dest_row_bytes],
+                );
+            }
+        }
+        DynamicImage::ImageRgba8(src_rgba) => {
+            let src_stride = (src_rgba.width() as usize) * 4;
+            let src_raw = src_rgba.as_raw();
+
+            for y in 0..(copy_h as usize) {
+                let src_start = y * src_stride;
+                let src_slice = &src_raw[src_start..src_start + dest_row_bytes];
+                let dest_start =
+                    ((geom.paste_y as usize) + y) * dest_stride + (geom.paste_x as usize) * 4;
+                dest_raw[dest_start..dest_start + dest_row_bytes].copy_from_slice(src_slice);
+            }
+        }
+        other => {
+            let src_rgba = to_rgba8_fast(other);
+            let src_stride = (src_rgba.width() as usize) * 4;
+            let src_raw = src_rgba.as_raw();
+
+            for y in 0..(copy_h as usize) {
+                let src_start = y * src_stride;
+                let src_slice = &src_raw[src_start..src_start + dest_row_bytes];
+                let dest_start =
+                    ((geom.paste_y as usize) + y) * dest_stride + (geom.paste_x as usize) * 4;
+                dest_raw[dest_start..dest_start + dest_row_bytes].copy_from_slice(src_slice);
+            }
+        }
+    }
+}
+
+/// Renders the scaled and panned image onto the destination canvas, applying
+/// offscreen boundary margins, centering, and brightness/contrast adjustments.
+pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> DynamicImage {
+    if is_full_viewport_crop(req) {
+        let img_to_resize: &DynamicImage = &req.img;
+        let src_crop = SourceCropRect::map_from_original(
+            req.intersection,
+            PixelDimensions::new(req.original_size.0, req.original_size.1),
+            PixelDimensions::new(img_to_resize.width(), img_to_resize.height()),
+        );
         let Some(src_crop) = src_crop else {
             return DynamicImage::ImageRgba8(image::RgbaImage::new(req.target_w, req.target_h));
         };
@@ -1031,87 +1204,15 @@ pub fn render_resize_canvas(req: &ResizeRequest, resizer: &mut fir::Resizer) -> 
     } else {
         let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
 
-        if let Some(src_crop) = src_crop {
-            let target_inter_w =
-                ((req.intersection.width() as f64 * req.scale).round() as u32).max(1);
-            let target_inter_h =
-                ((req.intersection.height() as f64 * req.scale).round() as u32).max(1);
-
-            let resized_part = resize_cropped_source(
-                resizer,
-                img_to_resize,
-                src_crop,
-                target_inter_w,
-                target_inter_h,
-                req.filter_type,
+        if let Some(geom) = compute_letterbox_geometry(req) {
+            let resized_part = prepare_letterbox_part(req, resizer, geom);
+            composite_resized_into_rgba_slice(
+                &resized_part,
+                geom,
+                screen_canvas.as_mut(),
+                req.target_w,
+                req.target_h,
             );
-
-            let paste_x =
-                ((req.intersection.x1 as i64 - req.crop.x1) as f64 * req.scale).round() as i64;
-            let paste_y =
-                ((req.intersection.y1 as i64 - req.crop.y1) as f64 * req.scale).round() as i64;
-
-            let paste_x =
-                paste_x.clamp(0, (req.target_w as i64 - target_inter_w as i64).max(0)) as u32;
-            let paste_y =
-                paste_y.clamp(0, (req.target_h as i64 - target_inter_h as i64).max(0)) as u32;
-
-            let copy_w = target_inter_w.min(req.target_w.saturating_sub(paste_x));
-            let copy_h = target_inter_h.min(req.target_h.saturating_sub(paste_y));
-
-            if copy_w > 0 && copy_h > 0 {
-                let dest_stride = (req.target_w as usize) * 4;
-                let dest_raw = screen_canvas.as_mut();
-
-                match resized_part {
-                    DynamicImage::ImageRgb8(mut src_rgb) => {
-                        let src_stride = (src_rgb.width() as usize) * 3;
-                        let src_row_bytes = (copy_w as usize) * 3;
-                        let dest_row_bytes = (copy_w as usize) * 4;
-                        let active_src_len = ((copy_h as usize) - 1) * src_stride + src_row_bytes;
-                        apply_adjustments_lut_rgb(
-                            &mut src_rgb.as_mut()[..active_src_len],
-                            req.brightness.value(),
-                            req.contrast.value(),
-                        );
-                        let src_raw = src_rgb.as_raw();
-
-                        for y in 0..(copy_h as usize) {
-                            let src_start = y * src_stride;
-                            let src_slice = &src_raw[src_start..src_start + src_row_bytes];
-                            let dest_start =
-                                ((paste_y as usize) + y) * dest_stride + (paste_x as usize) * 4;
-                            unpack_rgb24_into_rgba32(
-                                src_slice,
-                                &mut dest_raw[dest_start..dest_start + dest_row_bytes],
-                            );
-                        }
-                    }
-                    other => {
-                        let mut src_rgba = match other {
-                            DynamicImage::ImageRgba8(rgba) => rgba,
-                            non_rgba => into_rgba8_fast(non_rgba),
-                        };
-                        let src_stride = (src_rgba.width() as usize) * 4;
-                        let row_bytes = (copy_w as usize) * 4;
-                        let active_src_len = ((copy_h as usize) - 1) * src_stride + row_bytes;
-                        apply_adjustments_lut(
-                            &mut src_rgba.as_mut()[..active_src_len],
-                            req.brightness.value(),
-                            req.contrast.value(),
-                        );
-                        let src_raw = src_rgba.as_raw();
-
-                        for y in 0..(copy_h as usize) {
-                            let src_start = y * src_stride;
-                            let src_slice = &src_raw[src_start..src_start + row_bytes];
-                            let dest_start =
-                                ((paste_y as usize) + y) * dest_stride + (paste_x as usize) * 4;
-                            dest_raw[dest_start..dest_start + row_bytes].copy_from_slice(src_slice);
-                        }
-                    }
-                }
-            }
         }
         DynamicImage::ImageRgba8(screen_canvas)
     }
@@ -1124,11 +1225,6 @@ pub fn process_resize(
     resizer: &mut fir::Resizer,
 ) -> (ViewportProtocol, std::time::Duration, std::time::Duration) {
     let rendered_cells = req.rendered_size_cells;
-    let start_process = std::time::Instant::now();
-    let canvas = render_resize_canvas(&req, resizer);
-    let process_duration = start_process.elapsed();
-
-    let start_protocol = std::time::Instant::now();
     let target_size = ratatui::layout::Size::new(rendered_cells.0, rendered_cells.1);
     let make_kitty_direct_or_empty =
         |canvas: &DynamicImage, compressed: bool| match KittyDirectProtocol::new(
@@ -1142,6 +1238,58 @@ pub fn process_resize(
             Err(_) => ViewportProtocol::Empty,
         };
 
+    // Direct-to-SHM compositing for letterboxed/panned Kitty SHM frames: avoids allocating and
+    // zero-filling a full-viewport RGBA canvas and eliminates the secondary SHM memcpy.
+    if req.protocol == ActiveProtocol::Kitty(KittyTransferMode::SharedMemory)
+        && !is_full_viewport_crop(&req)
+    {
+        let start_process = std::time::Instant::now();
+        let prepared = compute_letterbox_geometry(&req)
+            .map(|geom| (geom, prepare_letterbox_part(&req, resizer, geom)));
+        let process_duration = start_process.elapsed();
+
+        let start_protocol = std::time::Instant::now();
+        let protocol = match KittyShmProtocol::from_rgba_writer(
+            req.picker.font_size(),
+            target_size,
+            req.picker.tmux_detected(),
+            |mapped, target_px_w, target_px_h| {
+                if let Some((geom, ref resized_part)) = prepared {
+                    composite_resized_into_rgba_slice(
+                        resized_part,
+                        geom,
+                        mapped,
+                        target_px_w,
+                        target_px_h,
+                    );
+                }
+            },
+        ) {
+            Ok(shm_proto) => ViewportProtocol::KittyShm(shm_proto),
+            Err(_) => {
+                let mut screen_canvas = image::RgbaImage::new(req.target_w, req.target_h);
+                if let Some((geom, ref resized_part)) = prepared {
+                    composite_resized_into_rgba_slice(
+                        resized_part,
+                        geom,
+                        screen_canvas.as_mut(),
+                        req.target_w,
+                        req.target_h,
+                    );
+                }
+                let canvas = DynamicImage::ImageRgba8(screen_canvas);
+                make_kitty_direct_or_empty(&canvas, false)
+            }
+        };
+        let protocol_duration = start_protocol.elapsed();
+        return (protocol, process_duration, protocol_duration);
+    }
+
+    let start_process = std::time::Instant::now();
+    let canvas = render_resize_canvas(&req, resizer);
+    let process_duration = start_process.elapsed();
+
+    let start_protocol = std::time::Instant::now();
     let protocol = match req.protocol {
         ActiveProtocol::Kitty(KittyTransferMode::SharedMemory) => match KittyShmProtocol::new(
             &canvas,
@@ -4212,5 +4360,228 @@ mod tests {
             assert_eq!(out_from_rgb.get_pixel(10, 5)[3], 255);
             assert_eq!(out_from_rgb.get_pixel(49, 34)[3], 255);
         }
+    }
+
+    #[test]
+    fn test_process_resize_kitty_shm_direct_compositing_matches_reference_byte_for_byte() {
+        let mut resizer = fir::Resizer::new();
+        // Picker::halfblocks() has FontSize::new(8, 16).
+        let picker = Picker::halfblocks();
+
+        let rgb_img = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            80,
+            60,
+            |x, y| {
+                image::Rgb([
+                    ((x * 5 + 17) % 256) as u8,
+                    ((y * 7 + 31) % 256) as u8,
+                    (((x + y) * 3 + 53) % 256) as u8,
+                ])
+            },
+        )));
+        let rgba_img = Arc::new(DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
+            80,
+            60,
+            |x, y| {
+                let a = if (x + y) % 5 == 0 { 128 } else { 255 };
+                Rgba([
+                    ((x * 5 + 17) % 256) as u8,
+                    ((y * 7 + 31) % 256) as u8,
+                    (((x + y) * 3 + 53) % 256) as u8,
+                    a,
+                ])
+            },
+        )));
+
+        let assert_direct_matches_reference =
+            |req: ResizeRequest, label: &str, resizer: &mut fir::Resizer| {
+                let ref_canvas = render_resize_canvas(&req, resizer);
+                let target_size = ratatui::layout::Size::new(
+                    req.rendered_size_cells.0,
+                    req.rendered_size_cells.1,
+                );
+                let ref_proto = KittyShmProtocol::new(
+                    &ref_canvas,
+                    req.picker.font_size(),
+                    target_size,
+                    req.picker.tmux_detected(),
+                )
+                .expect("Reference KittyShmProtocol::new failed");
+                let ref_bytes = ref_proto.read_shm_bytes();
+                assert!(
+                    ref_proto.transmit_str().contains("f=32"),
+                    "{label}: expected reference letterboxed SHM to be f=32"
+                );
+
+                let (direct_proto, _, _) = process_resize(req, resizer);
+                let direct_shm = match direct_proto {
+                    ViewportProtocol::KittyShm(p) => p,
+                    _ => panic!("{label}: expected ViewportProtocol::KittyShm"),
+                };
+                assert!(
+                    direct_shm.transmit_str().contains("f=32"),
+                    "{label}: expected direct-to-SHM protocol to emit f=32"
+                );
+                assert!(
+                    direct_shm.transmit_str().contains(&format!(
+                        "s={},v={}",
+                        u32::from(target_size.width) * u32::from(picker.font_size().width),
+                        u32::from(target_size.height) * u32::from(picker.font_size().height),
+                    )),
+                    "{label}: transmit dimensions mismatch"
+                );
+
+                let direct_bytes = direct_shm.read_shm_bytes();
+                assert_eq!(
+                    direct_bytes, ref_bytes,
+                    "{label}: direct-to-SHM payload diverged from reference"
+                );
+            };
+
+        let adj_cases = [
+            (Brightness::ZERO, Contrast::ZERO),
+            (Brightness::new(35), Contrast::ZERO),
+            (Brightness::new(-30), Contrast::new(25.0)),
+        ];
+
+        // 1. Letterboxed ImageRgb8 & partial-alpha ImageRgba8 (exact cell dimensions: 10x4 cells = 80x64 px)
+        for (brightness, contrast) in adj_cases {
+            for (kind, img) in [("rgb8", &rgb_img), ("rgba8", &rgba_img)] {
+                let req = ResizeRequest {
+                    img: Arc::clone(img),
+                    original_size: (80, 60),
+                    scale: 0.5,
+                    crop: CropBox::new(-40, -34, 120, 94),
+                    intersection: ImageIntersection::new(0, 0, 80, 60),
+                    target_w: 80,
+                    target_h: 64,
+                    filter_type: FilterType::Linear,
+                    picker: picker.clone(),
+                    brightness,
+                    contrast,
+                    rendered_size_cells: (10, 4), // 80 x 64 px
+                    sequence: 1,
+                    protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
+                };
+                assert_direct_matches_reference(
+                    req,
+                    &format!(
+                        "letterbox-{kind}-b{}-c{}",
+                        brightness.value(),
+                        contrast.value()
+                    ),
+                    &mut resizer,
+                );
+            }
+        }
+
+        // 2. Fully offscreen (src_crop == None): empty intersection produces all-zero SHM buffer.
+        for (kind, img) in [("rgb8", &rgb_img), ("rgba8", &rgba_img)] {
+            let req = ResizeRequest {
+                img: Arc::clone(img),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(100, 100, 180, 160),
+                intersection: ImageIntersection::new(80, 60, 80, 60),
+                target_w: 80,
+                target_h: 64,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness: Brightness::new(20),
+                contrast: Contrast::new(10.0),
+                rendered_size_cells: (10, 4),
+                sequence: 2,
+                protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
+            };
+            assert_direct_matches_reference(req, &format!("offscreen-{kind}"), &mut resizer);
+        }
+
+        // 3. Cell padding (req.target_w/h < target_px_w/h): 60x40 padded into 10x4 cells (80x64 px).
+        for (kind, img) in [("rgb8", &rgb_img), ("rgba8", &rgba_img)] {
+            let req = ResizeRequest {
+                img: Arc::clone(img),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(-20, -10, 100, 70),
+                intersection: ImageIntersection::new(0, 0, 80, 60),
+                target_w: 60,
+                target_h: 40,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness: Brightness::new(15),
+                contrast: Contrast::new(-10.0),
+                rendered_size_cells: (10, 4), // 80 x 64 px > 60 x 40
+                sequence: 3,
+                protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
+            };
+            assert_direct_matches_reference(req, &format!("cell-pad-{kind}"), &mut resizer);
+        }
+
+        // 4. Cell cropping (req.target_w/h > target_px_w/h): 100x80 cropped into 8x4 cells (64x64 px).
+        for (kind, img) in [("rgb8", &rgb_img), ("rgba8", &rgba_img)] {
+            let req = ResizeRequest {
+                img: Arc::clone(img),
+                original_size: (80, 60),
+                scale: 0.5,
+                crop: CropBox::new(-60, -40, 140, 120),
+                intersection: ImageIntersection::new(0, 0, 80, 60),
+                target_w: 100,
+                target_h: 80,
+                filter_type: FilterType::Linear,
+                picker: picker.clone(),
+                brightness: Brightness::new(-20),
+                contrast: Contrast::new(15.0),
+                rendered_size_cells: (8, 4), // 64 x 64 px < 100 x 80
+                sequence: 4,
+                protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
+            };
+            assert_direct_matches_reference(req, &format!("cell-crop-{kind}"), &mut resizer);
+        }
+
+        // 5. Pasted region completely past target_px_w (paste_x = 40 >= target_px_w = 32): all zeros.
+        let req_past = ResizeRequest {
+            img: Arc::clone(&rgb_img),
+            original_size: (80, 60),
+            scale: 0.5,
+            crop: CropBox::new(-80, -20, 120, 100),
+            intersection: ImageIntersection::new(0, 0, 80, 60),
+            target_w: 100,
+            target_h: 60,
+            filter_type: FilterType::Linear,
+            picker: picker.clone(),
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (4, 3), // 32 x 48 px; paste_x = 40 >= 32
+            sequence: 5,
+            protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
+        };
+        assert_direct_matches_reference(req_past, "cell-crop-past-paste-x", &mut resizer);
+
+        // 6. Full-viewport RGB8 (intersection == crop) still preserves f=24 via KittyShmProtocol::new.
+        let req_full = ResizeRequest {
+            img: Arc::clone(&rgb_img),
+            original_size: (80, 60),
+            scale: 1.0,
+            crop: CropBox::new(0, 0, 80, 60),
+            intersection: ImageIntersection::new(0, 0, 80, 60),
+            target_w: 80,
+            target_h: 64,
+            filter_type: FilterType::Linear,
+            picker,
+            brightness: Brightness::ZERO,
+            contrast: Contrast::ZERO,
+            rendered_size_cells: (10, 4), // 80 x 64 px
+            sequence: 6,
+            protocol: ActiveProtocol::Kitty(KittyTransferMode::SharedMemory),
+        };
+        let (full_proto, _, _) = process_resize(req_full, &mut resizer);
+        let full_shm = match full_proto {
+            ViewportProtocol::KittyShm(p) => p,
+            _ => panic!("Expected ViewportProtocol::KittyShm for full-viewport RGB8"),
+        };
+        assert!(
+            full_shm.transmit_str().contains("f=24"),
+            "Full-viewport RGB8 must preserve f=24"
+        );
     }
 }
