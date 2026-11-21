@@ -2850,3 +2850,64 @@ fn test_execute_command_and_viewport_reducers() {
     app.execute_command(Command::SetViewDefault);
     assert_eq!(app.view_mode, ViewMode::Default);
 }
+
+#[test]
+fn test_write_pending_protocol_transmit_respects_display_state() {
+    use crate::imaging::FontSize;
+    use crate::imaging::kitty_direct::KittyDirectProtocol;
+    use image::RgbImage;
+    use ratatui::layout::Size;
+
+    let images = vec![ImageSource::Local(PathBuf::from("photo.png"))];
+    let (mut app, _channels) = App::new_mocked(
+        images,
+        0,
+        Picker::halfblocks(),
+        AppConfig::default(),
+        ScanConfig::Directory {
+            path: PathBuf::from("."),
+            check_magic: false,
+            recursive: false,
+        },
+    )
+    .unwrap();
+
+    // 1. Loading / Empty state (no protocol yet): must not transmit
+    app.initial_load = InitialLoadState::start_at(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_millis(500))
+            .unwrap(),
+    );
+    assert!(matches!(
+        app.display_state(),
+        ImageDisplayState::LoadingSpinner
+    ));
+    let mut out = Vec::new();
+    assert!(!app.write_pending_protocol_transmit(&mut out).unwrap());
+    assert!(out.is_empty());
+
+    // 2. Error state: must not transmit
+    app.set_error_state("corrupt image");
+    assert!(matches!(app.display_state(), ImageDisplayState::Error(_)));
+    let mut out = Vec::new();
+    assert!(!app.write_pending_protocol_transmit(&mut out).unwrap());
+    assert!(out.is_empty());
+
+    // 3. Ready state with KittyDirect protocol: transmits exact bytes once
+    let img = DynamicImage::ImageRgb8(RgbImage::from_raw(4, 4, vec![99u8; 4 * 4 * 3]).unwrap());
+    let proto =
+        KittyDirectProtocol::new(&img, FontSize::new(1, 1), Size::new(4, 4), false, false).unwrap();
+    let expected = proto.transmit_str().as_bytes().to_vec();
+    app.error_message = None;
+    app.image_protocol = Some(ViewportProtocol::KittyDirect(proto));
+    assert!(matches!(app.display_state(), ImageDisplayState::Ready));
+
+    let mut out = Vec::new();
+    assert!(app.write_pending_protocol_transmit(&mut out).unwrap());
+    assert_eq!(out, expected);
+
+    // 4. Subsequent call in Ready state must be a no-op
+    let mut out2 = Vec::new();
+    assert!(!app.write_pending_protocol_transmit(&mut out2).unwrap());
+    assert!(out2.is_empty());
+}

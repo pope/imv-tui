@@ -401,6 +401,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if clear_before_draw {
                     clear_fullscreen_without_query(terminal)?;
                 }
+                app.write_pending_protocol_transmit(terminal.backend_mut())?;
                 terminal.draw(|f| {
                     term_size = f.area().as_size();
                     let mut model = app.ui_model();

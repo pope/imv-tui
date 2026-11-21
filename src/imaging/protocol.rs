@@ -174,6 +174,22 @@ pub enum ViewportProtocol {
 }
 
 impl ViewportProtocol {
+    /// Writes any pending one-shot protocol transmission escape sequence directly to `writer`.
+    ///
+    /// Currently used by [`Self::KittyDirect`] to bypass copying large Base64 payloads into
+    /// ratatui's cell buffer. Returns `Ok(true)` if bytes were written, or `Ok(false)` if
+    /// nothing was pending or the protocol does not use direct pre-draw transmission.
+    pub fn write_pending_transmit(&self, writer: impl std::io::Write) -> std::io::Result<bool> {
+        match self {
+            Self::KittyDirect(proto) => proto.write_pending_transmit(writer),
+            Self::Empty
+            | Self::KittyShm(_)
+            | Self::Sixel(_)
+            | Self::Iterm2(_)
+            | Self::Halfblocks(_) => Ok(false),
+        }
+    }
+
     /// Renders the encoded viewport image into `buf` within `area`.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         match self {
@@ -270,5 +286,13 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
         ViewportProtocol::Empty.render(Rect::new(0, 0, 4, 2), &mut buf);
         assert_eq!(buf[(0, 0)].symbol(), " ");
+
+        let mut out = Vec::new();
+        assert!(
+            !ViewportProtocol::Empty
+                .write_pending_transmit(&mut out)
+                .unwrap()
+        );
+        assert!(out.is_empty());
     }
 }

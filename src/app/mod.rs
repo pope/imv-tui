@@ -716,6 +716,24 @@ impl App {
         )
     }
 
+    /// Writes any pending one-shot graphics protocol transmission directly to `writer`
+    /// when the viewport is ready to render an image protocol.
+    ///
+    /// Calling this inside a synchronized update immediately before `terminal.draw` avoids
+    /// copying large inline protocol payloads through ratatui's cell buffer.
+    pub fn write_pending_protocol_transmit(
+        &self,
+        writer: impl std::io::Write,
+    ) -> std::io::Result<bool> {
+        if matches!(self.display_state(), ImageDisplayState::Ready)
+            && let Some(ref proto) = self.image_protocol
+        {
+            proto.write_pending_transmit(writer)
+        } else {
+            Ok(false)
+        }
+    }
+
     #[inline]
     fn compute_display_state<'a>(
         has_protocol: bool,

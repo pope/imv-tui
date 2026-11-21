@@ -135,8 +135,23 @@ impl KittyDirectProtocol {
         &self.transmit_str
     }
 
+    /// Writes the one-shot Kitty direct transmission escape sequence directly to `writer`
+    /// if it has not yet been transmitted.
+    ///
+    /// Returns `Ok(true)` if the transmission bytes were written, or `Ok(false)` if they
+    /// were already transmitted. If `writer.write_all` fails, the transmitted flag remains
+    /// unset so a subsequent attempt can retry.
+    pub fn write_pending_transmit(&self, mut writer: impl Write) -> std::io::Result<bool> {
+        if self.transmitted.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        writer.write_all(self.transmit_str.as_bytes())?;
+        self.transmitted.store(true, Ordering::Release);
+        Ok(true)
+    }
+
     /// Renders the Kitty Unicode placeholder grid, prepending the transmission escape sequence
-    /// only on the first render call.
+    /// only on the first render call if not already transmitted via [`Self::write_pending_transmit`].
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let is_first_render = !self.transmitted.swap(true, Ordering::SeqCst);
         let transmit = if is_first_render {
@@ -523,6 +538,54 @@ mod tests {
         assert!(!c00_second.symbol().contains("_Gq=2"));
         assert!(c00_second.symbol().starts_with('\u{10EEEE}'));
         assert!(c00_second.symbol().chars().count() == 4);
+    }
+
+    #[test]
+    fn test_kitty_direct_write_pending_transmit_oneshot_and_clean_render() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated write failure",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let raw = vec![64u8; 4 * 4 * 3];
+        let img = DynamicImage::ImageRgb8(RgbImage::from_raw(4, 4, raw).unwrap());
+        let font = FontSize {
+            width: 1,
+            height: 1,
+        };
+        let size = Size::new(4, 4);
+        let proto = KittyDirectProtocol::new(&img, font, size, false, false).unwrap();
+
+        // A failing write must NOT mark the protocol as transmitted
+        assert!(proto.write_pending_transmit(FailingWriter).is_err());
+
+        // First successful write emits exact transmit_str bytes and returns Ok(true)
+        let mut out = Vec::new();
+        assert!(proto.write_pending_transmit(&mut out).unwrap());
+        assert_eq!(out, proto.transmit_str().as_bytes());
+
+        // Second call is a no-op returning Ok(false)
+        let mut out2 = Vec::new();
+        assert!(!proto.write_pending_transmit(&mut out2).unwrap());
+        assert!(out2.is_empty());
+
+        // Subsequent render() emits ONLY clean Unicode placeholder cells (no transmit_str)
+        let area = Rect::new(0, 0, 4, 4);
+        let mut buf = Buffer::empty(area);
+        proto.render(area, &mut buf);
+        let c00 = &buf[(0, 0)];
+        assert!(!c00.symbol().contains("_Gq=2"));
+        assert!(c00.symbol().starts_with('\u{10EEEE}'));
+        assert_eq!(c00.symbol().chars().count(), 4);
+        assert_eq!(buf[(1, 0)].symbol(), "\u{10EEEE}");
     }
 
     #[test]
