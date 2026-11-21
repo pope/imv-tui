@@ -4,12 +4,11 @@
 //! - Automatic `f=24` (RGB8) selection for opaque images (25% smaller payload and Base64)
 //!   and `f=32` (RGBA8) for images with transparency.
 //! - Optional fast zlib compression (`o=z`) for remote SSH sessions.
-//! - Zero-intermediate-allocation parallel `rayon` + SIMD (`base64-simd`) 4096-character Base64 chunk formatting.
+//! - Zero-`unsafe`, zero-pre-zero-fill parallel `rayon` + SIMD (`base64-simd`) 4096-character Base64 chunk formatting.
 //! - Shared Kitty Unicode placeholder (`U+10EEEE`) rendering via [`super::kitty_shm::render_kitty_placeholders`].
 
 use std::borrow::Cow;
 use std::io::Write;
-use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::Compression;
@@ -33,7 +32,7 @@ const PARALLEL_CHUNK_THRESHOLD: usize = 16;
 
 /// Parallel `rayon`-accelerated inline Kitty graphics protocol (`t=d` / `o=z,t=d`) state.
 pub struct KittyDirectProtocol {
-    transmit_bytes: Vec<u8>,
+    transmit_slabs: Vec<Vec<u8>>,
     transmitted: AtomicBool,
     size: Size,
     id_extra: u16,
@@ -110,7 +109,7 @@ impl KittyDirectProtocol {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let fg = Color::Rgb(id_r, id_g, id_b);
 
-        let transmit_bytes = format_kitty_direct_chunks(
+        let transmit_slabs = format_kitty_direct_chunks(
             &payload,
             id,
             pixel_fmt,
@@ -122,7 +121,7 @@ impl KittyDirectProtocol {
         );
 
         Ok(Self {
-            transmit_bytes,
+            transmit_slabs,
             transmitted: AtomicBool::new(false),
             size,
             id_extra: u16::from(id_extra),
@@ -130,10 +129,25 @@ impl KittyDirectProtocol {
         })
     }
 
-    /// Returns a reference to the formatted Kitty direct transmission escape sequence.
+    /// Returns the formatted Kitty direct transmission escape sequence.
+    ///
+    /// Borrows directly when stored in a single slab, or concatenates slabs for multi-slab
+    /// parallel outputs.
     #[cfg(test)]
-    pub fn transmit_str(&self) -> &str {
-        std::str::from_utf8(&self.transmit_bytes).expect("Kitty direct chunk output is valid ASCII")
+    pub fn transmit_str(&self) -> Cow<'_, str> {
+        if self.transmit_slabs.len() == 1 {
+            Cow::Borrowed(
+                std::str::from_utf8(&self.transmit_slabs[0])
+                    .expect("Kitty direct chunk output is valid ASCII"),
+            )
+        } else {
+            let total_len: usize = self.transmit_slabs.iter().map(Vec::len).sum();
+            let mut flat = Vec::with_capacity(total_len);
+            for slab in &self.transmit_slabs {
+                flat.extend_from_slice(slab);
+            }
+            Cow::Owned(String::from_utf8(flat).expect("Kitty direct chunk output is valid ASCII"))
+        }
     }
 
     /// Writes the one-shot Kitty direct transmission escape sequence directly to `writer`
@@ -146,7 +160,9 @@ impl KittyDirectProtocol {
         if self.transmitted.load(Ordering::Acquire) {
             return Ok(false);
         }
-        writer.write_all(&self.transmit_bytes)?;
+        for slab in &self.transmit_slabs {
+            writer.write_all(slab)?;
+        }
         self.transmitted.store(true, Ordering::Release);
         Ok(true)
     }
@@ -155,8 +171,19 @@ impl KittyDirectProtocol {
     /// only on the first render call if not already transmitted via [`Self::write_pending_transmit`].
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let is_first_render = !self.transmitted.swap(true, Ordering::SeqCst);
+        let owned_fallback;
         let transmit = if is_first_render {
-            std::str::from_utf8(&self.transmit_bytes).ok()
+            if self.transmit_slabs.len() == 1 {
+                std::str::from_utf8(&self.transmit_slabs[0]).ok()
+            } else {
+                let total_len: usize = self.transmit_slabs.iter().map(Vec::len).sum();
+                let mut flat = Vec::with_capacity(total_len);
+                for slab in &self.transmit_slabs {
+                    flat.extend_from_slice(slab);
+                }
+                owned_fallback = flat;
+                std::str::from_utf8(&owned_fallback).ok()
+            }
         } else {
             None
         };
@@ -164,38 +191,22 @@ impl KittyDirectProtocol {
     }
 }
 
-/// Encodes `src` into RFC 4648 standard Base64 directly into `dst` using runtime-dispatched SIMD.
-///
-/// Caller must ensure `dst.len() == src.len().div_ceil(3) * 4`.
-/// Initializes every byte of `dst`.
+/// Appends a single formatted Kitty direct chunk (`header + base64(src) + trailer`) to `dst`
+/// using runtime-dispatched SIMD Base64 encoding without intermediate allocations.
 #[inline]
-fn encode_base64_slice(src: &[u8], dst: &mut [MaybeUninit<u8>]) {
-    if src.is_empty() {
-        debug_assert!(dst.is_empty());
-        return;
+fn append_kitty_chunk(header: &[u8], src: &[u8], trailer: &[u8], dst: &mut Vec<u8>) {
+    dst.extend_from_slice(header);
+    if !src.is_empty() {
+        base64_simd::STANDARD.encode_append(src, dst);
     }
-    let encoded = base64_simd::STANDARD.encode(src, base64_simd::Out::from_uninit_slice(dst));
-    debug_assert_eq!(encoded.len(), dst.len());
-}
-
-/// Writes a single formatted Kitty direct chunk (`header + base64(src) + trailer`) into `dst`,
-/// initializing every byte of `dst`.
-///
-/// Panics if `dst.len() != header.len() + src.len().div_ceil(3) * 4 + trailer.len()`.
-#[inline]
-fn write_kitty_chunk(header: &[u8], src: &[u8], trailer: &[u8], dst: &mut [MaybeUninit<u8>]) {
-    let h_len = header.len();
-    let b64_len = src.len().div_ceil(3) * 4;
-    assert_eq!(dst.len(), h_len + b64_len + trailer.len());
-    dst[..h_len].write_copy_of_slice(header);
-    encode_base64_slice(src, &mut dst[h_len..h_len + b64_len]);
-    dst[h_len + b64_len..].write_copy_of_slice(trailer);
+    dst.extend_from_slice(trailer);
 }
 
 /// Formats `payload` into Kitty direct (`t=d`) Base64 chunks of at most 4096 Base64 characters.
 ///
-/// Allocates a single exact-size uninitialized output buffer and formats middle chunks in parallel
-/// across `rayon` workers when `chunk_count >= parallel_threshold`. Returns pure ASCII bytes.
+/// Returns one or more pure-ASCII byte slabs whose concatenation is the complete Kitty direct
+/// transmission sequence. When `chunk_count >= parallel_threshold`, partitions chunks across
+/// `rayon` workers into pre-sized slabs without `unsafe` or pre-zero-fill allocations.
 #[allow(clippy::too_many_arguments)]
 fn format_kitty_direct_chunks(
     payload: &[u8],
@@ -206,7 +217,7 @@ fn format_kitty_direct_chunks(
     is_tmux: bool,
     compress: bool,
     parallel_threshold: usize,
-) -> Vec<u8> {
+) -> Vec<Vec<u8>> {
     let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
     let compression = if compress { "o=z," } else { "" };
     let trailer = format!("{escape}\\{end}");
@@ -220,14 +231,9 @@ fn format_kitty_direct_chunks(
         let b64_len = payload.len().div_ceil(3) * 4;
         let total_len = header0.len() + b64_len + trailer_bytes.len();
         let mut out = Vec::with_capacity(total_len);
-        let dst = &mut out.spare_capacity_mut()[..total_len];
-        write_kitty_chunk(header0.as_bytes(), payload, trailer_bytes, dst);
-        // SAFETY: `write_kitty_chunk` initialized every byte of `dst[..total_len]`,
-        // and `out` was allocated with capacity >= `total_len`.
-        unsafe {
-            out.set_len(total_len);
-        }
-        return out;
+        append_kitty_chunk(header0.as_bytes(), payload, trailer_bytes, &mut out);
+        debug_assert_eq!(out.len(), total_len);
+        return vec![out];
     }
 
     let header0 = format!(
@@ -235,72 +241,84 @@ fn format_kitty_direct_chunks(
     );
     let mid_header = format!("{start}{escape}_Gq=2,m=1;");
     let last_header = format!("{start}{escape}_Gq=2,m=0;");
+    let header0_bytes = header0.as_bytes();
+    let mid_header_bytes = mid_header.as_bytes();
+    let last_header_bytes = last_header.as_bytes();
 
-    let chunk0_len = header0.len() + FULL_CHUNK_B64_LEN + trailer_bytes.len();
+    let chunk0_len = header0_bytes.len() + FULL_CHUNK_B64_LEN + trailer_bytes.len();
     let mid_count = chunk_count - 2;
-    let mid_chunk_len = mid_header.len() + FULL_CHUNK_B64_LEN + trailer_bytes.len();
-    let mid_total_len = mid_count * mid_chunk_len;
+    let mid_chunk_len = mid_header_bytes.len() + FULL_CHUNK_B64_LEN + trailer_bytes.len();
 
     let last_src = &payload[(chunk_count - 1) * CHUNK_SIZE..];
     let last_b64_len = last_src.len().div_ceil(3) * 4;
-    let last_chunk_len = last_header.len() + last_b64_len + trailer_bytes.len();
+    let last_chunk_len = last_header_bytes.len() + last_b64_len + trailer_bytes.len();
 
-    let total_len = chunk0_len + mid_total_len + last_chunk_len;
-    assert_eq!(chunk0_len + mid_total_len + last_chunk_len, total_len);
-    let mut out = Vec::with_capacity(total_len);
-    let dst = &mut out.spare_capacity_mut()[..total_len];
-
-    // Chunk 0
-    write_kitty_chunk(
-        header0.as_bytes(),
-        &payload[..CHUNK_SIZE],
-        trailer_bytes,
-        &mut dst[..chunk0_len],
-    );
-
-    // Middle chunks (1..chunk_count - 1)
-    if mid_count > 0 {
-        let mid_src = &payload[CHUNK_SIZE..(chunk_count - 1) * CHUNK_SIZE];
-        let mid_dst = &mut dst[chunk0_len..chunk0_len + mid_total_len];
-        let mid_header_bytes = mid_header.as_bytes();
-        assert_eq!(mid_src.len(), mid_count * CHUNK_SIZE);
-
-        if chunk_count >= parallel_threshold {
-            mid_src
-                .par_chunks(CHUNK_SIZE)
-                .zip(mid_dst.par_chunks_mut(mid_chunk_len))
-                .for_each(|(src_chunk, dst_chunk)| {
-                    write_kitty_chunk(mid_header_bytes, src_chunk, trailer_bytes, dst_chunk);
-                });
-        } else {
-            mid_src
-                .chunks(CHUNK_SIZE)
-                .zip(mid_dst.chunks_mut(mid_chunk_len))
-                .for_each(|(src_chunk, dst_chunk)| {
-                    write_kitty_chunk(mid_header_bytes, src_chunk, trailer_bytes, dst_chunk);
-                });
+    if chunk_count < parallel_threshold {
+        let total_len = chunk0_len + mid_count * mid_chunk_len + last_chunk_len;
+        let mut out = Vec::with_capacity(total_len);
+        append_kitty_chunk(
+            header0_bytes,
+            &payload[..CHUNK_SIZE],
+            trailer_bytes,
+            &mut out,
+        );
+        for chunk_idx in 1..(chunk_count - 1) {
+            let byte_start = chunk_idx * CHUNK_SIZE;
+            append_kitty_chunk(
+                mid_header_bytes,
+                &payload[byte_start..byte_start + CHUNK_SIZE],
+                trailer_bytes,
+                &mut out,
+            );
         }
+        append_kitty_chunk(last_header_bytes, last_src, trailer_bytes, &mut out);
+        debug_assert_eq!(out.len(), total_len);
+        return vec![out];
     }
 
-    // Final chunk
-    write_kitty_chunk(
-        last_header.as_bytes(),
-        last_src,
-        trailer_bytes,
-        &mut dst[chunk0_len + mid_total_len..],
-    );
+    let target_slabs = rayon::current_num_threads().max(1) * 2;
+    let chunks_per_slab = chunk_count.div_ceil(target_slabs).max(1);
+    let slab_count = chunk_count.div_ceil(chunks_per_slab);
 
-    // SAFETY: `dst[..total_len]` is partitioned exhaustively into:
-    // - `dst[..chunk0_len]` (initialized by chunk 0 `write_kitty_chunk`),
-    // - `dst[chunk0_len..chunk0_len + mid_total_len]` (initialized by `mid_count` exact
-    //   `mid_chunk_len` `write_kitty_chunk` calls when `mid_count > 0`, or empty when `mid_count == 0`),
-    // - `dst[chunk0_len + mid_total_len..total_len]` (initialized by final chunk `write_kitty_chunk`).
-    // Every byte of `out.spare_capacity_mut()[..total_len]` is therefore initialized, and
-    // `out.capacity() >= total_len`.
-    unsafe {
-        out.set_len(total_len);
-    }
-    out
+    (0..slab_count)
+        .into_par_iter()
+        .map(|slab_idx| {
+            let start_chunk = slab_idx * chunks_per_slab;
+            let end_chunk = (start_chunk + chunks_per_slab).min(chunk_count);
+
+            let mut slab_cap = 0usize;
+            for chunk_idx in start_chunk..end_chunk {
+                slab_cap += if chunk_idx == 0 {
+                    chunk0_len
+                } else if chunk_idx + 1 == chunk_count {
+                    last_chunk_len
+                } else {
+                    mid_chunk_len
+                };
+            }
+
+            let mut slab = Vec::with_capacity(slab_cap);
+            for chunk_idx in start_chunk..end_chunk {
+                let byte_start = chunk_idx * CHUNK_SIZE;
+                let byte_end = (byte_start + CHUNK_SIZE).min(payload.len());
+                let header = if chunk_idx == 0 {
+                    header0_bytes
+                } else if chunk_idx + 1 == chunk_count {
+                    last_header_bytes
+                } else {
+                    mid_header_bytes
+                };
+                append_kitty_chunk(
+                    header,
+                    &payload[byte_start..byte_end],
+                    trailer_bytes,
+                    &mut slab,
+                );
+            }
+            debug_assert_eq!(slab.len(), slab_cap);
+            slab
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -340,6 +358,16 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Flattens transmission slabs into a single contiguous byte buffer for test assertions.
+    fn flatten_slabs(slabs: &[Vec<u8>]) -> Vec<u8> {
+        let total_len: usize = slabs.iter().map(Vec::len).sum();
+        let mut flat = Vec::with_capacity(total_len);
+        for slab in slabs {
+            flat.extend_from_slice(slab);
+        }
+        flat
     }
 
     /// Parses Kitty APC chunks from `transmit_str` (for `is_tmux = false` or `true`),
@@ -390,7 +418,7 @@ mod tests {
         let rgb_raw: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 7 % 256) as u8).collect();
         let rgb_img = DynamicImage::ImageRgb8(RgbImage::from_raw(4, 4, rgb_raw.clone()).unwrap());
         let proto_rgb = KittyDirectProtocol::new(&rgb_img, font, size, false, false).unwrap();
-        let chunks = parse_kitty_chunks(proto_rgb.transmit_str(), false);
+        let chunks = parse_kitty_chunks(&proto_rgb.transmit_str(), false);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].0.contains("f=24"));
         assert!(chunks[0].0.contains("t=d"));
@@ -407,7 +435,7 @@ mod tests {
             DynamicImage::ImageRgba8(RgbaImage::from_raw(4, 4, opaque_rgba_raw).unwrap());
         let proto_opaque =
             KittyDirectProtocol::new(&opaque_rgba, font, size, false, false).unwrap();
-        let chunks = parse_kitty_chunks(proto_opaque.transmit_str(), false);
+        let chunks = parse_kitty_chunks(&proto_opaque.transmit_str(), false);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].0.contains("f=24"));
         assert_eq!(decode_base64_ascii(&chunks[0].1), rgb_raw);
@@ -418,7 +446,7 @@ mod tests {
         let trans_rgba =
             DynamicImage::ImageRgba8(RgbaImage::from_raw(4, 4, trans_rgba_raw.clone()).unwrap());
         let proto_trans = KittyDirectProtocol::new(&trans_rgba, font, size, false, false).unwrap();
-        let chunks = parse_kitty_chunks(proto_trans.transmit_str(), false);
+        let chunks = parse_kitty_chunks(&proto_trans.transmit_str(), false);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].0.contains("f=32"));
         assert_eq!(decode_base64_ascii(&chunks[0].1), trans_rgba_raw);
@@ -426,7 +454,7 @@ mod tests {
         // 4. Other image variant (Grayscale Luma8) -> opaque, packed to f=24
         let gray = DynamicImage::ImageLuma8(GrayImage::from_raw(4, 4, vec![42u8; 16]).unwrap());
         let proto_gray = KittyDirectProtocol::new(&gray, font, size, false, false).unwrap();
-        let chunks = parse_kitty_chunks(proto_gray.transmit_str(), false);
+        let chunks = parse_kitty_chunks(&proto_gray.transmit_str(), false);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].0.contains("f=24"));
         assert_eq!(decode_base64_ascii(&chunks[0].1), vec![42u8; 4 * 4 * 3]);
@@ -444,7 +472,7 @@ mod tests {
         let rgb_raw: Vec<u8> = (0..32 * 32 * 3).map(|i| ((i / 3) % 64) as u8).collect();
         let rgb_img = DynamicImage::ImageRgb8(RgbImage::from_raw(32, 32, rgb_raw.clone()).unwrap());
         let proto_rgb = KittyDirectProtocol::new(&rgb_img, font, size, false, true).unwrap();
-        let chunks = parse_kitty_chunks(proto_rgb.transmit_str(), false);
+        let chunks = parse_kitty_chunks(&proto_rgb.transmit_str(), false);
         assert!(chunks[0].0.contains("f=24,o=z,t=d,s=32,v=32"));
 
         let mut reassembled = Vec::new();
@@ -462,7 +490,7 @@ mod tests {
         let rgba_img =
             DynamicImage::ImageRgba8(RgbaImage::from_raw(32, 32, rgba_raw.clone()).unwrap());
         let proto_rgba = KittyDirectProtocol::new(&rgba_img, font, size, false, true).unwrap();
-        let chunks = parse_kitty_chunks(proto_rgba.transmit_str(), false);
+        let chunks = parse_kitty_chunks(&proto_rgba.transmit_str(), false);
         assert!(chunks[0].0.contains("f=32,o=z,t=d,s=32,v=32"));
 
         let mut reassembled = Vec::new();
@@ -494,7 +522,7 @@ mod tests {
 
         for is_tmux in [false, true] {
             let proto = KittyDirectProtocol::new(&img, font, size, is_tmux, false).unwrap();
-            let chunks = parse_kitty_chunks(proto.transmit_str(), is_tmux);
+            let chunks = parse_kitty_chunks(&proto.transmit_str(), is_tmux);
 
             let expected_chunks = rgb_raw.len().div_ceil(CHUNK_SIZE);
             assert!(
@@ -522,13 +550,22 @@ mod tests {
                 reassembled.extend_from_slice(&decode_base64_ascii(b64));
             }
             assert_eq!(reassembled, rgb_raw);
+
+            // Verify multi-slab write_pending_transmit matches transmit_str bit-for-bit
+            let mut written = Vec::new();
+            assert!(proto.write_pending_transmit(&mut written).unwrap());
+            assert_eq!(written, proto.transmit_str().as_bytes());
         }
 
         // Verify bit-for-bit equivalence between parallel and sequential paths
-        let parallel_out =
+        let parallel_slabs =
             format_kitty_direct_chunks(&rgb_raw, 555, 24, width, height, false, false, 16);
-        let sequential_out =
+        let sequential_slabs =
             format_kitty_direct_chunks(&rgb_raw, 555, 24, width, height, false, false, usize::MAX);
+        assert_eq!(sequential_slabs.len(), 1);
+        assert!(!parallel_slabs.is_empty());
+        let parallel_out = flatten_slabs(&parallel_slabs);
+        let sequential_out = flatten_slabs(&sequential_slabs);
         assert!(parallel_out.is_ascii());
         assert_eq!(parallel_out, sequential_out);
     }
@@ -566,6 +603,38 @@ mod tests {
         assert!(!c00_second.symbol().contains("_Gq=2"));
         assert!(c00_second.symbol().starts_with('\u{10EEEE}'));
         assert!(c00_second.symbol().chars().count() == 4);
+
+        // Multi-slab fallback path in render() (skipping write_pending_transmit on a large image)
+        let large_w = 160u32;
+        let large_h = 160u32;
+        let large_img = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(
+                large_w,
+                large_h,
+                vec![99u8; (large_w * large_h * 3) as usize],
+            )
+            .unwrap(),
+        );
+        let large_proto = KittyDirectProtocol::new(
+            &large_img,
+            FontSize {
+                width: 40,
+                height: 40,
+            },
+            Size::new(4, 4),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut large_buf = Buffer::empty(area);
+        large_proto.render(area, &mut large_buf);
+        let large_c00 = &large_buf[(0, 0)];
+        assert!(
+            large_c00
+                .symbol()
+                .starts_with(large_proto.transmit_str().as_ref())
+        );
+        assert!(large_c00.symbol().contains('\u{10EEEE}'));
     }
 
     #[test]
@@ -618,9 +687,11 @@ mod tests {
 
     #[test]
     fn test_kitty_direct_empty_payload_defensive() {
-        let seq = format_kitty_direct_chunks(&[], 42, 24, 1, 1, false, false, 16);
+        let slabs = format_kitty_direct_chunks(&[], 42, 24, 1, 1, false, false, 16);
+        assert_eq!(slabs.len(), 1);
+        let seq = &slabs[0];
         assert!(seq.is_ascii());
-        let seq_str = std::str::from_utf8(&seq).expect("Kitty direct output must be valid ASCII");
+        let seq_str = std::str::from_utf8(seq).expect("Kitty direct output must be valid ASCII");
         let chunks = parse_kitty_chunks(seq_str, false);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].0, "q=2,i=42,a=T,U=1,f=24,t=d,s=1,v=1,m=0");
@@ -628,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_base64_slice_rfc4648_remainders() {
+    fn test_append_kitty_chunk_rfc4648_remainders() {
         let cases: &[(&[u8], &str)] = &[
             (b"", ""),
             (b"f", "Zg=="),
@@ -639,18 +710,12 @@ mod tests {
             (b"foobar", "Zm9vYmFy"),
         ];
         for &(input, expected) in cases {
-            let len = input.len().div_ceil(3) * 4;
-            let mut dst = vec![MaybeUninit::uninit(); len];
-            encode_base64_slice(input, &mut dst);
-            // SAFETY: `encode_base64_slice` initialized all `len` bytes of `dst`.
-            let initialized: Vec<u8> = dst
-                .into_iter()
-                .map(|b| unsafe { b.assume_init() })
-                .collect();
-            assert!(initialized.is_ascii());
+            let mut dst = Vec::new();
+            append_kitty_chunk(b"<H>", input, b"<T>", &mut dst);
+            assert!(dst.is_ascii());
             assert_eq!(
-                std::str::from_utf8(&initialized).unwrap(),
-                expected,
+                std::str::from_utf8(&dst).unwrap(),
+                format!("<H>{expected}<T>"),
                 "Mismatch for input len {}",
                 input.len()
             );
@@ -682,7 +747,7 @@ mod tests {
 
         for &len in &sizes {
             let payload: Vec<u8> = (0..len).map(|i| ((i * 73 + 19) % 256) as u8).collect();
-            let actual = format_kitty_direct_chunks(
+            let actual_slabs = format_kitty_direct_chunks(
                 &payload,
                 999,
                 24,
@@ -692,8 +757,11 @@ mod tests {
                 false,
                 PARALLEL_CHUNK_THRESHOLD,
             );
-            let reference =
+            let reference_slabs =
                 format_kitty_direct_chunks(&payload, 999, 24, 16, 16, false, false, usize::MAX);
+            assert_eq!(reference_slabs.len(), 1);
+            let actual = flatten_slabs(&actual_slabs);
+            let reference = flatten_slabs(&reference_slabs);
             assert_eq!(
                 actual, reference,
                 "Parallel/threshold output diverged from sequential reference for len={len}"
