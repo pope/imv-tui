@@ -95,6 +95,7 @@ fn pack_rgba_blocks(in_blocks: &[[u8; 16]], out_blocks: &mut [[u8; 12]]) {
 /// A POSIX shared memory segment holding raw RGB or RGBA pixel data for Kitty transmission.
 pub struct KittyShmSegment {
     c_name: CString,
+    len: usize,
     transmitted: AtomicBool,
 }
 
@@ -130,6 +131,7 @@ impl KittyShmSegment {
         // (in reverse drop order: `MmapGuard` munmap -> `File` close -> `segment` shm_unlink).
         let segment = Self {
             c_name,
+            len,
             transmitted: AtomicBool::new(false),
         };
 
@@ -248,15 +250,38 @@ impl KittyShmSegment {
     }
 
     /// Reads the raw bytes currently stored in this POSIX shared memory segment.
+    ///
+    /// Uses `mmap` rather than `read(2)` because macOS/BSD POSIX shared memory descriptors
+    /// reject `read(2)` with `ENXIO` and page-align `fstat().st_size`.
     #[cfg(test)]
     pub fn read_bytes(&self) -> Vec<u8> {
-        use std::io::Read;
         let fd = unsafe { libc::shm_open(self.c_name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(fd >= 0, "Failed to open shm segment {}", self.shm_name());
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let mut out = Vec::new();
-        file.read_to_end(&mut out)
-            .expect("Failed to read shm segment bytes");
+        let _file = unsafe { File::from_raw_fd(fd) };
+        if self.len == 0 {
+            return Vec::new();
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                self.len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert!(
+            ptr != libc::MAP_FAILED && !ptr.is_null(),
+            "Failed to mmap shm segment {}: {}",
+            self.shm_name(),
+            std::io::Error::last_os_error()
+        );
+        let guard = MmapGuard { ptr, len: self.len };
+        // SAFETY: `guard` owns a valid read-only mapping of `self.len` bytes backed by `_file`
+        // and unmaps on drop after `to_vec()` copies out the slice.
+        let out = unsafe { std::slice::from_raw_parts(guard.ptr.cast::<u8>(), guard.len) }.to_vec();
+        drop(guard);
         out
     }
 }
@@ -665,9 +690,10 @@ impl KittyShmProtocol {
 
         let b64_name = encode_base64_ascii(segment.shm_name().as_bytes());
 
+        let byte_len = segment.len;
         let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
         let transmit_str = format!(
-            "{start}{escape}_Gq=2,i={id},a=T,U=1,f={pixel_fmt},t=s,s={width},v={height},m=0;{b64_name}{escape}\\{end}",
+            "{start}{escape}_Gq=2,i={id},a=T,U=1,f={pixel_fmt},t=s,s={width},v={height},S={byte_len},m=0;{b64_name}{escape}\\{end}",
         );
 
         Self {
@@ -828,12 +854,6 @@ pub fn probe_kitty_shm_support(is_tmux: bool) -> bool {
         return false;
     }
 
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let dummy = [0u8; 4];
-    let _ = file.set_len(4);
-    let _ = file.write_all(&dummy);
-    drop(file);
-
     struct ShmUnlinkGuard(CString);
     impl Drop for ShmUnlinkGuard {
         fn drop(&mut self) {
@@ -844,10 +864,19 @@ pub fn probe_kitty_shm_support(is_tmux: bool) -> bool {
     }
     let _guard = ShmUnlinkGuard(c_name);
 
+    let file = unsafe { File::from_raw_fd(fd) };
+    // POSIX `ftruncate` (`set_len`) zero-initializes newly extended SHM pages, avoiding
+    // `write(2)` which returns `ENXIO` on macOS/BSD POSIX shared memory descriptors.
+    if file.set_len(4).is_err() {
+        return false;
+    }
+    drop(file);
+
     let b64_name = encode_base64_ascii(probe_name.as_bytes());
     let (start, escape, end) = super::picker::tmux_start_escape_end(is_tmux);
-    let query =
-        format!("{start}{escape}_Gi=33,s=1,v=1,a=q,t=s,f=32;{b64_name}{escape}\\{escape}[5n{end}");
+    let query = format!(
+        "{start}{escape}_Gi=33,s=1,v=1,a=q,t=s,f=32,S=4;{b64_name}{escape}\\{escape}[5n{end}"
+    );
 
     let mut stdout = std::io::stdout();
     if stdout.write_all(query.as_bytes()).is_err() || stdout.flush().is_err() {
@@ -940,6 +969,7 @@ mod tests {
             .expect("Opaque SHM creation failed");
         assert!(proto_opaque.transmit_str().contains("t=s"));
         assert!(proto_opaque.transmit_str().contains("f=24"));
+        assert!(proto_opaque.transmit_str().contains("S=300"));
         assert!(proto_opaque.transmit_str().contains("a=T,U=1"));
         assert!(!proto_opaque.segment.is_transmitted());
 
@@ -1286,6 +1316,7 @@ mod tests {
         assert!(proto.transmit_str().contains("t=s"));
         assert!(proto.transmit_str().contains("f=32"));
         assert!(proto.transmit_str().contains("s=20,v=12"));
+        assert!(proto.transmit_str().contains("S=960"));
 
         let bytes = proto.read_shm_bytes();
         let mut expected = vec![0u8; (20 * 12 * 4) as usize];
