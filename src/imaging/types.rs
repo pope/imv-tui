@@ -796,6 +796,22 @@ impl LoaderMode {
     pub fn is_thumbnail_only(self) -> bool {
         matches!(self, Self::ThumbnailOnly)
     }
+
+    /// Returns the scheduling and deduplication priority within a same-sequence loader batch
+    /// (lower value = higher priority).
+    ///
+    /// Ensures foreground full-resolution promotions (`ThumbnailAndFull` / `FullOnly`) always
+    /// supersede earlier `ThumbnailOnly` or background `Prefetch` requests for the same
+    /// `(sequence, idx)` when coalesced in `loader_rx`.
+    #[inline]
+    pub const fn batch_priority(self) -> u8 {
+        match self {
+            Self::ThumbnailAndFull => 0,
+            Self::FullOnly => 1,
+            Self::ThumbnailOnly => 2,
+            Self::Prefetch => 3,
+        }
+    }
 }
 
 /// A request sent to the persistent loader thread.

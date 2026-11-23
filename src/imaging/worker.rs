@@ -548,7 +548,7 @@ pub fn spawn_loader_pool(
                 .drain(..)
                 .filter(|r| r.sequence == highest_seq)
                 .collect();
-            matching.sort_by_key(|r| r.mode.is_prefetch());
+            matching.sort_by_key(|r| r.mode.batch_priority());
             seen_indices.clear();
             matching.retain(|r| seen_indices.insert(r.idx));
             current_requests.clear();
@@ -3191,7 +3191,7 @@ mod tests {
         loader_tx
             .send(LoaderRequest {
                 idx: 42,
-                source: ImageSource::Local(src_path),
+                source: ImageSource::Local(src_path.clone()),
                 mode: LoaderMode::ThumbnailOnly,
                 sequence: 2,
             })
@@ -3214,9 +3214,146 @@ mod tests {
         }
         assert!(got_seq2_thumb, "ThumbnailOnly must emit fast thumbnail");
 
+        // 4. Regression test: when App::tick() promotes a deferred ThumbnailOnly request with
+        // ThumbnailAndFull or FullOnly at the SAME sequence before Stage 1 drains loader_rx,
+        // deduplication must keep the full-resolution promotion instead of dropping it.
+        active_seq.store(3, Ordering::Release);
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path.clone()),
+                mode: LoaderMode::ThumbnailOnly,
+                sequence: 3,
+            })
+            .unwrap();
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path.clone()),
+                mode: LoaderMode::ThumbnailAndFull,
+                sequence: 3,
+            })
+            .unwrap();
+
+        let mut got_seq3_thumb = false;
+        let mut got_seq3_full = false;
+        let start3 = std::time::Instant::now();
+        while (!got_seq3_thumb || !got_seq3_full) && start3.elapsed() < timeout {
+            if let Ok(resp) = response_rx.recv_timeout(std::time::Duration::from_millis(500))
+                && resp.idx == 42
+                && resp.sequence == 3
+            {
+                if resp.thumbnail_source.is_some() {
+                    got_seq3_thumb = true;
+                } else {
+                    got_seq3_full = true;
+                    assert!(
+                        !resp.is_prefetch,
+                        "Promoted ThumbnailAndFull must complete as foreground"
+                    );
+                }
+            }
+        }
+        assert!(
+            got_seq3_thumb,
+            "Coalesced ThumbnailOnly + ThumbnailAndFull must still emit fast thumbnail"
+        );
+        assert!(
+            got_seq3_full,
+            "Coalesced ThumbnailOnly + ThumbnailAndFull at same sequence must not drop full decode"
+        );
+
+        active_seq.store(4, Ordering::Release);
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path.clone()),
+                mode: LoaderMode::ThumbnailOnly,
+                sequence: 4,
+            })
+            .unwrap();
+        loader_tx
+            .send(LoaderRequest {
+                idx: 42,
+                source: ImageSource::Local(src_path),
+                mode: LoaderMode::FullOnly,
+                sequence: 4,
+            })
+            .unwrap();
+
+        let mut got_seq4_full = false;
+        let start4 = std::time::Instant::now();
+        while !got_seq4_full && start4.elapsed() < timeout {
+            if let Ok(resp) = response_rx.recv_timeout(std::time::Duration::from_millis(500))
+                && resp.idx == 42
+                && resp.sequence == 4
+                && resp.thumbnail_source.is_none()
+            {
+                got_seq4_full = true;
+                assert!(
+                    !resp.is_prefetch,
+                    "Promoted FullOnly must complete as foreground"
+                );
+            }
+        }
+        assert!(
+            got_seq4_full,
+            "Coalesced ThumbnailOnly + FullOnly at same sequence must not drop full decode"
+        );
+
         drop(loader_tx);
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_loader_mode_batch_priority_coalescing() {
+        let make_req = |idx: usize, mode: LoaderMode| LoaderRequest {
+            idx,
+            source: ImageSource::Local(std::path::PathBuf::from("dummy.raf")),
+            mode,
+            sequence: 7,
+        };
+
+        let coalesce = |mut batch: Vec<LoaderRequest>| -> Vec<(usize, LoaderMode)> {
+            batch.sort_by_key(|r| r.mode.batch_priority());
+            let mut seen = std::collections::HashSet::new();
+            batch.retain(|r| seen.insert(r.idx));
+            batch.into_iter().map(|r| (r.idx, r.mode)).collect()
+        };
+
+        // Deferred ThumbnailOnly followed by ThumbnailAndFull promotion at same sequence
+        assert_eq!(
+            coalesce(vec![
+                make_req(10, LoaderMode::ThumbnailOnly),
+                make_req(10, LoaderMode::ThumbnailAndFull),
+                make_req(11, LoaderMode::Prefetch),
+            ]),
+            vec![
+                (10, LoaderMode::ThumbnailAndFull),
+                (11, LoaderMode::Prefetch),
+            ]
+        );
+
+        // Deferred ThumbnailOnly followed by FullOnly promotion at same sequence
+        assert_eq!(
+            coalesce(vec![
+                make_req(10, LoaderMode::ThumbnailOnly),
+                make_req(10, LoaderMode::FullOnly),
+            ]),
+            vec![(10, LoaderMode::FullOnly)]
+        );
+
+        // Prefetch superseded by foreground modes, and foreground modes ordered before Prefetch
+        assert_eq!(
+            coalesce(vec![
+                make_req(20, LoaderMode::Prefetch),
+                make_req(10, LoaderMode::Prefetch),
+                make_req(10, LoaderMode::ThumbnailOnly),
+                make_req(20, LoaderMode::FullOnly),
+            ]),
+            vec![(20, LoaderMode::FullOnly), (10, LoaderMode::ThumbnailOnly),]
+        );
     }
 
     #[test]
