@@ -6,6 +6,8 @@
   # CPU target for rustc (`-C target-cpu=<cpu>`) and C deps (`-march=<cpu>`).
   # Examples: null (target baseline), "x86-64-v2", "x86-64-v3", "native".
   cpu ? (if stdenv.hostPlatform.isLinux && stdenv.hostPlatform.isx86_64 then "x86-64-v3" else null),
+  # Enforce zero /nix/store runtime references for portable release builds.
+  static ? false,
 }:
 let
   rustTargetEnv = lib.replaceStrings [ "-" ] [ "_" ] (
@@ -22,29 +24,34 @@ let
       "-C target-cpu=${cpu}"
     ];
 in
-rustPlatform.buildRustPackage {
-  pname = "imv-tui";
-  version = "0.1.0";
-  src = ../.;
+rustPlatform.buildRustPackage (
+  {
+    pname = "imv-tui";
+    version = "0.1.0";
+    src = ../.;
 
-  cargoLock = {
-    lockFile = ../Cargo.lock;
-  };
-
-  nativeBuildInputs = lib.optionals useLld [
-    llvmPackages.bintools
-  ];
-
-  env =
-    lib.optionalAttrs (extraRustFlags != [ ]) {
-      "CARGO_TARGET_${rustTargetEnv}_RUSTFLAGS" = lib.concatStringsSep " " extraRustFlags;
-    }
-    // lib.optionalAttrs (cpu != null) {
-      NIX_CFLAGS_COMPILE = "-march=${cpu}";
+    cargoLock = {
+      lockFile = ../Cargo.lock;
     };
 
-  meta = {
-    description = "TUI for viewing images with zooming and panning";
-    mainProgram = "imv-tui";
-  };
-}
+    nativeBuildInputs = lib.optionals useLld [
+      llvmPackages.bintools
+    ];
+
+    env =
+      lib.optionalAttrs (extraRustFlags != [ ]) {
+        "CARGO_TARGET_${rustTargetEnv}_RUSTFLAGS" = lib.concatStringsSep " " extraRustFlags;
+      }
+      // lib.optionalAttrs (cpu != null) {
+        NIX_CFLAGS_COMPILE = "-march=${cpu}";
+      };
+
+    meta = {
+      description = "TUI for viewing images with zooming and panning";
+      mainProgram = "imv-tui";
+    };
+  }
+  // lib.optionalAttrs static {
+    allowedReferences = [ ];
+  }
+)

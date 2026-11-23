@@ -24,10 +24,14 @@
       ];
       overlay = final: _prev: {
         imv-tui = final.callPackage ./nix/imv-tui.nix { };
-        imv-tui-static = final.pkgsStatic.callPackage ./nix/imv-tui.nix { };
+        imv-tui-static =
+          if final.stdenv.hostPlatform.isLinux then
+            final.pkgsStatic.callPackage ./nix/imv-tui.nix { static = true; }
+          else
+            final.callPackage ./nix/imv-tui.nix { static = true; };
         imv-tui-static-aarch64 =
           final.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.callPackage ./nix/imv-tui.nix
-            { };
+            { static = true; };
       };
       sys-config =
         system:
@@ -64,11 +68,8 @@
         in
         {
           packages.${system} = rec {
-            inherit (pkgs) imv-tui;
+            inherit (pkgs) imv-tui imv-tui-static;
             default = imv-tui;
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            inherit (pkgs) imv-tui-static;
           }
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit (pkgs) imv-tui-static-aarch64;
