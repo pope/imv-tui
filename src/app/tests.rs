@@ -87,12 +87,17 @@ fn test_import_export_text_and_json() {
     app.export_classifications(&txt_path).unwrap();
     assert!(txt_path.exists());
     let txt_content = std::fs::read_to_string(&txt_path).unwrap();
-    // Verify that the tab character is used to separate
-    assert!(txt_content.contains("PICK\t"));
-    assert!(txt_content.contains("REJECT\t"));
-    // Text format does not contain adjustment parameters
-    assert!(!txt_content.contains("20"));
-    assert!(!txt_content.contains("15"));
+    // Verify tab-separated format with no adjustment parameters
+    let cwd = std::env::current_dir().ok();
+    let txt_lines: Vec<&str> = txt_content.lines().collect();
+    assert_eq!(
+        txt_lines,
+        vec![
+            format!("PICK\t{}", images[0].identifier_with_cwd(cwd.as_deref())),
+            format!("REJECT\t{}", images[1].identifier_with_cwd(cwd.as_deref())),
+            format!("PICK\t{}", images[2].identifier_with_cwd(cwd.as_deref())),
+        ]
+    );
 
     // Clear classifications and adjustments in app
     app.queue.clear_classifications_and_adjustments();
