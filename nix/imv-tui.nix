@@ -20,6 +20,9 @@ let
       "-C link-arg=-fuse-ld=lld"
       "-C split-debuginfo=unpacked"
     ]
+    ++ lib.optionals (stdenv.hostPlatform.isDarwin && static) [
+      "-C link-arg=-Wl,-dead_strip_dylibs"
+    ]
     ++ lib.optionals (cpu != null) [
       "-C target-cpu=${cpu}"
     ];
